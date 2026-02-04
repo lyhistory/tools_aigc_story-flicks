@@ -1,6 +1,7 @@
 import base64
 import time
 import os
+import re
 from openai import OpenAI
 from app.config import get_settings
 from loguru import logger
@@ -445,12 +446,23 @@ class LLMService:
 
                         logger.info(f"Decoded init_image_base64 successfully, size: {len(image_bytes)} bytes")
 
-                        # Create simple mask (white rectangle in center for demo - customize!)
+                        # Create a character-focused mask (center + slightly lower region)
                         img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
                         mask = Image.new("L", img.size, 0)  # black mask
                         width, height = img.size
                         draw = ImageDraw.Draw(mask)
-                        draw.rectangle((width//4, height//4, width*3//4, height*3//4), fill=255)  # white center
+                        # Ellipse around center (upper body)
+                        ell_w = int(width * 0.6)
+                        ell_h = int(height * 0.55)
+                        ell_x0 = (width - ell_w) // 2
+                        ell_y0 = int(height * 0.1)
+                        draw.ellipse((ell_x0, ell_y0, ell_x0 + ell_w, ell_y0 + ell_h), fill=255)
+                        # Lower rectangle (full body/legs)
+                        rect_w = int(width * 0.7)
+                        rect_h = int(height * 0.5)
+                        rect_x0 = (width - rect_w) // 2
+                        rect_y0 = int(height * 0.45)
+                        draw.rectangle((rect_x0, rect_y0, rect_x0 + rect_w, rect_y0 + rect_h), fill=255)
                         
                         mask_bytes = io.BytesIO()
                         mask.save(mask_bytes, format="PNG")
@@ -466,6 +478,8 @@ class LLMService:
 
                                     Only make the following changes:
                                     {prompt}
+                                    Focus changes on the characters (pose/action/expression),
+                                    keep the background unchanged.
                                     The result should look like the same moment in the same scene,
                                     with subtle action changes or added details,
                                     not a new illustration.
@@ -599,6 +613,70 @@ class LLMService:
             task_dir = str(Path("/app/tasks") / task_id)
             Path(task_dir).mkdir(parents=True, exist_ok=True)
 
+        async def build_variation_hint(scene_text: str, idx: int, request: StoryGenerationRequest) -> str:
+            # Heuristic: extract action + emotion from the scene text
+            if not scene_text:
+                scene_text = ""
+            text = scene_text.lower()
+            action_terms = [
+                "walk", "run", "look", "smile", "laugh", "point", "hold",
+                "hug", "wave", "sit", "stand", "lean", "turn", "jump",
+                "reach", "whisper", "nod", "shake", "kneel", "crouch",
+                "step", "gesture", "talk", "speak", "listen", "giggle"
+            ]
+            emotion_terms = [
+                "surprised", "curious", "thoughtful", "excited", "calm",
+                "content", "playful", "happy", "sad", "angry", "worried",
+                "confident", "shy", "proud", "nervous", "relieved"
+            ]
+
+            def find_first_term(terms):
+                for term in terms:
+                    if re.search(rf"\\b{re.escape(term)}\\b", text):
+                        return term
+                return ""
+
+            action = find_first_term(action_terms)
+            emotion = find_first_term(emotion_terms)
+
+            if action or emotion:
+                action_phrase = action if action else "subtle motion"
+                emotion_phrase = emotion if emotion else "neutral"
+                return f"pose/action: {action_phrase}; expression: {emotion_phrase}"
+
+            # Fallback: ask the text LLM for a short variation hint
+            try:
+                messages = [
+                    {
+                        "role": "system",
+                        "content": "You generate short visual variation hints for inpainting. Return only JSON."
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            "Given the following scene text, extract a concise pose/action and expression.\n"
+                            "Return JSON: {\"pose_action\": \"...\", \"expression\": \"...\"}\n\n"
+                            f"Scene text: {scene_text}"
+                        ),
+                    },
+                ]
+                result = await self._generate_response(
+                    text_llm_provider=request.text_llm_provider,
+                    text_llm_model=request.text_llm_model,
+                    messages=messages,
+                    response_format="json_object",
+                )
+                pose_action = (result.get("pose_action") or "").strip()
+                expression = (result.get("expression") or "").strip()
+                if pose_action or expression:
+                    pose_action = pose_action or "subtle motion"
+                    expression = expression or "neutral"
+                    return f"pose/action: {pose_action}; expression: {expression}"
+            except Exception as e:
+                logger.warning(f"Variation hint fallback failed: {e}")
+
+            return ""
+
         previous_base64 = None
 
         # 为每个场景生成图片
@@ -608,10 +686,14 @@ class LLMService:
             logger.info(f"2 mins passed")
             
             try:
+                variation_hint = await build_variation_hint(segment.get("text", ""), idx, request) if idx > 1 else ""
                 img2img_kwargs = {"init_image_base64": previous_base64} if previous_base64 else {}
                 
                 image_url = self.generate_image(
-                    prompt=segment["image_prompt"], 
+                    prompt=(
+                        segment["image_prompt"]
+                        + (f"\n\nVariation hint for this scene: {variation_hint}" if variation_hint else "")
+                    ),
                     resolution=request.resolution, 
                     image_llm_provider=request.image_llm_provider, 
                     image_llm_model=request.image_llm_model,
