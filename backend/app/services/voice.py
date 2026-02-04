@@ -1152,10 +1152,22 @@ async def gtts_voice(text: str, voice_file: str, subtitle_file: str, language: s
 
     logger.info(f"gTTS generating | text length: {len(text)} | voice: {tld} | rate approx: {voice_rate}")
     
+    def sanitize_text_for_tts(raw_text: str) -> str:
+        if not raw_text:
+            return raw_text
+        # Normalize smart quotes to simple quotes
+        cleaned = raw_text.replace("“", '"').replace("”", '"').replace("‘", "'").replace("’", "'")
+        # Remove standalone quotes (keep apostrophes inside words like Timmy's)
+        cleaned = re.sub(r"(?<!\\w)['\\\"](?!\\w)", "", cleaned)
+        # Collapse whitespace
+        cleaned = re.sub(r"\\s+", " ", cleaned).strip()
+        return cleaned
+
     try:
+        clean_text = sanitize_text_for_tts(text)
         # Approximate rate: slow=True for slower speech
         slow = voice_rate < 0.8
-        tts = gTTS(text=text, lang="en",tld=tld, slow=slow)
+        tts = gTTS(text=clean_text, lang="en", tld=tld, slow=slow)
         tts.save(voice_file)
         
         logger.info(f"gTTS success → saved: {voice_file}")
@@ -1168,7 +1180,7 @@ async def gtts_voice(text: str, voice_file: str, subtitle_file: str, language: s
         # Detect nonsilent chunks to remove silence
         nonsilent_chunks = detect_nonsilent(audio, min_silence_len=400, silence_thresh=-40)
 
-        lines = split_string_by_punctuations(text)
+        lines = split_string_by_punctuations(clean_text)
         num_lines = len(lines)
 
         def normalize_srt_times(time_pairs, total_s, min_gap=0.05, min_dur=0.25):

@@ -481,10 +481,13 @@ class LLMService:
                                 stretched proportions, deformed limbs,
                                 style change, camera change, perspective change
                                 """,
-                            "image": list(image_bytes),  # array of bytes
+                            "image_b64": img2img_kwargs["init_image_base64"],
                             "mask": list(mask_bytes),    # array of bytes
                             "num_steps": 20,
-                            "strength": 0.3,            # how much to change masked area
+                            "strength": 0.55,            # how much to change masked area
+                            "guidance": 7.5,
+                            "width": width,
+                            "height": height,
                             "seed": random.randint(1, 2147483647)
                         }
                     except base64.binascii.Error as b64_err:

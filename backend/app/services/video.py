@@ -95,10 +95,8 @@ def parse_resolution(resolution: str, fallback=(768, 1344)):
     except Exception:
         return fallback
 
-def pad_image_to_size(img: Image.Image, target_w: int, target_h: int) -> Image.Image:
-    if img.size == (target_w, target_h):
-        return img
-    # Fit image inside target without stretching
+def fit_image_to_size(img: Image.Image, target_w: int, target_h: int) -> Image.Image:
+    # Fit image inside target without stretching, return sharp fit on transparent canvas
     img_ratio = img.width / img.height
     target_ratio = target_w / target_h
     if img_ratio > target_ratio:
@@ -109,29 +107,37 @@ def pad_image_to_size(img: Image.Image, target_w: int, target_h: int) -> Image.I
         new_w = max(1, int(target_h * img_ratio))
     resized = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
 
-    # Create a blurred background from the image to avoid harsh bars
-    bg = img.resize((target_w, target_h), Image.Resampling.LANCZOS)
-    bg = bg.filter(ImageFilter.GaussianBlur(radius=24))
-
+    canvas = Image.new("RGBA", (target_w, target_h), (0, 0, 0, 0))
     x = (target_w - new_w) // 2
     y = (target_h - new_h) // 2
-    bg.paste(resized, (x, y))
-    return bg
+    canvas.paste(resized, (x, y))
+    return canvas
 
-def build_image_clip(image_file: str, target_w: int, target_h: int, duration: float, image_scale: float = 1.2):
+def build_image_clips(image_file: str, target_w: int, target_h: int, duration: float, image_scale: float = 1.2):
     img = Image.open(image_file).convert("RGB")
-    img = pad_image_to_size(img, target_w, target_h)
-    image_clip = ImageClip(np.array(img))
-    origin_image_w, origin_image_h = image_clip.size
+    # Background: heavy blur of full-frame image
+    bg = img.resize((target_w, target_h), Image.Resampling.LANCZOS)
+    blur_radius = max(24, min(target_w, target_h) // 12)
+    bg = bg.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+    bg_clip = ImageClip(np.array(bg)).with_duration(duration)
 
-    image_clip = image_clip.resized(image_scale)
-    image_clip = image_clip.cropped(
-        x_center=image_clip.w / 2,
-        y_center=image_clip.h / 2,
+    # Foreground: sharp fit on transparent canvas
+    fg_rgba = fit_image_to_size(img, target_w, target_h)
+    fg_np = np.array(fg_rgba)
+    fg_rgb = fg_np[..., :3]
+    fg_mask = fg_np[..., 3] / 255.0
+
+    fg_clip = ImageClip(fg_rgb).with_mask(ImageClip(fg_mask, is_mask=True))
+    origin_image_w, origin_image_h = fg_clip.size
+
+    fg_clip = fg_clip.resized(image_scale)
+    fg_clip = fg_clip.cropped(
+        x_center=fg_clip.w / 2,
+        y_center=fg_clip.h / 2,
         width=origin_image_w,
         height=origin_image_h
     )
-    image_clip = image_clip.with_duration(duration)
+    fg_clip = fg_clip.with_duration(duration)
 
     width_diff = origin_image_w * (image_scale - 1)
     def pan_position(t):
@@ -140,8 +146,8 @@ def build_image_clip(image_file: str, target_w: int, target_h: int, duration: fl
         x = -width_diff * (t / duration)
         y = 0
         return (x, y)
-    image_clip = image_clip.with_position(pan_position)
-    return image_clip, origin_image_w, origin_image_h
+    fg_clip = fg_clip.with_position(pan_position)
+    return bg_clip, fg_clip, origin_image_w, origin_image_h
 
 async def create_video_with_scenes(
         task_dir: str, 
@@ -195,7 +201,7 @@ async def create_video_with_scenes(
                 base_img = Image.open(image_file)
                 target_w, target_h = base_img.size
                 base_img.close()
-            image_clip, origin_image_w, origin_image_h = build_image_clip(
+            bg_clip, fg_clip, origin_image_w, origin_image_h = build_image_clips(
                 image_file=image_file,
                 target_w=target_w,
                 target_h=target_h,
@@ -204,7 +210,7 @@ async def create_video_with_scenes(
             )
             # 创建音频剪辑  
             audio_clip = AudioFileClip(audio_file)
-            image_clip = image_clip.with_audio(audio_clip)
+            # audio will be attached to the final composite clip
             # 使用系统字体
             font_path = os.path.join(utils.resource_dir(), "fonts", "STHeitiLight.ttc")
             if not os.path.exists(font_path):
@@ -256,16 +262,18 @@ async def create_video_with_scenes(
                     for item in sub.subtitles:
                         clip = create_text_clip(subtitle_item=item)
                         text_clips.append(clip)
-                    video_clip = CompositeVideoClip([image_clip, *text_clips], (origin_image_w, origin_image_h))
-                    clips.append(video_clip)
+                    video_clip = CompositeVideoClip([bg_clip, fg_clip, *text_clips], (origin_image_w, origin_image_h))
+                    clips.append(video_clip.with_audio(audio_clip))
                     logger.info(f"Added subtitles for scene {i}")
                 
                 except Exception as e:
                     logger.error(f"Failed to add subtitles for scene {i}: {str(e)}")
-                    clips.append(image_clip.with_audio(audio_clip))
+                    video_clip = CompositeVideoClip([bg_clip, fg_clip], (origin_image_w, origin_image_h))
+                    clips.append(video_clip.with_audio(audio_clip))
             else:
                 logger.warning(f"Subtitle file not found: {subtitle_file}")
-                clips.append(image_clip.with_audio(audio_clip))
+                video_clip = CompositeVideoClip([bg_clip, fg_clip], (origin_image_w, origin_image_h))
+                clips.append(video_clip.with_audio(audio_clip))
         except Exception as e:
             logger.error(f"Failed to process scene {i}: {str(e)}")
             raise e
