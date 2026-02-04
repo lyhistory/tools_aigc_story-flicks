@@ -19,11 +19,14 @@ from moviepy import (
     afx,
 )
 from moviepy.video.tools import subtitles
-from moviepy.video.tools.subtitles import SubtitlesClip
 from PIL import Image, ImageDraw, ImageFont
 import numpy as np
 import requests
 import random
+import shutil
+
+from moviepy import ImageClip, CompositeVideoClip, AudioFileClip, TextClip, concatenate_videoclips
+from moviepy.video.tools.subtitles import SubtitlesClip, file_to_subtitles
 
 def wrap_text(text, max_width, font="Arial", fontsize=60):
     # Create ImageFont
@@ -82,7 +85,13 @@ def wrap_text(text, max_width, font="Arial", fontsize=60):
     # logger.warning(f"wrapped text: {result}")
     return result, height
 
-async def create_video_with_scenes(task_dir: str, scenes: List[StoryScene], voice_name: str, voice_rate: float, test_mode: bool = False) -> str:
+async def create_video_with_scenes(
+        task_dir: str, 
+        scenes: List[StoryScene], 
+        voice_name: str, 
+        voice_rate: float, 
+        language: str = "en-US",
+        test_mode: bool = False) -> str:
     """创建带有场景的视频
 
     Args:
@@ -100,7 +109,7 @@ async def create_video_with_scenes(task_dir: str, scenes: List[StoryScene], voic
             audio_file = os.path.join(task_dir, f"{i}.mp3")
             subtitle_file = os.path.join(task_dir, f"{i}.srt")
 
-            # 测试模式下检查文件是否存在
+            # Test mode check
             if test_mode:
                 if not (os.path.exists(image_file) and os.path.exists(audio_file) and os.path.exists(subtitle_file)):
                     logger.warning(f"Test mode: Required files not found for scene {i}")
@@ -113,7 +122,8 @@ async def create_video_with_scenes(task_dir: str, scenes: List[StoryScene], voic
                     voice_name,
                     voice_rate,
                     audio_file,
-                    subtitle_file
+                    subtitle_file,
+                    language
                 )
             
             # 获取字幕的总时长
@@ -124,17 +134,27 @@ async def create_video_with_scenes(task_dir: str, scenes: List[StoryScene], voic
             image_clip = ImageClip(image_file)
             origin_image_w, origin_image_h = image_clip.size  # 获取放大后的图片尺寸
             image_scale = 1.2
-            image_clip = image_clip.resized((origin_image_w*image_scale,origin_image_h*image_scale))
-            image_w, image_h = image_clip.size  # 获取放大后的图片尺寸
+            # Resize and set duration
+            image_clip = image_clip.resized(image_scale)
+
+            # Crop back to canvas size
+            image_clip = image_clip.cropped(
+                x_center=image_clip.w / 2,
+                y_center=image_clip.h / 2,
+                width=origin_image_w,
+                height=origin_image_h
+            )
             # 确保图片视频时长至少和字幕一样长
             image_clip = image_clip.with_duration(subtitle_duration)
 
-            width_diff = origin_image_w * (image_scale-1)
-            def debug_position(t):
-                # print(f"当前时间 t = {t}", subtitle_duration, width_diff, width_diff/subtitle_duration*t)  # 输出当前时间
-                return (-width_diff/subtitle_duration*t, 'center')
-            image_clip = image_clip.with_position(debug_position)
-            # 创建音频剪辑
+            width_diff = origin_image_w * (image_scale - 1)
+            def pan_position(t):
+                logger.info(f"当前时间 t = {t}， subtitle_duration={subtitle_duration}， width_diff={width_diff}，{width_diff/subtitle_duration*t}")
+                x = -width_diff * (t / subtitle_duration)
+                y = 0
+                return (x, y)
+            image_clip = image_clip.with_position(pan_position)
+            # 创建音频剪辑  
             audio_clip = AudioFileClip(audio_file)
             image_clip = image_clip.with_audio(audio_clip)
             # 使用系统字体
@@ -155,6 +175,11 @@ async def create_video_with_scenes(task_dir: str, scenes: List[StoryScene], voic
                             text=text,
                             font=font_path,
                             font_size=60,
+                            # color='white',
+                            # stroke_color='black',
+                            # stroke_width=2,
+                            # method='caption',
+                            # size=(origin_image_w * 0.9, None)
                         )
                     def create_text_clip(subtitle_item):
                         phrase = subtitle_item[1]
@@ -176,9 +201,9 @@ async def create_video_with_scenes(task_dir: str, scenes: List[StoryScene], voic
                         _clip = _clip.with_duration(duration)
                         _clip = _clip.with_position(("center", origin_image_h * 0.95 - _clip.h - 50))
                         return _clip
-                    
-                    sub = SubtitlesClip(subtitle_file, encoding="utf-8", make_textclip=make_textclip)
 
+                    # Create subtitles clip
+                    sub = SubtitlesClip(subtitle_file, encoding="utf-8", make_textclip=make_textclip)
                     text_clips = []
                     for item in sub.subtitles:
                         clip = create_text_clip(subtitle_item=item)
@@ -186,12 +211,13 @@ async def create_video_with_scenes(task_dir: str, scenes: List[StoryScene], voic
                     video_clip = CompositeVideoClip([image_clip, *text_clips], (origin_image_w, origin_image_h))
                     clips.append(video_clip)
                     logger.info(f"Added subtitles for scene {i}")
+                
                 except Exception as e:
                     logger.error(f"Failed to add subtitles for scene {i}: {str(e)}")
-                    clips.append(image_clip)
+                    clips.append(image_clip.with_audio(audio_clip))
             else:
                 logger.warning(f"Subtitle file not found: {subtitle_file}")
-                clips.append(image_clip)
+                clips.append(image_clip.with_audio(audio_clip))
         except Exception as e:
             logger.error(f"Failed to process scene {i}: {str(e)}")
             raise e
@@ -235,6 +261,9 @@ async def generate_video(request: VideoGenerateRequest):
             request.test_mode = True
             scenes = [StoryScene(**scene) for scene in story_data.get("scenes", [])]
         else:
+            task_id = str(int(time.time()))
+            task_dir = utils.task_dir(task_id)
+            os.makedirs(task_dir, exist_ok=True)
             req = StoryGenerationRequest(
                 resolution=request.resolution,
                 story_prompt=request.story_prompt,
@@ -245,33 +274,79 @@ async def generate_video(request: VideoGenerateRequest):
                 image_llm_provider=request.image_llm_provider,
                 image_llm_model=request.image_llm_model
             )
-            story_list = await llm_service.generate_story_with_images(request=req)
+            logger.info(f"generate_video StoryGenerationRequest: {req}")
+            story_list = await llm_service.generate_story_with_images(
+                request=req,
+                task_id=task_id,
+                task_dir=task_dir)
+            
+            for i, scene in enumerate(story_list, 1):
+                image_url = scene.get("url")
+                logger.info(f"Scene {i} - Generated image URL: {image_url}")
+                
+                if image_url:
+                    image_path = os.path.join(task_dir, f"{i}.png")
+                    logger.info(f"  → URL starts with: {image_url[:100]}...")
+                    # Check if it's a local file path (starts with / or C:\ or relative)
+                    if image_url.startswith('/') or image_url.startswith('\\') or image_url.startswith('./') or image_url.startswith('..'):
+                        # Local file — check if it exists
+                        if os.path.exists(image_url):
+                            logger.info(f"  → Local file exists: {image_url}")
+                        else:
+                            logger.warning(f"  → Local file NOT found: {image_url}")
+                    else:
+                        # Remote URL — try download
+                        try:
+                            response = requests.get(image_url, timeout=20)
+                            logger.info(f"  → Download test status: {response.status_code}")
+                            if response.status_code != 200:
+                                logger.warning(f"  → Image may be invalid/expired (status {response.status_code})")
+                        except Exception as e:
+                            logger.error(f"  → Immediate download test failed: {str(e)}")
+                else:
+                    logger.warning(f"Scene {i} has no image URL!")
+        
             scenes = [StoryScene(text=scene["text"], image_prompt=scene["image_prompt"], url=scene["url"]) for scene in story_list]
             
             # 保存 story.json
             story_data = request.model_dump()
             story_data["scenes"] = [scene.model_dump() for scene in scenes]
-            task_id = str(int(time.time()))
-            task_dir = utils.task_dir(task_id)
-            os.makedirs(task_dir, exist_ok=True)
+            
             story_file = os.path.join(task_dir, "story.json")
             for i, scene in enumerate(story_list, 1):
                 if scene.get("url"):
                     image_path = os.path.join(task_dir, f"{i}.png")
-                    try:
-                        response = requests.get(scene["url"])
-                        if response.status_code == 200:
-                            with open(image_path, "wb") as f:
-                                f.write(response.content)
-                            logger.info(f"Downloaded image {i} to {image_path}")
-                    except Exception as e:
-                        logger.error(f"Failed to download image {i}: {e}")
-
+                    # Check if it's already a local path
+                    if scene["url"].startswith('/') or scene["url"].startswith('\\') or os.path.isabs(scene["url"]):
+                        # Local path — just copy/rename to expected name
+                        if os.path.exists(scene["url"]):
+                            logger.info(f"  → Local file exists: {scene['url']}")
+                            # If path is different from expected, copy it
+                            if scene["url"] != image_path:
+                                try:
+                                    shutil.copy2(scene["url"], image_path)
+                                    logger.info(f"  → Copied local image to expected path: {image_path}")
+                                except Exception as copy_err:
+                                    logger.error(f"  → Copy failed: {copy_err}")
+                        else:
+                            logger.warning(f"  → Local file NOT found: {scene['url']}")
+                    else:
+                        # Remote URL — download as before
+                        try:
+                            response = requests.get(scene["url"])
+                            if response.status_code == 200:
+                                with open(image_path, "wb") as f:
+                                    f.write(response.content)
+                                logger.info(f"Downloaded image {i} to {image_path}")
+                        except Exception as e:
+                            logger.error(f"Failed to download image {i}: {e}")
+                else:
+                    logger.warning(f"No image URL for scene {i} — skipping")
             with open(story_file, "w", encoding="utf-8") as f:
                 json.dump(story_data, f, ensure_ascii=False, indent=2)
         # return ""
         # 生成视频
-        return await create_video_with_scenes(task_dir, scenes, request.voice_name, request.voice_rate, request.test_mode)
+        return await create_video_with_scenes(task_dir, scenes, request.voice_name, request.voice_rate,request.language, request.test_mode)
     except Exception as e:
         logger.error(f"Failed to generate video: {e}")
         raise e

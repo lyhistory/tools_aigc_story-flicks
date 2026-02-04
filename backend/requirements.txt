@@ -14,3 +14,9 @@ decorator==4.4.2
 imageio-ffmpeg==0.4.9
 requests==2.31.0
 Pillow==9.5.0
+tenacity==8.2.3          # robust retry with backoff
+fake-useragent==1.5.1    # rotating realistic browser User-Agents
+websockets==16.0
+gtts==2.5.3
+google-cloud-texttospeech==2.16.0
+pydub==0.25.1

@@ -55,7 +55,8 @@ async def generate_story_with_images(request: StoryGenerationRequest) -> StoryGe
         logger.error(f"Failed to generate story with images: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.get("/providers", response_model=Dict[str, List[str]])
+#@router.get("/providers", response_model=Dict[str, List[str]])
+@router.get("/providers")
 async def get_llm_providers():
     """
     获取 LLM Provider 列表

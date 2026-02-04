@@ -53,6 +53,9 @@ htmlcov/
 .env
 .env.local
 .env.*.local
+.env-nvidia
+.env-siliconflow
+.env-cloudflare
 
 # Temporary files
 *.bak

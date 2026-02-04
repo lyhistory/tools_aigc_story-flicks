@@ -1,6 +1,8 @@
 export const VOICE_LANGUAGES: Language[] = [
     "zh-CN",
     "zh-TW",
+    "fixed-en-GB",
+    "en-GB",
     "en-US",
     "ja-JP",
     "ko-KR"
@@ -14,6 +16,14 @@ export const VOICE_LANGUAGES_LABELS = [
     {
         label: '中文（繁体）',
         value: 'zh-TW'
+    },
+    {
+        label: 'Fixed UK Accent',
+        value: 'fixed-en-GB' 
+    },
+    {
+        label: 'British English (UK)',
+        value: 'en-GB' 
     },
     {
         label: 'English',

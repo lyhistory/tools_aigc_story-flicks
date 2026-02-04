@@ -20,6 +20,8 @@ class Language(str, Enum):
     """支持的语言"""
     CHINESE_CN = "zh-CN"      # 中文（简体）
     CHINESE_TW = "zh-TW"      # 中文（繁体）
+    ENGLISH_FIXED = "fixed-en-GB"      # 英语（美国）
+    ENGLISH_EN = "en-GB"      # 英语（英国）
     ENGLISH_US = "en-US"      # 英语（美国）
     JAPANESE = "ja-JP"        # 日语
     KOREAN = "ko-KR"          # 韩语
@@ -28,7 +30,9 @@ class Language(str, Enum):
 LANGUAGE_NAMES = {
     Language.CHINESE_CN: "中文（简体）",
     Language.CHINESE_TW: "中文（繁体）",
-    Language.ENGLISH_US: "English",
+    Language.ENGLISH_FIXED: "GB English fixed",
+    Language.ENGLISH_EN: "GB English",
+    Language.ENGLISH_US: "US English",
     Language.JAPANESE: "日本語",
     Language.KOREAN: "한국어"
 }

@@ -24,7 +24,7 @@ interface VideoGenerateReq {
 }
 
 // 假设 Language 和 ImageStyle 是其他接口或枚举
-type Language = "zh-CN" | "zh-TW" |  "en-US" | "ja-JP" | "ko-KR";
+type Language = "zh-CN" | "zh-TW" | "fixed-en-GB" | "en-GB" | "en-US" | "ja-JP" | "ko-KR";
 
 interface VideoGenerateRes {
     success: boolean;

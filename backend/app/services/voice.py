@@ -12,6 +12,15 @@ from moviepy.video.tools import subtitles
 from loguru import logger
 from typing import Tuple
 from xml.sax.saxutils import unescape
+from fake_useragent import UserAgent
+import websockets
+from functools import partial
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from gtts import gTTS
+from pydub import AudioSegment
+from pydub.silence import detect_nonsilent
+
+ua = UserAgent()  # global fake-useragent instance
 
 PUNCTUATIONS = [
     "?",
@@ -1086,7 +1095,14 @@ def convert_rate_to_percent(rate: float) -> str:
         return f"{percent}%"
 
 
-async def generate_voice(text: str, voice_name: str, voice_rate: float = 0, audio_file: str = None, subtitle_file: str = None) -> Tuple[str, str]:
+async def generate_voice(
+        text: str, 
+        voice_name: str, 
+        voice_rate: float = 0, 
+        audio_file: str = None, 
+        subtitle_file: str = None,
+        language: str = "en-US"
+        ) -> Tuple[str, str]:
     """生成语音和字幕
 
     Args:
@@ -1104,46 +1120,148 @@ async def generate_voice(text: str, voice_name: str, voice_rate: float = 0, audi
     if subtitle_file is None:
         subtitle_file = f"temp_{uuid.uuid4()}.srt"
 
-    # 生成语音
-    sub_maker = await edge_tts_voice(text, voice_name, audio_file, voice_rate)
-    # 生成字幕
-    if sub_maker:
-        await generate_subtitle(sub_maker, text, subtitle_file)
-    else:
-        logger.error("Failed to generate sub_maker")
+    if not voice_name or voice_name == "default":
+        logger.info("Using default gTTS voice (no specific name needed)")
+
+    # generate with edge tts 
+    # await edge_tts_voice_notwork(text, voice_name, audio_file, subtitle_file, voice_rate)
+     
+    # Generate audio with gTTS with UK support
+    await gtts_voice(text, audio_file, subtitle_file, language, voice_rate)
     
     return audio_file, subtitle_file
 
+@retry(
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=1.5, min=3, max=30),
+    retry=retry_if_exception_type((Exception,)),  # retry on all errors, including 403
+    reraise=True
+)
+async def gtts_voice(text: str, voice_file: str, subtitle_file: str, language: str, voice_rate: float = 0):
+    """
+    Fallback to gTTS (Google TTS) — stable, no 403 issues.
+    Note: gTTS doesn't support exact rate or SubMaker subtitles — use simple text split for .srt if needed.
+    """
+    
+    tld = "com"  # US default
+    if language in ["fixed-en-GB", "en-GB", "en-UK", "uk", "gb", "British"]:
+        tld = "co.uk"  # British English
+        logger.info("Using gTTS with UK English (tld=co.uk)")
+    else:
+        logger.info("Using gTTS with US English")
 
-async def edge_tts_voice(text: str, voice_name: str, voice_file: str, voice_rate: float = 0) -> SubMaker:
+    logger.info(f"gTTS generating | text length: {len(text)} | voice: {tld} | rate approx: {voice_rate}")
+    
+    try:
+        # Approximate rate: slow=True for slower speech
+        slow = voice_rate < 0.8
+        tts = gTTS(text=text, lang="en",tld=tld, slow=slow)
+        tts.save(voice_file)
+        
+        logger.info(f"gTTS success → saved: {voice_file}")
+
+        # Get real audio duration
+        audio = AudioSegment.from_mp3(voice_file)
+        total_duration_ms = len(audio)
+        total_duration_s = total_duration_ms / 1000.0
+
+        # Detect nonsilent chunks to remove silence
+        nonsilent_chunks = detect_nonsilent(audio, min_silence_len=400, silence_thresh=-40)
+
+        lines = split_string_by_punctuations(text)
+        num_lines = len(lines)
+
+        if num_lines == 0:
+            logger.warning("No lines for SRT")
+            with open(subtitle_file, "w", encoding="utf-8") as f:
+                f.write("")
+        else:
+            if len(nonsilent_chunks) >= num_lines:
+                # Use real speech chunk timings
+                with open(subtitle_file, "w", encoding="utf-8") as f:
+                    for i, line in enumerate(lines, 1):
+                        start_ms, end_ms = nonsilent_chunks[i-1]
+                        start_s = start_ms / 1000.0
+                        end_s = end_ms / 1000.0
+                        
+                        start_hms = f"{int(start_s // 3600):02d}:{int((start_s % 3600) // 60):02d}:{int(start_s % 60):02d},{int((start_s % 1)*1000):03d}"
+                        end_hms   = f"{int(end_s // 3600):02d}:{int((end_s % 3600) // 60):02d}:{int(end_s % 60):02d},{int((end_s % 1)*1000):03d}"
+                        
+                        f.write(f"{i}\n")
+                        f.write(f"{start_hms} --> {end_hms}\n")
+                        f.write(f"{line.strip()}\n\n")
+                
+                logger.info(f"SRT aligned with real speech chunks")
+            else:
+                # Even timing, but trim 0.5s silence from end/start
+                time_per_line = (total_duration_s - 1.0) / num_lines if num_lines > 0 else 5.0  # subtract buffer silence
+                
+                with open(subtitle_file, "w", encoding="utf-8") as f:
+                    current_time = 0.5  # start 0.5s in to skip leading silence
+                    for i, line in enumerate(lines, 1):
+                        start_s = current_time
+                        end_s = min(start_s + time_per_line, total_duration_s - 0.5)
+                        
+                        start_hms = f"{int(start_s // 3600):02d}:{int((start_s % 3600) // 60):02d}:{int(start_s % 60):02d},{int((start_s % 1)*1000):03d}"
+                        end_hms   = f"{int(end_s // 3600):02d}:{int((end_s % 3600) // 60):02d}:{int(end_s % 60):02d},{int((end_s % 1)*1000):03d}"
+                        
+                        f.write(f"{i}\n")
+                        f.write(f"{start_hms} --> {end_hms}\n")
+                        f.write(f"{line.strip()}\n\n")
+                        
+                        current_time = end_s
+                
+                logger.info(f"SRT fallback with silence trim")
+    except Exception as e:
+        logger.error(f"gTTS failed: {str(e)}")
+        raise
+
+async def edge_tts_voice_notwork(text: str, voice_name: str, voice_file: str, subtitle_file:str, voice_rate: float = 0):
     """使用 Edge TTS 生成语音"""
     rate_str = convert_rate_to_percent(voice_rate)
-    for i in range(3):
-        try:
-            logger.info(f"start, voice name: {voice_name}, try: {i + 1}")
 
-            communicate = edge_tts.Communicate(text, voice_name, rate=rate_str)
-            sub_maker = edge_tts.SubMaker()
-            
-            with open(voice_file, "wb") as file:
-                async for chunk in communicate.stream():
-                    if chunk["type"] == "audio":
-                        file.write(chunk["data"])
-                    elif chunk["type"] == "WordBoundary":
-                        logger.debug(f"Got word boundary: {chunk}")
-                        # 使用 SubMaker 的 create_sub 方法创建字幕
-                        sub_maker.create_sub((chunk["offset"], chunk["duration"]), chunk["text"])
+    # Rotate a realistic browser User-Agent each attempt
+    custom_ua = ua.random
+    logger.info(f"edge-tts attempt | UA: {custom_ua} | voice: {voice_name}")
+        
+    try:
+        # Monkey-patch edge_tts's internal websocket to use custom UA
+        original_connect = websockets.connect
+        async def patched_connect(*args, **kwargs):
+            kwargs.setdefault("extra_headers", {})
+            kwargs["extra_headers"]["User-Agent"] = custom_ua
+            return await original_connect(*args, **kwargs)
+        # Temporarily patch
+        websockets.connect = patched_connect
 
-            if not sub_maker or not sub_maker.subs:
-                logger.warning("failed, sub_maker is None or sub_maker.subs is None")
-                continue
+        communicate = edge_tts.Communicate(text, voice_name, rate=rate_str)
+        sub_maker = edge_tts.SubMaker()
+        
+        with open(voice_file, "wb") as file:
+            async for chunk in communicate.stream():
+                if chunk["type"] == "audio":
+                    file.write(chunk["data"])
+                elif chunk["type"] == "WordBoundary":
+                    logger.debug(f"Got word boundary: {chunk}")
+                    # 使用 SubMaker 的 create_sub 方法创建字幕
+                    sub_maker.create_sub((chunk["offset"], chunk["duration"]), chunk["text"])
 
-            logger.info(f"completed, output file: {voice_file}")
-            return sub_maker
-        except Exception as e:
-            logger.error(f"failed, error: {str(e)}")
-            continue
-    return None
+        if not sub_maker or not sub_maker.subs:
+            raise RuntimeError("No subtitles generated")
+
+        logger.info(f"completed, output file: {voice_file}")
+
+        # 生成字幕
+        if sub_maker:
+            await generate_subtitle(sub_maker, text, subtitle_file)
+        else:
+            logger.error("Failed to generate sub_maker")
+    except Exception as e:
+        logger.error(f"failed, error: {str(e)}")
+        raise  # tenacity retries
+    finally:
+        # Restore original websocket connect
+        websockets.connect = original_connect
 
 
 async def generate_subtitle(sub_maker: edge_tts.SubMaker, text: str, subtitle_file: str):
