@@ -1,5 +1,6 @@
 import base64
 import time
+import os
 from openai import OpenAI
 from app.config import get_settings
 from loguru import logger
@@ -617,9 +618,22 @@ class LLMService:
                 )
                 segment["url"] = image_url
                 if image_url:
-                    with open(image_url, "rb") as f:
-                        previous_base64 = base64.b64encode(f.read()).decode()
-                        logger.info(f"Encode previous_base64 successfully, size: {len(previous_base64)} bytes")
+                    try:
+                        if os.path.exists(image_url):
+                            with open(image_url, "rb") as f:
+                                previous_base64 = base64.b64encode(f.read()).decode()
+                            logger.info(f"Encode previous_base64 successfully, size: {len(previous_base64)} bytes")
+                        else:
+                            parsed = urlparse(image_url)
+                            if parsed.scheme in ("http", "https"):
+                                resp = requests.get(image_url, timeout=30)
+                                resp.raise_for_status()
+                                previous_base64 = base64.b64encode(resp.content).decode()
+                                logger.info(f"Downloaded + encoded previous_base64, size: {len(previous_base64)} bytes")
+                            else:
+                                logger.warning(f"previous_base64 skipped, unknown path: {image_url}")
+                    except Exception as e:
+                        logger.warning(f"Failed to encode previous_base64: {e}")
             except Exception as e:
                 logger.error(f"Failed to generate image for segment: {e}")
                 segment["url"] = None

@@ -19,7 +19,7 @@ from moviepy import (
     afx,
 )
 from moviepy.video.tools import subtitles
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 import numpy as np
 import requests
 import random
@@ -85,13 +85,72 @@ def wrap_text(text, max_width, font="Arial", fontsize=60):
     # logger.warning(f"wrapped text: {result}")
     return result, height
 
+def parse_resolution(resolution: str, fallback=(768, 1344)):
+    if not resolution:
+        return fallback
+    value = resolution.lower().replace("x", "*")
+    try:
+        w_str, h_str = value.split("*")
+        return int(w_str.strip()), int(h_str.strip())
+    except Exception:
+        return fallback
+
+def pad_image_to_size(img: Image.Image, target_w: int, target_h: int) -> Image.Image:
+    if img.size == (target_w, target_h):
+        return img
+    # Fit image inside target without stretching
+    img_ratio = img.width / img.height
+    target_ratio = target_w / target_h
+    if img_ratio > target_ratio:
+        new_w = target_w
+        new_h = max(1, int(target_w / img_ratio))
+    else:
+        new_h = target_h
+        new_w = max(1, int(target_h * img_ratio))
+    resized = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+
+    # Create a blurred background from the image to avoid harsh bars
+    bg = img.resize((target_w, target_h), Image.Resampling.LANCZOS)
+    bg = bg.filter(ImageFilter.GaussianBlur(radius=24))
+
+    x = (target_w - new_w) // 2
+    y = (target_h - new_h) // 2
+    bg.paste(resized, (x, y))
+    return bg
+
+def build_image_clip(image_file: str, target_w: int, target_h: int, duration: float, image_scale: float = 1.2):
+    img = Image.open(image_file).convert("RGB")
+    img = pad_image_to_size(img, target_w, target_h)
+    image_clip = ImageClip(np.array(img))
+    origin_image_w, origin_image_h = image_clip.size
+
+    image_clip = image_clip.resized(image_scale)
+    image_clip = image_clip.cropped(
+        x_center=image_clip.w / 2,
+        y_center=image_clip.h / 2,
+        width=origin_image_w,
+        height=origin_image_h
+    )
+    image_clip = image_clip.with_duration(duration)
+
+    width_diff = origin_image_w * (image_scale - 1)
+    def pan_position(t):
+        if duration <= 0:
+            return (0, 0)
+        x = -width_diff * (t / duration)
+        y = 0
+        return (x, y)
+    image_clip = image_clip.with_position(pan_position)
+    return image_clip, origin_image_w, origin_image_h
+
 async def create_video_with_scenes(
         task_dir: str, 
         scenes: List[StoryScene], 
         voice_name: str, 
         voice_rate: float, 
         language: str = "en-US",
-        test_mode: bool = False) -> str:
+        test_mode: bool = False,
+        resolution: str = None) -> str:
     """创建带有场景的视频
 
     Args:
@@ -102,6 +161,7 @@ async def create_video_with_scenes(
         test_mode (bool): 是否为测试模式，如果是则使用已有的图片、音频、字幕文件
     """
     clips = []
+    target_w, target_h = parse_resolution(resolution) if resolution else (None, None)
     for i, scene in enumerate(scenes, 1):
         try:
             # 获取文件路径
@@ -130,30 +190,18 @@ async def create_video_with_scenes(
             subs = subtitles.file_to_subtitles(subtitle_file, encoding="utf-8")
             subtitle_duration = max([tb for ((ta, tb), txt) in subs])
                     
-            # 创建图片剪辑
-            image_clip = ImageClip(image_file)
-            origin_image_w, origin_image_h = image_clip.size  # 获取放大后的图片尺寸
-            image_scale = 1.2
-            # Resize and set duration
-            image_clip = image_clip.resized(image_scale)
-
-            # Crop back to canvas size
-            image_clip = image_clip.cropped(
-                x_center=image_clip.w / 2,
-                y_center=image_clip.h / 2,
-                width=origin_image_w,
-                height=origin_image_h
+            # 创建图片剪辑（统一尺寸，避免拉伸/拼贴）
+            if target_w is None or target_h is None:
+                base_img = Image.open(image_file)
+                target_w, target_h = base_img.size
+                base_img.close()
+            image_clip, origin_image_w, origin_image_h = build_image_clip(
+                image_file=image_file,
+                target_w=target_w,
+                target_h=target_h,
+                duration=subtitle_duration,
+                image_scale=1.2
             )
-            # 确保图片视频时长至少和字幕一样长
-            image_clip = image_clip.with_duration(subtitle_duration)
-
-            width_diff = origin_image_w * (image_scale - 1)
-            def pan_position(t):
-                logger.info(f"当前时间 t = {t}， subtitle_duration={subtitle_duration}， width_diff={width_diff}，{width_diff/subtitle_duration*t}")
-                x = -width_diff * (t / subtitle_duration)
-                y = 0
-                return (x, y)
-            image_clip = image_clip.with_position(pan_position)
             # 创建音频剪辑  
             audio_clip = AudioFileClip(audio_file)
             image_clip = image_clip.with_audio(audio_clip)
@@ -227,7 +275,7 @@ async def create_video_with_scenes(
 
     # 合并所有片段
     logger.info("Merging all clips")
-    final_clip = concatenate_videoclips(clips)
+    final_clip = concatenate_videoclips(clips, method="compose")
     video_file = os.path.join(task_dir, "video.mp4")
     logger.info(f"Writing video to {video_file}")
     final_clip.write_videofile(video_file, fps=24, codec='libx264', audio_codec='aac')
@@ -346,7 +394,15 @@ async def generate_video(request: VideoGenerateRequest):
                 json.dump(story_data, f, ensure_ascii=False, indent=2)
         # return ""
         # 生成视频
-        return await create_video_with_scenes(task_dir, scenes, request.voice_name, request.voice_rate,request.language, request.test_mode)
+        return await create_video_with_scenes(
+            task_dir,
+            scenes,
+            request.voice_name,
+            request.voice_rate,
+            request.language,
+            request.test_mode,
+            request.resolution,
+        )
     except Exception as e:
         logger.error(f"Failed to generate video: {e}")
         raise e

@@ -1171,6 +1171,27 @@ async def gtts_voice(text: str, voice_file: str, subtitle_file: str, language: s
         lines = split_string_by_punctuations(text)
         num_lines = len(lines)
 
+        def normalize_srt_times(time_pairs, total_s, min_gap=0.05, min_dur=0.25):
+            normalized = []
+            prev_end = 0.0
+            for start_s, end_s in time_pairs:
+                start_s = max(0.0, float(start_s))
+                end_s = max(float(end_s), start_s)
+                if start_s < prev_end + min_gap:
+                    start_s = prev_end + min_gap
+                if end_s < start_s + min_dur:
+                    end_s = start_s + min_dur
+                if end_s > total_s:
+                    end_s = total_s
+                    if end_s - start_s < min_dur:
+                        start_s = max(0.0, end_s - min_dur)
+                        if start_s < prev_end + min_gap:
+                            start_s = prev_end + min_gap
+                            end_s = min(total_s, start_s + min_dur)
+                normalized.append((start_s, end_s))
+                prev_end = end_s
+            return normalized
+
         if num_lines == 0:
             logger.warning("No lines for SRT")
             with open(subtitle_file, "w", encoding="utf-8") as f:
@@ -1179,10 +1200,13 @@ async def gtts_voice(text: str, voice_file: str, subtitle_file: str, language: s
             if len(nonsilent_chunks) >= num_lines:
                 # Use real speech chunk timings
                 with open(subtitle_file, "w", encoding="utf-8") as f:
+                    raw_pairs = []
+                    for i in range(num_lines):
+                        start_ms, end_ms = nonsilent_chunks[i]
+                        raw_pairs.append((start_ms / 1000.0, end_ms / 1000.0))
+                    norm_pairs = normalize_srt_times(raw_pairs, total_duration_s)
                     for i, line in enumerate(lines, 1):
-                        start_ms, end_ms = nonsilent_chunks[i-1]
-                        start_s = start_ms / 1000.0
-                        end_s = end_ms / 1000.0
+                        start_s, end_s = norm_pairs[i-1]
                         
                         start_hms = f"{int(start_s // 3600):02d}:{int((start_s % 3600) // 60):02d}:{int(start_s % 60):02d},{int((start_s % 1)*1000):03d}"
                         end_hms   = f"{int(end_s // 3600):02d}:{int((end_s % 3600) // 60):02d}:{int(end_s % 60):02d},{int((end_s % 1)*1000):03d}"
@@ -1198,9 +1222,15 @@ async def gtts_voice(text: str, voice_file: str, subtitle_file: str, language: s
                 
                 with open(subtitle_file, "w", encoding="utf-8") as f:
                     current_time = 0.5  # start 0.5s in to skip leading silence
-                    for i, line in enumerate(lines, 1):
+                    raw_pairs = []
+                    for _ in range(num_lines):
                         start_s = current_time
                         end_s = min(start_s + time_per_line, total_duration_s - 0.5)
+                        raw_pairs.append((start_s, end_s))
+                        current_time = end_s
+                    norm_pairs = normalize_srt_times(raw_pairs, total_duration_s)
+                    for i, line in enumerate(lines, 1):
+                        start_s, end_s = norm_pairs[i-1]
                         
                         start_hms = f"{int(start_s // 3600):02d}:{int((start_s % 3600) // 60):02d}:{int(start_s % 60):02d},{int((start_s % 1)*1000):03d}"
                         end_hms   = f"{int(end_s // 3600):02d}:{int((end_s % 3600) // 60):02d}:{int(end_s % 60):02d},{int((end_s % 1)*1000):03d}"
@@ -1208,8 +1238,6 @@ async def gtts_voice(text: str, voice_file: str, subtitle_file: str, language: s
                         f.write(f"{i}\n")
                         f.write(f"{start_hms} --> {end_hms}\n")
                         f.write(f"{line.strip()}\n\n")
-                        
-                        current_time = end_s
                 
                 logger.info(f"SRT fallback with silence trim")
     except Exception as e:
