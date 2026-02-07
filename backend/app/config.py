@@ -38,6 +38,7 @@ class Settings(BaseSettings):
     image_llm_model: str = "black-forest-labs/flux-1-dev" #"dall-e-3"
     
     image_resolution: str = "1080*1920"
+    avoid_exact_counts: bool = False
 
     class Config:
         env_file = ".env"

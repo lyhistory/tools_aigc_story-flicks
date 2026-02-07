@@ -184,7 +184,7 @@ async def create_video_with_scenes(
                 # 正式模式下生成所需文件
                 logger.info(f"Processing scene {i}")
                 audio_file, subtitle_file = await generate_voice(
-                    scene.text,
+                    scene.script,
                     voice_name,
                     voice_rate,
                     audio_file,
@@ -315,7 +315,16 @@ async def generate_video(request: VideoGenerateRequest):
             
             request = VideoGenerateRequest(**story_data)
             request.test_mode = True
-            scenes = [StoryScene(**scene) for scene in story_data.get("scenes", [])]
+            scenes = []
+            for scene in story_data.get("scenes", []):
+                scenes.append(
+                    StoryScene(
+                        script=scene.get("script", scene.get("text", "")),
+                        scene_prompt=scene.get("scene_prompt", scene.get("image_prompt", "")),
+                        objects=scene.get("objects", []),
+                        url=scene.get("url"),
+                    )
+                )
         else:
             task_id = str(int(time.time()))
             task_dir = utils.task_dir(task_id)
@@ -328,7 +337,10 @@ async def generate_video(request: VideoGenerateRequest):
                 text_llm_provider=request.text_llm_provider,
                 text_llm_model=request.text_llm_model,
                 image_llm_provider=request.image_llm_provider,
-                image_llm_model=request.image_llm_model
+                image_llm_model=request.image_llm_model,
+                use_inpainting=request.use_inpainting,
+                avoid_exact_counts=request.avoid_exact_counts,
+                topic_type=request.topic_type
             )
             logger.info(f"generate_video StoryGenerationRequest: {req}")
             story_list = await llm_service.generate_story_with_images(
@@ -362,7 +374,15 @@ async def generate_video(request: VideoGenerateRequest):
                 else:
                     logger.warning(f"Scene {i} has no image URL!")
         
-            scenes = [StoryScene(text=scene["text"], image_prompt=scene["image_prompt"], url=scene["url"]) for scene in story_list]
+            scenes = [
+                StoryScene(
+                    script=scene.get("script", scene.get("text", "")),
+                    scene_prompt=scene.get("scene_prompt", scene.get("image_prompt", "")),
+                    objects=scene.get("objects", []),
+                    url=scene.get("url"),
+                )
+                for scene in story_list
+            ]
             
             # 保存 story.json
             story_data = request.model_dump()

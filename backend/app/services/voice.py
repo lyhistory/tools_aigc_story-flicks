@@ -1163,11 +1163,37 @@ async def gtts_voice(text: str, voice_file: str, subtitle_file: str, language: s
         cleaned = re.sub(r"\\s+", " ", cleaned).strip()
         return cleaned
 
+    def expand_contractions(raw_text: str) -> str:
+        if not raw_text:
+            return raw_text
+        # Expand common contractions for clearer TTS pronunciation
+        replacements = {
+            "we're": "we are",
+            "you're": "you are",
+            "they're": "they are",
+            "I'm": "I am",
+            "i'm": "I am",
+            "it's": "it is",
+            "that's": "that is",
+            "there's": "there is",
+            "can't": "cannot",
+            "don't": "do not",
+            "doesn't": "does not",
+            "isn't": "is not",
+            "won't": "will not",
+            "let's": "let us",
+        }
+        text = raw_text
+        for k, v in replacements.items():
+            text = re.sub(rf"\\b{re.escape(k)}\\b", v, text)
+        return text
+
     try:
         clean_text = sanitize_text_for_tts(text)
+        tts_text = expand_contractions(clean_text)
         # Approximate rate: slow=True for slower speech
         slow = voice_rate < 0.8
-        tts = gTTS(text=clean_text, lang="en", tld=tld, slow=slow)
+        tts = gTTS(text=tts_text, lang="en", tld=tld, slow=slow)
         tts.save(voice_file)
         
         logger.info(f"gTTS success → saved: {voice_file}")
@@ -1202,6 +1228,15 @@ async def gtts_voice(text: str, voice_file: str, subtitle_file: str, language: s
                             end_s = min(total_s, start_s + min_dur)
                 normalized.append((start_s, end_s))
                 prev_end = end_s
+            # If the first subtitle starts noticeably late, shift earlier a bit
+            if normalized and normalized[0][0] > 0.2:
+                shift = min(0.2, normalized[0][0] - 0.05)
+                shifted = []
+                for start_s, end_s in normalized:
+                    start_s = max(0.0, start_s - shift)
+                    end_s = max(start_s + min_dur, end_s - shift)
+                    shifted.append((start_s, min(end_s, total_s)))
+                normalized = shifted
             return normalized
 
         if num_lines == 0:

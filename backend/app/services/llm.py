@@ -85,28 +85,65 @@ class LLMService:
             # Special case: exactly 1 segment → skip LLM, directly use user-provided prompt
             logger.info("segments == 1 → skipping LLM, using story_prompt directly as single scene")
             
-            # Create image prompt from story_prompt (you can customize this logic)
-            image_prompt = f"Detailed, family-friendly illustration of: {request.story_prompt}. Suitable for children, bright colors, no violence."
+            # Create scene prompt from story_prompt (you can customize this logic)
+            scene_prompt = f"Clear, family-friendly illustration teaching: {request.story_prompt}. Suitable for children, bright colors, no violence. Include concrete plural objects."
 
             single_scene = {
-                "text": request.story_prompt.strip(),
-                "image_prompt": image_prompt.strip()
+                "script": request.story_prompt.strip(),
+                "scene_prompt": scene_prompt.strip(),
+                "objects": []
             }
             
             return [single_scene]
             
         if request.language == Language.CHINESE_CN:
-            system_content = "你是一个专业的故事创作者，善于创作引人入胜的故事。请只返回JSON格式的内容。"
-            base_start = "讲一个故事，主题是："
+            system_content = "你是一个专业的英语老师，擅长用适合幼儿的方式讲解英语知识。请只返回JSON格式的内容。"
+            base_start = "请讲解一个英语学习话题，主题是："
             text_lang_note = "written in Chinese (简体中文)"
         else:
-            system_content = "You are a professional storyteller, skilled at creating engaging stories. Please return only JSON format content."
-            base_start = "Tell a story about:"
-            text_lang_note = "written in English"
+            system_content = "You are a professional UK English teacher who explains topics in a way that is clear, friendly, and suitable for young children. Please return only JSON format content."
+            base_start = "Discuss an English learning topic about:"
+            text_lang_note = "written in English (UK)"
         
+        extra_requirements = ""
+        sp = (request.story_prompt or "").lower()
+        topic_type = getattr(request, "topic_type", None)
+        is_edu_topic = (
+            topic_type == "explanation"
+            or any(k in sp for k in ["plural", "plurals", "grammar", "english", "learning", "teach", "lesson"])
+        )
+        if is_edu_topic:
+            extra_requirements = """
+        4. Do not invent named characters unless explicitly asked. Use generic roles like "a teacher" and "a child".
+        5. Use concrete object examples when teaching (e.g., cats, apples, books). Include multiple plural examples across scenes.
+        6. Each scene_prompt must explicitly mention the objects to draw and show plural counts (e.g., "two cats", "three apples").
+        7. Avoid repetitive "standing child" scenes; if people appear, show them interacting with the objects.
+        8. Provide an `objects` array listing the plural objects shown in the scene (e.g., ["two cats", "three apples"]).
+        9. Use a different object set in each scene; do not repeat the same object across scenes.
+            """
+        elif topic_type == "dialogue":
+            extra_requirements = """
+        4. Create a short two-person dialogue. Use simple, kid-friendly lines.
+        5. The scene_prompt should show both speakers interacting naturally.
+        6. Avoid forced teaching objects unless the topic explicitly needs them.
+            """
+        elif topic_type == "scene":
+            extra_requirements = """
+        4. Focus on describing a setting or moment. Keep characters minimal or optional.
+        5. The scene_prompt should emphasize environment, objects, and atmosphere.
+        6. Do not force a teacher or classroom unless the topic explicitly requires it.
+            """
+
         messages = [
             {"role": "system", "content": system_content},
-            {"role": "user", "content": await self._get_story_prompt(request.story_prompt, request.language, request.segments, base_start, text_lang_note)}
+            {"role": "user", "content": await self._get_story_prompt(
+                request.story_prompt,
+                request.language,
+                request.segments,
+                base_start,
+                text_lang_note,
+                extra_requirements,
+            )}
         ]
         logger.info(f"generate_story called | provider: {request.text_llm_provider} | model: {request.text_llm_model}")
         logger.info(f"prompt messages: {json.dumps(messages, indent=4, ensure_ascii=False)}")
@@ -121,24 +158,25 @@ class LLMService:
         return response
     def normalize_keys(self, data):
         """
-        阿里云和 openai 的模型返回结果不一致，处理一下
-        修改对象中非 `text` 的键为 `image_prompt`
-        - 如果是字典，替换 `text` 以外的单个键为 `image_prompt`
-        - 如果是列表，对列表中的每个对象递归处理
+        Normalize model outputs to expected keys:
+        - script (legacy: text)
+        - scene_prompt (legacy: image_prompt)
+        - objects (optional)
         """
         if isinstance(data, dict):
-            # 如果是字典，处理键值
-            if "text" in data:
-                # 找到非 `text` 的键
-                other_keys = [key for key in data.keys() if key != "text"]
-                # 确保只处理一个非 `text` 键的情况
+            if "text" in data and "script" not in data:
+                data["script"] = data.pop("text")
+            if "image_prompt" in data and "scene_prompt" not in data:
+                data["scene_prompt"] = data.pop("image_prompt")
+            # If only script + one other key, assume that other key is scene_prompt
+            if "script" in data and "scene_prompt" not in data:
+                other_keys = [key for key in data.keys() if key not in ("script", "objects", "url")]
                 if len(other_keys) == 1:
-                    data["image_prompt"] = data.pop(other_keys[0])
-                elif len(other_keys) > 1:
-                    raise ValueError(f"Unexpected extra keys: {other_keys}. Only one non-'text' key is allowed.")
+                    data["scene_prompt"] = data.pop(other_keys[0])
+            if "objects" not in data or data["objects"] is None:
+                data["objects"] = []
             return data
         elif isinstance(data, list):
-            # 如果是列表，递归处理每个对象
             return [self.normalize_keys(item) for item in data]
         else:
             raise TypeError("Input must be a dict or list of dicts")
@@ -171,6 +209,14 @@ class LLMService:
         logger.info(f"generate_image called | provider: {image_llm_provider} | model: {image_llm_model} | resolution: {resolution}")
         
         try:
+            style_prefix = (
+                "Bright, simple, friendly children's illustration, clean shapes, pastel colors, "
+                "clear objects for teaching, no realism, no horror. "
+            )
+            neg_style = (
+                "photorealistic, horror, creepy, scary, gore, deformed, mutated, "
+                "animal-human hybrid, extra limbs, distorted anatomy, uncanny, low quality"
+            )
             # 添加安全提示词
             safe_prompt = f"Create a safe, family-friendly illustration. {prompt} The image should be appropriate for all ages, non-violent, and non-controversial."
             
@@ -431,7 +477,17 @@ class LLMService:
                 # Assume you have first image as reference (base64 from previous generation)
                 # If no init_image, fallback to text-to-image mode (use a different model)
                 img2img_kwargs = img2img_kwargs or {}  # ensure dict, never None
-                if "init_image_base64" in img2img_kwargs and img2img_kwargs["init_image_base64"]:
+                model_name_lc = (image_llm_model or "").lower()
+                supports_image_input = any(
+                    name in model_name_lc
+                    for name in [
+                        "inpainting",
+                        "img2img",
+                        "dreamshaper-8-lcm",
+                    ]
+                )
+                wants_inpaint = bool(img2img_kwargs.get("init_image_base64")) and supports_image_input
+                if wants_inpaint:
                     # Validate base64 first
                     base64_str = img2img_kwargs["init_image_base64"]
 
@@ -446,30 +502,49 @@ class LLMService:
 
                         logger.info(f"Decoded init_image_base64 successfully, size: {len(image_bytes)} bytes")
 
-                        # Create a character-focused mask (center + slightly lower region)
+                        # Ensure init image matches requested resolution to avoid orientation drift
                         img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-                        mask = Image.new("L", img.size, 0)  # black mask
-                        width, height = img.size
+                        target_w, target_h = width, height
+                        logger.info(f"Init image size: {img.size} | target: {target_w}x{target_h}")
+                        if img.size != (target_w, target_h):
+                            img = img.resize((target_w, target_h), Image.Resampling.LANCZOS)
+
+                        # Re-encode to base64 to guarantee target orientation/size
+                        buf = io.BytesIO()
+                        img.save(buf, format="PNG")
+                        init_b64 = base64.b64encode(buf.getvalue()).decode()
+
+                        # Create a character-focused mask (center + slightly lower region)
+                        mask = Image.new("L", (target_w, target_h), 0)  # black mask
                         draw = ImageDraw.Draw(mask)
                         # Ellipse around center (upper body)
-                        ell_w = int(width * 0.6)
-                        ell_h = int(height * 0.55)
-                        ell_x0 = (width - ell_w) // 2
-                        ell_y0 = int(height * 0.1)
+                        ell_w = int(target_w * 0.6)
+                        ell_h = int(target_h * 0.55)
+                        ell_x0 = (target_w - ell_w) // 2
+                        ell_y0 = int(target_h * 0.1)
                         draw.ellipse((ell_x0, ell_y0, ell_x0 + ell_w, ell_y0 + ell_h), fill=255)
                         # Lower rectangle (full body/legs)
-                        rect_w = int(width * 0.7)
-                        rect_h = int(height * 0.5)
-                        rect_x0 = (width - rect_w) // 2
-                        rect_y0 = int(height * 0.45)
+                        rect_w = int(target_w * 0.7)
+                        rect_h = int(target_h * 0.5)
+                        rect_x0 = (target_w - rect_w) // 2
+                        rect_y0 = int(target_h * 0.45)
                         draw.rectangle((rect_x0, rect_y0, rect_x0 + rect_w, rect_y0 + rect_h), fill=255)
                         
                         mask_bytes = io.BytesIO()
                         mask.save(mask_bytes, format="PNG")
                         mask_bytes = mask_bytes.getvalue()
                         
+                        is_img2img = (supports_image_input and "inpainting" not in model_name_lc)
+                        strength_value = 0.35 if is_img2img else 0.45
+                        preserve_hint = ""
+                        if is_img2img:
+                            preserve_hint = (
+                                "Preserve character identity (face, hair, clothing) and keep the background unchanged. "
+                                "Make only small, gentle changes related to the prompt. "
+                            )
                         payload = {
                             "prompt": f"""
+                                    {style_prefix}
                                     Using the attached image as a strict visual reference:
 
                                     - Keep the same characters, faces, body proportions, clothing, and skin tones
@@ -478,6 +553,7 @@ class LLMService:
 
                                     Only make the following changes:
                                     {prompt}
+                                    {preserve_hint}
                                     Focus changes on the characters (pose/action/expression),
                                     keep the background unchanged.
                                     The result should look like the same moment in the same scene,
@@ -487,23 +563,36 @@ class LLMService:
                                     Style: consistent, cohesive, high visual continuity
                                     Content: safe, family-friendly, non-violent, appropriate for all ages
                                     """,
-                            "negative_prompt": """
+                            "negative_prompt": f"""
                                 blurry, low quality, deformed, 
                                 different character, different face, different body,
                                 changed background, new environment,
                                 distorted anatomy, wide body, short body,
                                 stretched proportions, deformed limbs,
-                                style change, camera change, perspective change
+                                style change, camera change, perspective change,
+                                {neg_style}
                                 """,
-                            "image_b64": img2img_kwargs["init_image_base64"],
-                            "mask": list(mask_bytes),    # array of bytes
+                            "image_b64": init_b64,
+                            **({} if is_img2img else {"mask": list(mask_bytes)}),    # mask only for inpainting
                             "num_steps": 20,
-                            "strength": 0.55,            # how much to change masked area
+                            "strength": strength_value,            # how much to change
                             "guidance": 7.5,
                             "width": width,
                             "height": height,
                             "seed": random.randint(1, 2147483647)
                         }
+                        if is_img2img:
+                            # For img2img, try swapped width/height to counter model orientation flip
+                            if "width" in payload and "height" in payload:
+                                payload["width"], payload["height"] = payload["height"], payload["width"]
+                                logger.info(f"img2img: swapped width/height to {payload['width']}x{payload['height']}")
+                            logger.info("img2img: omitting mask; using init image size")
+                        if "dreamshaper-8-lcm" in model_name_lc:
+                            logger.info("dreamshaper: keeping width/height, no mask")
+                        logger.info(
+                            f"image-input mode | supports_image_input={supports_image_input} | "
+                            f"is_img2img={is_img2img} | model={image_llm_model}"
+                        )
                     except base64.binascii.Error as b64_err:
                         logger.error(f"Invalid base64 in init_image_base64: {b64_err}")
                         logger.warning("Falling back to text-to-image due to bad base64")
@@ -519,75 +608,102 @@ class LLMService:
                     logger.warning("No init_image provided - falling back to text-to-image")
                     # Switch to text model or use same model without image/mask
                     payload = {
-                        "prompt": safe_prompt,
-                        "negative_prompt": "blurry, low quality",
+                        "prompt": f"{style_prefix}{safe_prompt}",
+                        "negative_prompt": f"blurry, low quality, {neg_style}",
                         "width": width,
                         "height": height,
                         "num_steps": 20,
                         "seed": random.randint(1, 2147483647)
                     }
-                    image_llm_model = "@cf/stabilityai/stable-diffusion-xl-base-1.0"  # text-to-image model
+                    # If user selected an img2img/inpainting model, switch to a text-to-image model
+                    model_name_lc = (image_llm_model or "").lower()
+                    if ("inpainting" in model_name_lc or "img2img" in model_name_lc) or not image_llm_model:
+                        image_llm_model = "@cf/stabilityai/stable-diffusion-xl-base-1.0"  # text-to-image model
                 
-                logger.info(f"Cloudflare payload keys: {list(payload.keys())}")
+                safe_payload = dict(payload)
+                if "image_b64" in safe_payload:
+                    safe_payload["image_b64"] = f"<base64:{len(str(safe_payload['image_b64']))} chars>"
+                if "mask" in safe_payload:
+                    safe_payload["mask"] = f"<mask:{len(safe_payload['mask'])} bytes>"
+                logger.info(f"Cloudflare payload summary: {safe_payload}")
                 
-                try:
-                    response = requests.post(f"{api_base_url}{image_llm_model}", headers=headers, json=payload, timeout=180)
-                    logger.info(f"Cloudflare status: {response.status_code}")
-                    
-                    content_type = response.headers.get("content-type", "").lower()
-                    logger.info(f"Cloudflare content_type: {content_type}")
-                    if response.status_code == 200:
-                        if "image/" in content_type:  # image/png, image/jpeg, etc.
-                            # Binary image response - this is the SUCCESS case for image models
-                            img_bytes = response.content
-                            
-                            task_path = Path(task_dir)
-                            task_path.mkdir(parents=True, exist_ok=True)
-                            image_filename = f"{segment_index}.png"
-                            image_path = task_path / image_filename
-                            image_path.write_bytes(img_bytes)
-                            
-                            logger.info(f"Cloudflare binary image saved: {image_path} (content-type: {content_type})")
-                            return str(image_path)
+                def is_wrong_orientation(image_path: Path) -> bool:
+                    try:
+                        with Image.open(image_path) as im:
+                            w, h = im.size
+                        return (width < height and w > h) or (width > height and w < h)
+                    except Exception:
+                        return False
+
+                for attempt in range(1):
+                    try:
+                        response = requests.post(f"{api_base_url}{image_llm_model}", headers=headers, json=payload, timeout=180)
+                        logger.info(f"Cloudflare status: {response.status_code}")
                         
-                        elif "application/json" in content_type:
-                            # JSON response - only for errors or text models
-                            try:
-                                result = response.json()
-                                logger.info(f"Cloudflare JSON response: {result}")
+                        content_type = response.headers.get("content-type", "").lower()
+                        logger.info(f"Cloudflare content_type: {content_type}")
+                        if response.status_code == 200:
+                            if "image/" in content_type:  # image/png, image/jpeg, etc.
+                                # Binary image response - this is the SUCCESS case for image models
+                                img_bytes = response.content
                                 
-                                if "result" in result and isinstance(result["result"], str):
-                                    base64_str = result["result"]
-                                    img_bytes = base64.b64decode(base64_str)
+                                task_path = Path(task_dir)
+                                task_path.mkdir(parents=True, exist_ok=True)
+                                image_filename = f"{segment_index}.png"
+                                image_path = task_path / image_filename
+                                image_path.write_bytes(img_bytes)
+                                
+                                if is_wrong_orientation(image_path):
+                                    with Image.open(image_path) as im:
+                                        w, h = im.size
+                                    logger.warning(f"Cloudflare wrong orientation attempt {attempt+1}: {w}x{h}")
+                                
+                                logger.info(f"Cloudflare binary image saved: {image_path} (content-type: {content_type})")
+                                return str(image_path)
+                            
+                            elif "application/json" in content_type:
+                                # JSON response - only for errors or text models
+                                try:
+                                    result = response.json()
+                                    logger.info(f"Cloudflare JSON response: {result}")
                                     
-                                    task_path = Path(task_dir)
-                                    task_path.mkdir(parents=True, exist_ok=True)
-                                    image_filename = f"scene_{segment_index}.png"
-                                    image_path = task_path / image_filename
-                                    image_path.write_bytes(img_bytes)
-                                    
-                                    logger.info(f"Cloudflare base64 image saved: {image_path}")
-                                    return str(image_path)
-                                else:
-                                    logger.error(f"Unexpected JSON format: {result}")
+                                    if "result" in result and isinstance(result["result"], str):
+                                        base64_str = result["result"]
+                                        img_bytes = base64.b64decode(base64_str)
+                                        
+                                        task_path = Path(task_dir)
+                                        task_path.mkdir(parents=True, exist_ok=True)
+                                        image_filename = f"scene_{segment_index}.png"
+                                        image_path = task_path / image_filename
+                                        image_path.write_bytes(img_bytes)
+                                        
+                                        if is_wrong_orientation(image_path):
+                                            with Image.open(image_path) as im:
+                                                w, h = im.size
+                                            logger.warning(f"Cloudflare wrong orientation attempt {attempt+1}: {w}x{h}")
+                                        
+                                        logger.info(f"Cloudflare base64 image saved: {image_path}")
+                                        return str(image_path)
+                                    else:
+                                        logger.error(f"Unexpected JSON format: {result}")
+                                        return ""
+                                except json.JSONDecodeError as json_err:
+                                    logger.error(f"JSON decode failed on Cloudflare response: {json_err}")
+                                    logger.error(f"Raw response body preview: {response.text[:500]}")
                                     return ""
-                            except json.JSONDecodeError as json_err:
-                                logger.error(f"JSON decode failed on Cloudflare response: {json_err}")
-                                logger.error(f"Raw response body preview: {response.text[:500]}")
+                            
+                            else:
+                                logger.error(f"Unknown content-type: {content_type}")
+                                logger.error(f"Raw response preview: {response.text[:500]}")
                                 return ""
                         
                         else:
-                            logger.error(f"Unknown content-type: {content_type}")
-                            logger.error(f"Raw response preview: {response.text[:500]}")
+                            error_text = response.text[:500]
+                            logger.error(f"Cloudflare error {response.status_code}: {error_text}")
                             return ""
-                    
-                    else:
-                        error_text = response.text[:500]
-                        logger.error(f"Cloudflare error {response.status_code}: {error_text}")
+                    except Exception as e:
+                        logger.error(f"Cloudflare generation failed: {str(e)}")
                         return ""
-                except Exception as e:
-                    logger.error(f"Cloudflare generation failed: {str(e)}")
-                    return ""
         except Exception as e:
             logger.error(f"Failed to generate image: {e}")
             return ""
@@ -606,6 +722,130 @@ class LLMService:
         story_segments = await self.generate_story(
             request,
         )
+
+        def soften_object_count(obj: str) -> str:
+            if not obj:
+                return obj
+            # Replace explicit counts with "some" to avoid exact-number rendering
+            return re.sub(
+                r"^\\s*(\\d+|one|two|three|four|five|six|seven|eight|nine|ten)\\b\\s+",
+                "some ",
+                obj.strip(),
+                flags=re.I,
+            )
+
+        def soften_counts_in_text(text: str) -> str:
+            if not text:
+                return text
+            # Replace explicit counts like "two cats" with "some cats"
+            return re.sub(
+                r"\\b(\\d+|one|two|three|four|five|six|seven|eight|nine|ten)\\b\\s+([a-zA-Z]+)",
+                r"some \\2",
+                text,
+                flags=re.I,
+            )
+
+        def enhance_scene_prompt_for_education(scene_text: str, scene_prompt: str, objects: list, use_exact_counts: bool, is_edu: bool) -> str:
+            if not is_edu:
+                return scene_prompt
+            base = (scene_prompt or "").strip()
+            obj_hint = ""
+            objects_for_prompt = objects
+            if objects and not use_exact_counts:
+                objects_for_prompt = [soften_object_count(o) for o in objects]
+            if objects_for_prompt:
+                obj_hint = f"Objects to show: {', '.join(objects_for_prompt)}."
+            count_hints = []
+            if use_exact_counts:
+                for obj in objects or []:
+                    m = re.match(r"^\\s*(\\d+|one|two|three|four|five|six|seven|eight|nine|ten)\\b\\s*(.*)$", obj.strip(), flags=re.I)
+                    if m:
+                        count = m.group(1)
+                        name = m.group(2).strip()
+                        if name:
+                            count_hints.append(f"exactly {count} {name}, no more, no fewer")
+            guidance = (
+                "Include clear visual examples of plural objects mentioned in the scene text "
+                "or objects list (e.g., two cats, three apples, several books). "
+                "Avoid a single child standing alone; if people appear, show a teacher/adult explaining with the objects visible. "
+                "Keep the background relevant to a learning setting."
+            )
+            count_hint_text = ""
+            if count_hints:
+                count_hint_text = "Quantity emphasis: " + "; ".join(count_hints) + "."
+            return f"{base}\n\n{obj_hint}\n{count_hint_text}\n{guidance}".strip()
+
+        def remove_named_characters(text: str) -> str:
+            if not text:
+                return text
+            # Replace "named X" patterns
+            cleaned = re.sub(r"\bnamed\s+[A-Z][a-z]+\b", "a child", text)
+            # Replace possessive names like "Timmy's"
+            cleaned = re.sub(r"\b[A-Z][a-z]{2,}'s\b", "the child's", cleaned)
+            return cleaned
+
+        def add_role_hints(scene: dict):
+            script = (scene.get("script", "") or "").lower()
+            hints = []
+            if "father" in script or "dad" in script:
+                hints.append("Show the father (adult man), not the mother.")
+            if "mother" in script or "mom" in script:
+                hints.append("Show the mother (adult woman), not the father.")
+            if "teacher" in script:
+                hints.append("Include a teacher (adult).")
+            if "boy" in script:
+                hints.append("Include a boy.")
+            if "girl" in script:
+                hints.append("Include a girl.")
+            if hints:
+                scene["scene_prompt"] = (scene.get("scene_prompt", "") + "\n" + " ".join(hints)).strip()
+
+        def ensure_unique_objects(scene: dict, idx: int, used_objects: set) -> list:
+            fallback_objects = [
+                "two cats",
+                "three apples",
+                "four books",
+                "five toys",
+                "six pencils",
+                "seven balls",
+                "eight cars",
+                "nine dogs",
+                "ten stars",
+            ]
+            objs = scene.get("objects") or []
+            # Normalize to list of strings
+            objs = [str(o).strip() for o in objs if str(o).strip()]
+            # If empty or repeats, assign a new one
+            if not objs:
+                for item in fallback_objects:
+                    if item not in used_objects:
+                        objs = [item]
+                        break
+            else:
+                # If any object already used, replace with a new one
+                if any(o in used_objects for o in objs):
+                    for item in fallback_objects:
+                        if item not in used_objects:
+                            objs = [item]
+                            break
+            for o in objs:
+                used_objects.add(o)
+            scene["objects"] = objs
+            return objs
+
+        def ensure_objects_in_script(scene: dict, objects: list, use_exact_counts: bool):
+            if not objects:
+                return
+            script = scene.get("script", "")
+            script_lower = script.lower()
+            if any(o.lower() in script_lower for o in objects):
+                return
+            # Append a short kid-friendly counting line
+            if use_exact_counts:
+                objects_phrase = ", ".join(objects)
+                scene["script"] = (script + f" Let's count {objects_phrase} together!").strip()
+            else:
+                scene["script"] = (script + " Let's count together: 1, 2, 3... so many!").strip()
 
         # Create task dir early (or receive from upper caller)
         if not task_dir:
@@ -680,18 +920,67 @@ class LLMService:
         previous_base64 = None
 
         # 为每个场景生成图片
+        used_objects = set()
+        use_inpainting = bool(getattr(request, "use_inpainting", False))
+        image_model_name = (request.image_llm_model or settings.image_llm_model or "").lower()
+        avoid_counts = settings.avoid_exact_counts
+        if getattr(request, "avoid_exact_counts", None) is not None:
+            avoid_counts = bool(request.avoid_exact_counts)
+        use_exact_counts = (not avoid_counts) and ("lightning" not in image_model_name)
+        is_edu_topic = (
+            getattr(request, "topic_type", None) == "explanation"
+            or any(k in (request.story_prompt or "").lower() for k in ["plural", "plurals", "grammar", "english", "learning", "teach", "lesson"])
+        )
+        target_w, target_h = None, None
+        if request.resolution:
+            try:
+                w_str, h_str = request.resolution.replace("x", "*").split("*")
+                target_w, target_h = int(w_str.strip()), int(h_str.strip())
+            except Exception:
+                target_w, target_h = None, None
         for idx, segment in enumerate(story_segments, 1):
             logger.info(f"Wait for 2 mins, free api have concurrency limits")
             time.sleep(120)
             logger.info(f"2 mins passed")
             
             try:
-                variation_hint = await build_variation_hint(segment.get("text", ""), idx, request) if idx > 1 else ""
-                img2img_kwargs = {"init_image_base64": previous_base64} if previous_base64 else {}
+                logger.info(
+                    f"Scene {idx} start | use_inpainting={use_inpainting} | "
+                    f"model={request.image_llm_model or settings.image_llm_model} | "
+                    f"resolution={request.resolution}"
+                )
+                segment["script"] = remove_named_characters(segment.get("script", ""))
+                segment["scene_prompt"] = remove_named_characters(segment.get("scene_prompt", ""))
+                if is_edu_topic and not use_exact_counts:
+                    segment["script"] = soften_counts_in_text(segment.get("script", ""))
+                    segment["scene_prompt"] = soften_counts_in_text(segment.get("scene_prompt", ""))
+                objs = []
+                if is_edu_topic:
+                    objs = ensure_unique_objects(segment, idx, used_objects)
+                    ensure_objects_in_script(segment, objs, use_exact_counts)
+                else:
+                    segment["objects"] = segment.get("objects", [])
+                add_role_hints(segment)
+                variation_hint = await build_variation_hint(segment.get("script", ""), idx, request) if idx > 1 else ""
+                img2img_kwargs = {}
+                if use_inpainting and previous_base64:
+                    img2img_kwargs = {"init_image_base64": previous_base64}
+                logger.info(
+                    f"Scene {idx} image mode | "
+                    f"img2img={'yes' if img2img_kwargs else 'no'} | "
+                    f"init_image_bytes={'present' if img2img_kwargs else 'none'}"
+                )
+                segment["scene_prompt"] = enhance_scene_prompt_for_education(
+                    segment.get("script", ""),
+                    segment.get("scene_prompt", ""),
+                    segment.get("objects", []),
+                    use_exact_counts,
+                    is_edu_topic,
+                )
                 
                 image_url = self.generate_image(
                     prompt=(
-                        segment["image_prompt"]
+                        segment["scene_prompt"]
                         + (f"\n\nVariation hint for this scene: {variation_hint}" if variation_hint else "")
                     ),
                     resolution=request.resolution, 
@@ -702,6 +991,14 @@ class LLMService:
                     **img2img_kwargs
                 )
                 segment["url"] = image_url
+                if image_url and os.path.exists(image_url):
+                    try:
+                        with Image.open(image_url) as im:
+                            w, h = im.size
+                        logger.info(f"Scene {idx} output size: {w}x{h}")
+                    except Exception as e:
+                        logger.warning(f"Scene {idx} output size check failed: {e}")
+                # Orientation recheck removed per request (no retry)
                 if image_url:
                     try:
                         if os.path.exists(image_url):
@@ -748,7 +1045,15 @@ class LLMService:
             textLLMList.append("cloudflare")
             imgLLMList.append("cloudflare")
         
-        return { "textLLMProviders": textLLMList, "imageLLMProviders": imgLLMList, "text_llm_model": settings.text_llm_model, "image_llm_model": settings.image_llm_model, "resolution": settings.image_resolution }
+        return {
+            "textLLMProviders": textLLMList,
+            "imageLLMProviders": imgLLMList,
+            "text_llm_model": settings.text_llm_model,
+            "image_llm_model": settings.image_llm_model,
+            "resolution": settings.image_resolution,
+            "text_llm_provider": settings.text_provider,
+            "image_llm_provider": settings.image_provider,
+        }
 
     def _validate_story_response(self, response: any) -> None:
         """验证故事生成响应
@@ -766,17 +1071,20 @@ class LLMService:
             if not isinstance(scene, dict):
                 raise LLMResponseValidationError(f"story item {i} must be an object")
             
-            if "text" not in scene:
-                raise LLMResponseValidationError(f"Scene {i} missing 'text' field")
+            if "script" not in scene:
+                raise LLMResponseValidationError(f"Scene {i} missing 'script' field")
             
-            if "image_prompt" not in scene:
-                raise LLMResponseValidationError(f"Scene {i} missing 'image_prompt' field")
+            if "scene_prompt" not in scene:
+                raise LLMResponseValidationError(f"Scene {i} missing 'scene_prompt' field")
             
-            if not isinstance(scene["text"], str):
-                raise LLMResponseValidationError(f"Scene {i} 'text' must be a string")
+            if not isinstance(scene["script"], str):
+                raise LLMResponseValidationError(f"Scene {i} 'script' must be a string")
             
-            if not isinstance(scene["image_prompt"], str):
-                raise LLMResponseValidationError(f"Scene {i} 'image_prompt' must be a string")
+            if not isinstance(scene["scene_prompt"], str):
+                raise LLMResponseValidationError(f"Scene {i} 'scene_prompt' must be a string")
+            
+            if "objects" in scene and not isinstance(scene["objects"], list):
+                raise LLMResponseValidationError(f"Scene {i} 'objects' must be an array")
 
     async def _generate_response(self, *, text_llm_provider: str = None, text_llm_model: str = None, messages: List[Dict[str, str]], response_format: str = "json_object") -> any:
         """生成 LLM 响应
@@ -860,7 +1168,7 @@ class LLMService:
             logger.error(f"Failed to parse response: {e}")
             raise e
 
-    async def _get_story_prompt(self, story_prompt: str = None, language: Language = Language.CHINESE_CN, segments: int = 3, base_start: str = "讲一个故事，主题是：", text_lang_note: str = "written in Chinese (简体中文)") -> str:
+    async def _get_story_prompt(self, story_prompt: str = None, language: Language = Language.CHINESE_CN, segments: int = 3, base_start: str = "讲一个故事，主题是：", text_lang_note: str = "written in Chinese (简体中文)", extra_requirements: str = "") -> str:
         """生成故事提示词
 
         Args:
@@ -887,7 +1195,7 @@ class LLMService:
             array_note = f"The 'list' array must contain exactly {segments} objects."
             
         return f"""
-        {base_prompt}. {segment_instruction}, and each scene must include descriptive text and an image prompt.
+        {base_prompt}. {segment_instruction}, and each scene must include a narration script and a visual scene prompt.
 
         Please return the result in the following JSON format, where the key `list` contains an array of objects:
 
@@ -895,8 +1203,9 @@ class LLMService:
         {{
             "list": [
                 {{
-                    "text": "Descriptive text for the scene",
-                    "image_prompt": "Detailed image generation prompt, described in English"
+                    "script": "Short, kid-friendly narration for the scene",
+                    "scene_prompt": "Detailed visual prompt describing what to draw, in English",
+                    "objects": ["two cats", "three apples"]
                 }}
                 ,// ... {segments-1} more if segments > 1
             ]
@@ -905,9 +1214,11 @@ class LLMService:
         **Requirements**:
         1. The root object must contain a key named `list`, and its value must be an array of scene objects.
         2. Each object in the `list` array must include:
-            - `text`: A descriptive text for the scene, written in {languageValue}.
-            - `image_prompt`: A detailed prompt for generating an image, written in English.
-        3. Ensure the JSON format matches the above example exactly. Avoid extra fields or incorrect key names like `cimage_prompt` or `inage_prompt`.
+            - `script`: A short, kid-friendly narration for the scene, written in {languageValue}.
+            - `scene_prompt`: A detailed prompt for generating an image, written in English.
+            - `objects`: An array of plural objects to show (e.g., ["two cats", "three apples"]). Use [] if none.
+        3. Ensure the JSON format matches the above example exactly. Avoid extra fields or incorrect key names.
+        {extra_requirements}
         {array_note}
 
         **Important**:

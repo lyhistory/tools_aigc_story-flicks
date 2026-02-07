@@ -286,12 +286,13 @@ class BgmUploadResponse(BaseResponse):
         }
 
 
-from app.models.const import StoryType, ImageStyle
+from app.models.const import StoryType, ImageStyle, TopicType
 
 class StoryScene(BaseModel):
     """故事场景"""
-    text: str = Field(description="场景文本")
-    image_prompt: str = Field(description="图片生成提示词")
+    script: str = Field(description="场景讲解脚本")
+    scene_prompt: str = Field(description="图片生成提示词")
+    objects: List[str] = Field(default_factory=list, description="场景中的关键对象")
     url: Optional[str] = Field(default=None, description="生成的图片 URL")
 
 class VideoGenerateRequest(BaseModel):
@@ -305,10 +306,13 @@ class VideoGenerateRequest(BaseModel):
     segments: int = Field(default=3, ge=1, le=10, description="分段数量")
     language: Language = Field(default=Language.CHINESE_CN, description="故事语言")
     story_prompt: Optional[str] = Field(default=None, description="故事提示词")
+    topic_type: Optional[TopicType] = Field(default=None, description="主题类型")
     image_style: ImageStyle = Field(default=ImageStyle.realistic, description="图片风格")
     voice_name: str = Field(default="zh-CN-XiaoxiaoNeural", description="语音名称")
     voice_rate: float = Field(default=1.0, description="语音速率")
     resolution: Optional[str] = Field(default="1024*1024", description="分辨率")
+    use_inpainting: Optional[bool] = Field(default=False, description="是否使用图生图/修复模式")
+    avoid_exact_counts: Optional[bool] = Field(default=None, description="是否避免精确数量")
 
 
 class VideoGenerateResponse(BaseModel):

@@ -26,6 +26,12 @@ class Language(str, Enum):
     JAPANESE = "ja-JP"        # 日语
     KOREAN = "ko-KR"          # 韩语
 
+class TopicType(str, Enum):
+    """Topic type for kids learning videos"""
+    dialogue = "dialogue"      # two people dialog
+    explanation = "explanation"  # explain a word/grammar/science
+    scene = "scene"            # describe a scene or setting
+
 # 语言名称映射
 LANGUAGE_NAMES = {
     Language.CHINESE_CN: "中文（简体）",

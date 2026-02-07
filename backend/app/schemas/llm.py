@@ -1,6 +1,6 @@
 from pydantic import BaseModel, Field
 from typing import List, Dict, Any
-from app.models.const import Language
+from app.models.const import Language, TopicType
 from typing import Optional
 
 class StoryGenerationRequest(BaseModel):
@@ -12,11 +12,15 @@ class StoryGenerationRequest(BaseModel):
     segments: int = Field(..., ge=1, le=10, description="Number of story segments to generate")
     story_prompt: str = Field(..., min_length=1, max_length=4000, description="Theme or topic of the story")
     language: Language = Field(default=Language.CHINESE_CN, description="Story language")
+    topic_type: Optional[TopicType] = Field(default=None, description="Topic type for storyboard generation")
+    use_inpainting: Optional[bool] = Field(default=False, description="Whether to use img2img/inpainting for image generation")
+    avoid_exact_counts: Optional[bool] = Field(default=None, description="Avoid exact numeric counts in prompts")
 
 
 class StorySegment(BaseModel):
-    text: str = Field(..., description="Story text")
-    image_prompt: str = Field(..., description="Image generation prompt")
+    script: str = Field(..., description="Narration script for subtitles/voice")
+    scene_prompt: str = Field(..., description="Visual scene prompt for image generation")
+    objects: List[str] = Field(default_factory=list, description="Key plural objects to show in the scene")
     url: str = Field(None, description="Generated image URL")
 
 

@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import type { FormProps } from 'antd';
-import { Button, Form, Input, Select, message } from 'antd';
+import { Button, Form, Input, Select, message, Switch, Tooltip } from 'antd';
 import { useTranslation } from 'react-i18next'
 import { getVoiceList, getLLMProviders, generateVideo } from '../../services/index';
 import { VOICE_LANGUAGES, VOICE_LANGUAGES_LABELS } from '../../constants';
@@ -13,12 +13,15 @@ type FieldType = {
     image_llm_provider?: string; // Image LLM provider
     text_llm_model?: string; // Text LLM model
     image_llm_model?: string; // Image LLM model
+    use_inpainting?: boolean; // Use img2img/inpainting
+    avoid_exact_counts?: boolean; // Avoid exact numeric counts
     resolution?: string; // 分辨率
     test_mode?: boolean; // 是否为测试模式
     task_id?: string; // 任务ID，测试模式才需要
     segments: number; // 分段数量 (1-10)
     language?: Language; // 故事语言
     story_prompt?: string; // 故事提示词，测试模式不需要，非测试模式必填
+    topic_type?: "dialogue" | "explanation" | "scene";
     image_style?: string; // 图片风格，测试模式不需要，非测试模式必填
     voice_name: string; // 语音名称，需要和语言匹配
     voice_rate: number; // 语音速率，默认写1
@@ -51,6 +54,9 @@ const App: React.FC = () => {
                     text_llm_model: res.text_llm_model,
                     image_llm_model: res.image_llm_model,
                     resolution: res.resolution || '1080*1920', // fallback
+                    avoid_exact_counts: true,
+                    text_llm_provider: res.text_llm_provider || res.textLLMProviders?.[0],
+                    image_llm_provider: res.image_llm_provider || res.imageLLMProviders?.[0],
                 });
         }).catch(err => {
             console.log(err);
@@ -86,12 +92,7 @@ const App: React.FC = () => {
     const onFinishFailed: FormProps<FieldType>['onFinishFailed'] = (errorInfo) => {
         console.log('Failed:', errorInfo);
     };
-    useEffect(() => {
-        form.setFieldsValue({
-            text_llm_provider: llmProviders.textLLMProviders?.[0],
-            image_llm_provider: llmProviders.imageLLMProviders?.[0],
-         });
-      }, [llmProviders.imageLLMProviders, llmProviders.textLLMProviders]);
+    // defaults are set from backend in the initial load effect
         return (
             <div className={styles.formDiv}>
                 <Form
@@ -109,7 +110,6 @@ const App: React.FC = () => {
                         label={t('storyForm.txtLLMProvider')}
                         name="text_llm_provider"
                         rules={[{ required: true, message: t('storyForm.txtLLMProviderMissMsg') }]}
-                        initialValue={llmProviders.textLLMProviders?.[0]}
                     >
                         <Select>
                             {
@@ -123,7 +123,6 @@ const App: React.FC = () => {
                         label={t('storyForm.imgLLMProvider')}
                         name="image_llm_provider"
                         rules={[{ required: true, message: t('storyForm.imgLLMProviderMissMsg') }]}
-                        initialValue={llmProviders.imageLLMProviders?.[0]}
                     >
                         <Select>
                             {
@@ -153,6 +152,29 @@ const App: React.FC = () => {
                         rules={[{ required: true, message: t('storyForm.resolutionMissMsg') }]}
                     >
                         <Input placeholder={t('storyForm.resolutionPlaceholder')} />
+                    </Form.Item>
+                    <Form.Item<FieldType>
+                        label={
+                            <Tooltip title="Use img2img/inpainting to keep visual continuity. Turn off for text-to-image models.">
+                                <span>Use Inpainting</span>
+                            </Tooltip>
+                        }
+                        name="use_inpainting"
+                        valuePropName="checked"
+                    >
+                        <Switch />
+                    </Form.Item>
+                    <Form.Item<FieldType>
+                        label={
+                            <Tooltip title="Avoid exact numbers like 'two cats' when the image model struggles with counting.">
+                                <span>Avoid Exact Counts</span>
+                            </Tooltip>
+                        }
+                        name="avoid_exact_counts"
+                        valuePropName="checked"
+                        initialValue={true}
+                    >
+                        <Switch defaultChecked />
                     </Form.Item>
                     <Form.Item<FieldType>
                         label={t('storyForm.videoLanguage')}
@@ -213,6 +235,18 @@ const App: React.FC = () => {
                         rules={[{ required: true, message: t('storyForm.textPromptMissMsg') }]}
                     >
                         <Input.TextArea rows={4} placeholder={t('storyForm.storyPromptPlaceholder')} />
+                    </Form.Item>
+                    <Form.Item<FieldType>
+                        label="Topic Type"
+                        name="topic_type"
+                        initialValue="explanation"
+                        rules={[{ required: true, message: "Please select a topic type" }]}
+                    >
+                        <Select>
+                            <Select.Option value="dialogue">Dialogue (kid + kid/teacher/parent)</Select.Option>
+                            <Select.Option value="explanation">Explanation (word/grammar/science)</Select.Option>
+                            <Select.Option value="scene">Scene Description</Select.Option>
+                        </Select>
                     </Form.Item>
                     <Form.Item<FieldType>
                         label={t('storyForm.segments')}
