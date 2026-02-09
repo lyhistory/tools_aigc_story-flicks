@@ -293,6 +293,7 @@ class StoryScene(BaseModel):
     script: str = Field(description="场景讲解脚本")
     scene_prompt: str = Field(description="图片生成提示词")
     objects: List[str] = Field(default_factory=list, description="场景中的关键对象")
+    keywords: List[Dict[str, str]] = Field(default_factory=list, description="关键词与发音解释")
     url: Optional[str] = Field(default=None, description="生成的图片 URL")
 
 class VideoGenerateRequest(BaseModel):

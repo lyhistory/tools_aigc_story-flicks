@@ -535,13 +535,11 @@ class LLMService:
                         mask_bytes = mask_bytes.getvalue()
                         
                         is_img2img = (supports_image_input and "inpainting" not in model_name_lc)
-                        strength_value = 0.35 if is_img2img else 0.45
+                        # Allow more change for img2img to avoid "all same" images
+                        strength_value = 0.55 if is_img2img else 0.45
                         preserve_hint = ""
                         if is_img2img:
-                            preserve_hint = (
-                                "Preserve character identity (face, hair, clothing) and keep the background unchanged. "
-                                "Make only small, gentle changes related to the prompt. "
-                            )
+                            preserve_hint = ""
                         payload = {
                             "prompt": f"""
                                     {style_prefix}
@@ -550,7 +548,6 @@ class LLMService:
                                     - Keep the same characters, faces, body proportions, clothing, and skin tones
                                     - Keep the same background, environment, lighting, camera angle, and art style
                                     - Do NOT change character identity or scene composition
-
                                     Only make the following changes:
                                     {prompt}
                                     {preserve_hint}
@@ -573,7 +570,7 @@ class LLMService:
                                 {neg_style}
                                 """,
                             "image_b64": init_b64,
-                            **({} if is_img2img else {"mask": list(mask_bytes)}),    # mask only for inpainting
+                            "mask": list(mask_bytes),
                             "num_steps": 20,
                             "strength": strength_value,            # how much to change
                             "guidance": 7.5,
@@ -635,6 +632,15 @@ class LLMService:
                     except Exception:
                         return False
 
+                def is_black_image(image_path: Path) -> bool:
+                    try:
+                        with Image.open(image_path) as im:
+                            extrema = im.convert("RGB").getextrema()
+                        # extrema is ((minR,maxR),(minG,maxG),(minB,maxB))
+                        return all(ch[1] <= 5 for ch in extrema)
+                    except Exception:
+                        return False
+
                 for attempt in range(1):
                     try:
                         response = requests.post(f"{api_base_url}{image_llm_model}", headers=headers, json=payload, timeout=180)
@@ -657,7 +663,17 @@ class LLMService:
                                     with Image.open(image_path) as im:
                                         w, h = im.size
                                     logger.warning(f"Cloudflare wrong orientation attempt {attempt+1}: {w}x{h}")
-                                
+
+                                if is_black_image(image_path) and is_img2img and "mask" in payload:
+                                    logger.warning("Cloudflare returned black image for img2img, retrying without mask once")
+                                    payload_no_mask = dict(payload)
+                                    payload_no_mask.pop("mask", None)
+                                    payload_no_mask["seed"] = random.randint(1, 2147483647)
+                                    response = requests.post(f"{api_base_url}{image_llm_model}", headers=headers, json=payload_no_mask, timeout=180)
+                                    if response.status_code == 200 and "image/" in response.headers.get("content-type", "").lower():
+                                        image_path.write_bytes(response.content)
+                                        logger.info("Replaced black image with retry (no mask)")
+
                                 logger.info(f"Cloudflare binary image saved: {image_path} (content-type: {content_type})")
                                 return str(image_path)
                             
@@ -681,7 +697,28 @@ class LLMService:
                                             with Image.open(image_path) as im:
                                                 w, h = im.size
                                             logger.warning(f"Cloudflare wrong orientation attempt {attempt+1}: {w}x{h}")
-                                        
+
+                                        if is_black_image(image_path) and is_img2img and "mask" in payload:
+                                            logger.warning("Cloudflare returned black image for img2img, retrying without mask once")
+                                            payload_no_mask = dict(payload)
+                                            payload_no_mask.pop("mask", None)
+                                            payload_no_mask["seed"] = random.randint(1, 2147483647)
+                                            response = requests.post(f"{api_base_url}{image_llm_model}", headers=headers, json=payload_no_mask, timeout=180)
+                                            if response.status_code == 200:
+                                                content_type2 = response.headers.get("content-type", "").lower()
+                                                if "image/" in content_type2:
+                                                    image_path.write_bytes(response.content)
+                                                    logger.info("Replaced black image with retry (no mask)")
+                                                elif "application/json" in content_type2:
+                                                    try:
+                                                        result2 = response.json()
+                                                        if "result" in result2 and isinstance(result2["result"], str):
+                                                            img_bytes2 = base64.b64decode(result2["result"])
+                                                            image_path.write_bytes(img_bytes2)
+                                                            logger.info("Replaced black image with retry (no mask, base64)")
+                                                    except Exception:
+                                                        pass
+
                                         logger.info(f"Cloudflare base64 image saved: {image_path}")
                                         return str(image_path)
                                     else:
@@ -919,6 +956,65 @@ class LLMService:
 
         previous_base64 = None
 
+        async def extract_keywords_from_scripts(scripts: List[str], count: int = 2):
+            if not scripts:
+                return []
+            joined = " ".join([s for s in scripts if s])
+            messages = [
+                {
+                    "role": "system",
+                    "content": "You extract 1-2 key learning words from a kids' English script. Return only JSON.",
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "Pick 1-2 important verbs or nouns from the script. "
+                        "For each word, return both US and UK pronunciation (IPA) and a short kid-friendly explanation. "
+                        "Use clean IPA without syllable dots (no '.' or '·') and use length mark like 'ː' when needed.\n"
+                        "Return JSON: {\"keywords\":[{\"word\":\"...\",\"pronunciation_us\":\"...\",\"pronunciation_uk\":\"...\",\"explanation\":\"...\"}]}\n\n"
+                        f"Script: {joined}"
+                    ),
+                },
+            ]
+            try:
+                result = await self._generate_response(
+                    text_llm_provider=request.text_llm_provider,
+                    text_llm_model=request.text_llm_model,
+                    messages=messages,
+                    response_format="json_object",
+                )
+                keywords = result.get("keywords", [])
+                if isinstance(keywords, list):
+                    return keywords[:count]
+            except Exception as e:
+                logger.warning(f"Keyword extraction failed: {e}")
+            return []
+
+        # Extract 1-2 keywords for the whole video
+        keywords = await extract_keywords_from_scripts(
+            [s.get("script", "") for s in story_segments],
+            count=2,
+        )
+        if not keywords:
+            # Simple fallback: pick first verb-like word from script
+            fallback_verbs = ["walk", "run", "look", "smile", "hold", "pull", "talk", "say", "go", "play", "learn"]
+            joined = " ".join([s.get("script", "") for s in story_segments]).lower()
+            picked = None
+            for v in fallback_verbs:
+                if re.search(rf"\\b{re.escape(v)}\\b", joined):
+                    picked = v
+                    break
+            if picked:
+                keywords = [{
+                    "word": picked,
+                    "pronunciation_us": "",
+                    "pronunciation_uk": "",
+                    "explanation": f"to {picked}"
+                }]
+        logger.info(f"Extracted keywords: {keywords}")
+        for s in story_segments:
+            s["keywords"] = keywords
+
         # 为每个场景生成图片
         used_objects = set()
         use_inpainting = bool(getattr(request, "use_inpainting", False))
@@ -977,6 +1073,11 @@ class LLMService:
                     use_exact_counts,
                     is_edu_topic,
                 )
+                if getattr(request, "topic_type", None) in ("dialogue", "scene"):
+                    segment["scene_prompt"] = (
+                        segment["scene_prompt"]
+                        + "\nKeep the overall look and feel identical; only change motion or add small details. Keep the same characters and background."
+                    )
                 
                 image_url = self.generate_image(
                     prompt=(

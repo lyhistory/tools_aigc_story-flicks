@@ -21,6 +21,7 @@ class StorySegment(BaseModel):
     script: str = Field(..., description="Narration script for subtitles/voice")
     scene_prompt: str = Field(..., description="Visual scene prompt for image generation")
     objects: List[str] = Field(default_factory=list, description="Key plural objects to show in the scene")
+    keywords: List[Dict[str, str]] = Field(default_factory=list, description="Keywords with pronunciation and explanation")
     url: str = Field(None, description="Generated image URL")
 
 
