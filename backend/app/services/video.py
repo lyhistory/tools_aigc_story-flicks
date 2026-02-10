@@ -1,6 +1,7 @@
 import os
 import time
 import json
+import math
 from typing import List
 from app.schemas.llm import StoryGenerationRequest
 from loguru import logger
@@ -16,6 +17,7 @@ from moviepy import (
     TextClip,
     CompositeVideoClip,
     concatenate_videoclips,
+    ImageSequenceClip,
     afx,
 )
 from moviepy.video.tools import subtitles
@@ -24,8 +26,6 @@ import numpy as np
 import requests
 import random
 import shutil
-
-from moviepy import ImageClip, CompositeVideoClip, AudioFileClip, TextClip, concatenate_videoclips
 from moviepy.video.tools.subtitles import SubtitlesClip, file_to_subtitles
 import re
 
@@ -276,6 +276,136 @@ async def create_video_with_scenes(
         img.save(file_path, format="PNG")
         return img.size
 
+    def render_text_rgba(
+        text: str,
+        font_path: str,
+        font_size: int,
+        color: str,
+        max_width: int,
+        bg_rgba=(0, 0, 0, 0),
+        highlight_word: str | None = None,
+        highlight_bg_rgba=(255, 241, 153, 180),
+        highlight_text_color: str | None = None,
+    ) -> Image.Image | None:
+        if not text:
+            return None
+        wrapped_txt, _ = wrap_text(text, max_width=max_width, font=font_path, fontsize=font_size)
+        lines = wrapped_txt.split("\n")
+        font = ImageFont.truetype(font_path, font_size)
+        line_sizes = []
+        for line in lines:
+            bbox = font.getbbox(line)
+            w = max(1, bbox[2] - bbox[0])
+            h = max(1, bbox[3] - bbox[1])
+            line_sizes.append((line, bbox, w, h))
+        pad_x = max(8, int(font_size * 0.35))
+        pad_y = max(6, int(font_size * 0.3))
+        width = max(w for _, _, w, _ in line_sizes) + pad_x * 2
+        line_spacing = max(4, int(font_size * 0.15))
+        height = sum(h for _, _, _, h in line_sizes) + line_spacing * (len(line_sizes) - 1) + pad_y * 2
+        img = Image.new("RGBA", (width, height), bg_rgba)
+        draw = ImageDraw.Draw(img)
+        highlight = (highlight_word or "").strip()
+        y = pad_y
+        for line, bbox, w, h in line_sizes:
+            x = (width - w) // 2 - bbox[0]
+            if highlight:
+                match = re.search(rf"\\b{re.escape(highlight)}\\b", line, flags=re.IGNORECASE)
+                if match:
+                    pre = line[: match.start()]
+                    mid = line[match.start() : match.end()]
+                    pre_w = font.getlength(pre) if pre else 0
+                    mid_w = font.getlength(mid) if mid else 0
+                    hi_pad_x = max(4, int(font_size * 0.12))
+                    hi_pad_y = max(2, int(font_size * 0.12))
+                    draw.rectangle(
+                        [x + pre_w - hi_pad_x, y - hi_pad_y, x + pre_w + mid_w + hi_pad_x, y + h + hi_pad_y],
+                        fill=highlight_bg_rgba,
+                    )
+            draw.text((x, y - bbox[1]), line, font=font, fill=color)
+            if highlight and match and highlight_text_color:
+                draw.text((x + pre_w, y - bbox[1]), mid, font=font, fill=highlight_text_color)
+            y += h + line_spacing
+        return img
+
+    def build_keyword_panel(
+        word: str,
+        pron_us: str,
+        pron_uk: str,
+        expl: str,
+        word_font_path: str,
+        pron_font_path: str,
+        expl_font_path: str,
+        max_width: int,
+        origin_image_h: int,
+    ) -> Image.Image | None:
+        if not word:
+            return None
+        word_img = render_text_rgba(
+            word,
+            word_font_path,
+            max(34, int(origin_image_h * 0.045)),
+            "#1E2A36",
+            max_width=max_width,
+            bg_rgba=(0, 0, 0, 0),
+        )
+        pron_us_line = f"US /{pron_us}/" if pron_us else "US /.../"
+        pron_uk_line = f"UK /{pron_uk}/" if pron_uk else "UK /.../"
+        pron_us_img = render_text_rgba(
+            pron_us_line,
+            pron_font_path,
+            max(24, int(origin_image_h * 0.03)),
+            "#3B556D",
+            max_width=max_width,
+            bg_rgba=(0, 0, 0, 0),
+        )
+        pron_uk_img = render_text_rgba(
+            pron_uk_line,
+            pron_font_path,
+            max(24, int(origin_image_h * 0.03)),
+            "#3B556D",
+            max_width=max_width,
+            bg_rgba=(0, 0, 0, 0),
+        )
+        body_img = None
+        if expl:
+            body_img = render_text_rgba(
+                expl,
+                expl_font_path,
+                max(22, int(origin_image_h * 0.028)),
+                "#2B3A45",
+                max_width=max_width,
+                bg_rgba=(0, 0, 0, 0),
+            )
+        parts = [img for img in [word_img, pron_us_img, pron_uk_img, body_img] if img]
+        if not parts:
+            return None
+        widths = [p.width for p in parts]
+        heights = [p.height for p in parts]
+        gap = 6
+        panel_w = max(widths)
+        panel_h = sum(heights) + gap * (len(parts) - 1)
+        panel_bg = Image.new("RGBA", (panel_w + 24, panel_h + 16), (255, 255, 255, 170))
+        y = 8
+        for idx, part in enumerate(parts):
+            x = (panel_w - part.width) // 2 + 12
+            panel_bg.alpha_composite(part, (x, y))
+            y += part.height + gap
+        return panel_bg
+
+    def overlay_frame_with_subs(frame: np.ndarray, t: float, items: list[dict]) -> np.ndarray:
+        if not items:
+            return frame
+        base = Image.fromarray(frame).convert("RGBA")
+        for item in items:
+            if item["start"] <= t <= item["end"]:
+                if item.get("kw_img") is not None:
+                    base.alpha_composite(item["kw_img"], item["kw_pos"])
+                if item.get("sub_img") is not None:
+                    base.alpha_composite(item["sub_img"], item["sub_pos"])
+                break
+        return np.array(base.convert("RGB"))
+
     def imageclip_from_png(file_path: str) -> ImageClip:
         try:
             img = Image.open(file_path).convert("RGBA")
@@ -343,6 +473,11 @@ async def create_video_with_scenes(
                 "Noto_Sans",
                 "NotoSans-VariableFont_wdth,wght.ttf",
             )
+            noto_static_dir = os.path.join(utils.resource_dir(), "fonts", "Noto_Sans", "static")
+            noto_bold = os.path.join(noto_static_dir, "NotoSans-Bold.ttf")
+            noto_semibold = os.path.join(noto_static_dir, "NotoSans-SemiBold.ttf")
+            noto_regular = os.path.join(noto_static_dir, "NotoSans-Regular.ttf")
+            noto_light = os.path.join(noto_static_dir, "NotoSans-Light.ttf")
             if not os.path.exists(font_path):
                 logger.warning("Font file not found, using default font")
                 raise FileNotFoundError("Font file not found: " + font_path)
@@ -354,114 +489,95 @@ async def create_video_with_scenes(
                 subtitle_font_path = keyword_font_path
             if os.path.exists(ipa_font_path):
                 keyword_font_path = ipa_font_path
-            # 添加字幕
+                subtitle_font_path = ipa_font_path
+            if os.path.exists(noto_bold):
+                subtitle_font_path = noto_bold
+            if os.path.exists(noto_semibold):
+                keyword_font_path = noto_semibold
+            keyword_pron_font_path = noto_regular if os.path.exists(noto_regular) else keyword_font_path
+            keyword_expl_font_path = noto_light if os.path.exists(noto_light) else keyword_font_path
+            # 添加字幕 (PIL render directly onto frames)
             if os.path.exists(subtitle_file):
                 logger.info(f"Loading subtitle file: {subtitle_file}")
                 try:
-                    def create_text_clip(subtitle_item, idx_item: int):
-                        phrase = clean_subtitle_text(subtitle_item[1])
+                    sub = subtitles.file_to_subtitles(subtitle_file, encoding="utf-8")
+                    subtitle_items = []
+                    for item_idx, item in enumerate(sub, 1):
+                        phrase = clean_subtitle_text(item[1])
+                        if not phrase:
+                            continue
                         kw = find_keyword_in_text(phrase, scene.keywords)
                         highlight_word = (kw.get("word") or "").strip() if kw else ""
-                        sub_path = os.path.join(overlay_dir, f"sub_{i}_{idx_item}.png")
-                        w, h = render_text_png(
+                        sub_img = render_text_rgba(
                             phrase,
                             subtitle_font_path,
                             58,
-                            "#FFFFFF",
+                            "#EC4899",
                             max_width=int(origin_image_w * 0.9),
-                            file_path=sub_path,
-                            bg_rgba=(0, 0, 0, 200),
+                            bg_rgba=(0, 0, 0, 0),
                             highlight_word=highlight_word,
-                            highlight_bg_rgba=(255, 241, 153, 230),
+                            highlight_bg_rgba=(255, 238, 140, 200),
+                            highlight_text_color="#065F46",
                         )
-                        if w == 0 or h == 0:
-                            return None, 0
-                        _clip = ImageClip(sub_path)
-                        duration = subtitle_item[0][1] - subtitle_item[0][0]
-                        _clip = _clip.with_start(subtitle_item[0][0])
-                        _clip = _clip.with_end(subtitle_item[0][1])
-                        _clip = _clip.with_duration(duration)
-                        subtitle_y = origin_image_h * 0.95 - _clip.h - 50
-                        _clip = _clip.with_position(("center", subtitle_y))
-                        return _clip, subtitle_y
-
-                    # Parse subtitles
-                    sub = subtitles.file_to_subtitles(subtitle_file, encoding="utf-8")
-                    text_clips = []
-                    for item_idx, item in enumerate(sub, 1):
-                        clip, subtitle_y = create_text_clip(subtitle_item=item, idx_item=item_idx)
-                        if clip is None:
-                            continue
-                        text_clips.append(clip)
-                    overlays = [bg_clip, fg_clip]
-                    # Add per-subtitle keyword overlay (only when the sentence contains it)
-                    keyword_clips = []
-                    for item_idx, item in enumerate(sub, 1):
-                        phrase = clean_subtitle_text(item[1])
-                        kw = find_keyword_in_text(phrase, scene.keywords)
-                        if not kw:
-                            continue
-                        word = (kw.get("word") or "").strip()
-                        pron_us = sanitize_pronunciation(kw.get("pronunciation_us", ""))
-                        pron_uk = sanitize_pronunciation(kw.get("pronunciation_uk", ""))
-                        expl = (kw.get("explanation") or "").strip()
-                        if not word:
-                            continue
-                        title_line = f"{word}:"
-                        if pron_us or pron_uk:
-                            us = f"us /{pron_us}/" if pron_us else "us /.../"
-                            uk = f"uk /{pron_uk}/" if pron_uk else "uk /.../"
-                            title_line += f"\n{us} {uk}"
-                        title_path = os.path.join(overlay_dir, f"kw_title_{i}_{item_idx}.png")
-                        tw, th = render_text_png(
-                            title_line,
-                            keyword_font_path,
-                            max(30, int(origin_image_h * 0.04)),
-                            "#FFFFFF",
-                            max_width=int(origin_image_w * 0.9),
-                            file_path=title_path,
-                            bg_rgba=(0, 0, 0, 200),
-                        )
-                        kw_title = ImageClip(title_path) if tw and th else None
-                        kw_body = None
-                        if expl:
-                            body_path = os.path.join(overlay_dir, f"kw_body_{i}_{item_idx}.png")
-                            bw, bh = render_text_png(
-                                expl,
-                                keyword_font_path,
-                                max(22, int(origin_image_h * 0.028)),
-                                "#FFFFFF",
+                        kw_img = None
+                        if kw:
+                            word = (kw.get("word") or "").strip()
+                            pron_us = sanitize_pronunciation(kw.get("pronunciation_us", ""))
+                            pron_uk = sanitize_pronunciation(kw.get("pronunciation_uk", ""))
+                            expl = (kw.get("explanation") or "").strip()
+                            kw_img = build_keyword_panel(
+                                word=word,
+                                pron_us=pron_us,
+                                pron_uk=pron_uk,
+                                expl=expl,
+                                word_font_path=keyword_font_path,
+                                pron_font_path=keyword_pron_font_path,
+                                expl_font_path=keyword_expl_font_path,
                                 max_width=int(origin_image_w * 0.9),
-                                file_path=body_path,
-                                bg_rgba=(0, 0, 0, 200),
+                                origin_image_h=origin_image_h,
                             )
-                            kw_body = ImageClip(body_path) if bw and bh else None
-                        start_t, end_t = item[0]
-                        base_y = 20
-                        title_h = 0
-                        if kw_title:
-                            kw_title = kw_title.with_start(start_t).with_end(end_t).with_position(("center", base_y))
-                            keyword_clips.append(kw_title)
-                            title_h = kw_title.h
-                        if kw_body:
-                            kw_body = kw_body.with_start(start_t).with_end(end_t).with_position(("center", base_y + title_h + 6))
-                            keyword_clips.append(kw_body)
-                        logger.info(f"Keyword overlay added: {word} for subtitle '{phrase}'")
-                    overlays.extend(text_clips)
-                    overlays.extend(keyword_clips)
-                    video_clip = CompositeVideoClip(overlays, (origin_image_w, origin_image_h))
+                        if sub_img is None and kw_img is None:
+                            continue
+                        sub_x = (origin_image_w - sub_img.width) // 2 if sub_img else 0
+                        sub_y = int(origin_image_h * 0.95 - (sub_img.height if sub_img else 0) - 50)
+                        kw_x = (origin_image_w - kw_img.width) // 2 if kw_img else 0
+                        kw_y = 20
+                        subtitle_items.append(
+                            {
+                                "start": item[0][0],
+                                "end": item[0][1],
+                                "sub_img": sub_img,
+                                "sub_pos": (sub_x, sub_y),
+                                "kw_img": kw_img,
+                                "kw_pos": (kw_x, kw_y),
+                            }
+                        )
+                        if kw:
+                            logger.info(f"Keyword overlay added: {(kw.get('word') or '').strip()} for subtitle '{phrase}'")
+                    base_clip = CompositeVideoClip([bg_clip, fg_clip], (origin_image_w, origin_image_h))
+                    if subtitle_items:
+                        logger.info(f"Subtitle items rendered for scene {i}: {len(subtitle_items)}")
+                        fps = 24
+                        total_frames = max(1, int(math.ceil(subtitle_duration * fps)))
+                        frames = []
+                        for frame_idx in range(total_frames):
+                            t = frame_idx / fps
+                            frame = base_clip.get_frame(t)
+                            frame = overlay_frame_with_subs(frame, t, subtitle_items)
+                            frames.append(frame)
+                        video_clip = ImageSequenceClip(frames, fps=fps)
+                    else:
+                        logger.warning(f"No subtitle items rendered for scene {i}")
+                        video_clip = base_clip
                     clips.append(video_clip.with_audio(audio_clip))
                     logger.info(f"Added subtitles for scene {i}")
-                
                 except Exception as e:
                     logger.error(f"Failed to add subtitles for scene {i}: {str(e)}")
-                    overlays = [bg_clip, fg_clip]
-                    video_clip = CompositeVideoClip(overlays, (origin_image_w, origin_image_h))
+                    video_clip = CompositeVideoClip([bg_clip, fg_clip], (origin_image_w, origin_image_h))
                     clips.append(video_clip.with_audio(audio_clip))
             else:
                 logger.warning(f"Subtitle file not found: {subtitle_file}")
-                overlays = [bg_clip, fg_clip]
-                video_clip = CompositeVideoClip(overlays, (origin_image_w, origin_image_h))
+                video_clip = CompositeVideoClip([bg_clip, fg_clip], (origin_image_w, origin_image_h))
                 clips.append(video_clip.with_audio(audio_clip))
         except Exception as e:
             logger.error(f"Failed to process scene {i}: {str(e)}")

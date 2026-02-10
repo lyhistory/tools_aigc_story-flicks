@@ -882,7 +882,7 @@ class LLMService:
                 objects_phrase = ", ".join(objects)
                 scene["script"] = (script + f" Let's count {objects_phrase} together!").strip()
             else:
-                scene["script"] = (script + " Let's count together: 1, 2, 3... so many!").strip()
+                scene["script"] = script.strip()
 
         # Create task dir early (or receive from upper caller)
         if not task_dir:
