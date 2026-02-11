@@ -306,22 +306,28 @@ async def create_video_with_scenes(
         img = Image.new("RGBA", (width, height), bg_rgba)
         draw = ImageDraw.Draw(img)
         highlight = (highlight_word or "").strip()
+        highlight_norm = normalize_token(highlight) if highlight else ""
         y = pad_y
         for line, bbox, w, h in line_sizes:
             x = (width - w) // 2 - bbox[0]
-            if highlight:
-                match = re.search(rf"\\b{re.escape(highlight)}\\b", line, flags=re.IGNORECASE)
-                if match:
-                    pre = line[: match.start()]
-                    mid = line[match.start() : match.end()]
-                    pre_w = font.getlength(pre) if pre else 0
-                    mid_w = font.getlength(mid) if mid else 0
-                    hi_pad_x = max(4, int(font_size * 0.12))
-                    hi_pad_y = max(2, int(font_size * 0.12))
-                    draw.rectangle(
-                        [x + pre_w - hi_pad_x, y - hi_pad_y, x + pre_w + mid_w + hi_pad_x, y + h + hi_pad_y],
-                        fill=highlight_bg_rgba,
-                    )
+            match = None
+            if highlight_norm:
+                for m in re.finditer(r"[A-Za-z']+", line):
+                    token = m.group(0)
+                    if normalize_token(token) == highlight_norm:
+                        match = m
+                        break
+            if match:
+                pre = line[: match.start()]
+                mid = line[match.start() : match.end()]
+                pre_w = font.getlength(pre) if pre else 0
+                mid_w = font.getlength(mid) if mid else 0
+                hi_pad_x = max(4, int(font_size * 0.12))
+                hi_pad_y = max(2, int(font_size * 0.12))
+                draw.rectangle(
+                    [x + pre_w - hi_pad_x, y - hi_pad_y, x + pre_w + mid_w + hi_pad_x, y + h + hi_pad_y],
+                    fill=highlight_bg_rgba,
+                )
             draw.text((x, y - bbox[1]), line, font=font, fill=color)
             if highlight and match and highlight_text_color:
                 draw.text((x + pre_w, y - bbox[1]), mid, font=font, fill=highlight_text_color)
@@ -512,12 +518,12 @@ async def create_video_with_scenes(
                             phrase,
                             subtitle_font_path,
                             58,
-                            "#EC4899",
+                            "#F472B6",
                             max_width=int(origin_image_w * 0.9),
                             bg_rgba=(0, 0, 0, 0),
                             highlight_word=highlight_word,
-                            highlight_bg_rgba=(255, 238, 140, 200),
-                            highlight_text_color="#065F46",
+                            highlight_bg_rgba=(254, 240, 138, 220),
+                            highlight_text_color="#111827",
                         )
                         kw_img = None
                         if kw:

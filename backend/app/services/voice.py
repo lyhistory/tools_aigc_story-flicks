@@ -1162,7 +1162,7 @@ async def gtts_voice(text: str, voice_file: str, subtitle_file: str, language: s
         # Collapse whitespace
         cleaned = re.sub(r"\\s+", " ", cleaned).strip()
         return cleaned
-
+  
     def expand_contractions(raw_text: str) -> str:
         if not raw_text:
             return raw_text
@@ -1187,6 +1187,31 @@ async def gtts_voice(text: str, voice_file: str, subtitle_file: str, language: s
         for k, v in replacements.items():
             text = re.sub(rf"\\b{re.escape(k)}\\b", v, text)
         return text
+  
+    def compress_silence(
+        audio: AudioSegment,
+        min_silence_len: int = 350,
+        silence_thresh: int = -40,
+        keep_silence: int = 80,
+        gap_ms: int = 120,
+    ) -> AudioSegment:
+        """Reduce long pauses between sentences to improve cadence."""
+        ranges = detect_nonsilent(audio, min_silence_len=min_silence_len, silence_thresh=silence_thresh)
+        if not ranges:
+            return audio
+        segments = []
+        for start_ms, end_ms in ranges:
+            start_ms = max(0, start_ms - keep_silence)
+            end_ms = min(len(audio), end_ms + keep_silence)
+            if end_ms > start_ms:
+                segments.append(audio[start_ms:end_ms])
+        if not segments:
+            return audio
+        result = segments[0]
+        gap = AudioSegment.silent(duration=gap_ms)
+        for seg in segments[1:]:
+            result += gap + seg
+        return result
 
     try:
         clean_text = sanitize_text_for_tts(text)
@@ -1200,6 +1225,8 @@ async def gtts_voice(text: str, voice_file: str, subtitle_file: str, language: s
 
         # Get real audio duration
         audio = AudioSegment.from_mp3(voice_file)
+        audio = compress_silence(audio)
+        audio.export(voice_file, format="mp3")
         total_duration_ms = len(audio)
         total_duration_s = total_duration_ms / 1000.0
 

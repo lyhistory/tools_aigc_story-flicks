@@ -1091,6 +1091,28 @@ class LLMService:
                     segment_index=idx,                 # pass 1-based index
                     **img2img_kwargs
                 )
+                if not image_url:
+                    logger.warning(
+                        f"Image generation failed for scene {idx}; waiting 5 minutes before retry"
+                    )
+                    time.sleep(300)
+                    image_url = self.generate_image(
+                        prompt=(
+                            segment["scene_prompt"]
+                            + (f"\n\nVariation hint for this scene: {variation_hint}" if variation_hint else "")
+                        ),
+                        resolution=request.resolution, 
+                        image_llm_provider=request.image_llm_provider, 
+                        image_llm_model=request.image_llm_model,
+                        task_dir=str(task_dir),           # pass task dir
+                        segment_index=idx,                 # pass 1-based index
+                        **img2img_kwargs
+                    )
+                    if not image_url:
+                        logger.error(
+                            f"Image generation failed after retry for scene {idx}; aborting video generation"
+                        )
+                        raise RuntimeError("Image generation failed after retry")
                 segment["url"] = image_url
                 if image_url and os.path.exists(image_url):
                     try:
@@ -1120,6 +1142,8 @@ class LLMService:
             except Exception as e:
                 logger.error(f"Failed to generate image for segment: {e}")
                 segment["url"] = None
+                if isinstance(e, RuntimeError) and "after retry" in str(e):
+                    raise
 
         return story_segments
     
