@@ -2,7 +2,14 @@ from fastapi import APIRouter, HTTPException, Request, Query
 from fastapi.responses import JSONResponse
 from app.schemas.voice import VoiceGenerationRequest, VoiceGenerationResponse
 from app.schemas.video import VideoGenerateResponse, StoryScene
-from app.services.voice import generate_voice, get_all_azure_voices
+from app.services.voice import (
+    generate_voice,
+    get_all_azure_voices,
+    list_edge_tts_voices,
+    list_google_tts_voices,
+    get_voice_options,
+)
+from app.models.const import Language
 from app.services.video import create_video_with_scenes
 import os
 import json
@@ -13,6 +20,8 @@ router = APIRouter()
 
 
 class VoiceRequest(BaseModel):
+    provider: Optional[str] = "edge-tts"
+    language: Optional[str] = None
     area: Optional[List[str]] = None
 
 
@@ -45,7 +54,13 @@ async def test_subtitle_endpoint(task_id: str = Query(..., description="任务ID
             await generate_voice(scene.text, voice_name, voice_rate, audio_file, subtitle_file)
         
         # 创建视频
-        video_file = await create_video_with_scenes(task_dir, scenes, voice_name, voice_rate)
+        video_file = await create_video_with_scenes(
+            task_dir=task_dir,
+            scenes=scenes,
+            voice_name=voice_name,
+            voice_rate=voice_rate,
+            voice_provider="gtts",
+        )
         
         video_url = "/" + video_file.split("/tasks/")[-1]
         return VideoGenerateResponse(video_url=video_url, scenes=scenes)
@@ -72,7 +87,9 @@ async def generate_voice_api(request: Request) -> VoiceGenerationResponse:
         audio_file, subtitle_file = await generate_voice(
             text=req.text,
             voice_name=req.voice_name,
-            voice_rate=req.voice_rate
+            voice_rate=req.voice_rate,
+            language=req.language,
+            voice_provider=req.voice_provider,
         )
         
         if not audio_file or not subtitle_file:
@@ -95,4 +112,14 @@ async def list_voices(request: VoiceRequest) -> dict:
     """
     获取所有支持的语音列表
     """
-    return {"voices": get_all_azure_voices(request.area)}
+    provider = (request.provider or "edge-tts").lower()
+    if provider == "google-tts":
+        return {"voices": list_google_tts_voices(request.language, request.area)}
+    if provider == "gtts":
+        return {"voices": []}
+    return {"voices": list_edge_tts_voices(request.language, request.area)}
+
+@router.get("/options")
+async def voice_options() -> dict:
+    allowed = [lang.value for lang in Language if not lang.value.startswith("fixed-")]
+    return get_voice_options(allowed)

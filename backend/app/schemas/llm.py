@@ -15,6 +15,7 @@ class StoryGenerationRequest(BaseModel):
     topic_type: Optional[TopicType] = Field(default=None, description="Topic type for storyboard generation")
     use_inpainting: Optional[bool] = Field(default=False, description="Whether to use img2img/inpainting for image generation")
     avoid_exact_counts: Optional[bool] = Field(default=None, description="Avoid exact numeric counts in prompts")
+    subject: Optional[str] = Field(default=None, description="Optional cover subject")
 
 
 class StorySegment(BaseModel):
@@ -23,6 +24,8 @@ class StorySegment(BaseModel):
     objects: List[str] = Field(default_factory=list, description="Key plural objects to show in the scene")
     keywords: List[Dict[str, str]] = Field(default_factory=list, description="Keywords with pronunciation and explanation")
     url: str = Field(None, description="Generated image URL")
+    is_cover: bool = Field(default=False, description="Whether this segment is a cover/title scene")
+    subject: Optional[str] = Field(default=None, description="Optional cover subject")
 
 
 class StoryGenerationResponse(BaseModel):

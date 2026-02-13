@@ -295,6 +295,8 @@ class StoryScene(BaseModel):
     objects: List[str] = Field(default_factory=list, description="场景中的关键对象")
     keywords: List[Dict[str, str]] = Field(default_factory=list, description="关键词与发音解释")
     url: Optional[str] = Field(default=None, description="生成的图片 URL")
+    is_cover: Optional[bool] = Field(default=False, description="Whether this scene is a cover/title scene")
+    subject: Optional[str] = Field(default=None, description="Optional cover subject")
 
 class VideoGenerateRequest(BaseModel):
     """视频生成请求"""
@@ -309,6 +311,8 @@ class VideoGenerateRequest(BaseModel):
     story_prompt: Optional[str] = Field(default=None, description="故事提示词")
     topic_type: Optional[TopicType] = Field(default=None, description="主题类型")
     image_style: ImageStyle = Field(default=ImageStyle.realistic, description="图片风格")
+    subject: Optional[str] = Field(default=None, description="Optional cover subject")
+    voice_provider: str = Field(default="gtts", description="语音提供商: gtts, edge-tts, google-tts")
     voice_name: str = Field(default="zh-CN-XiaoxiaoNeural", description="语音名称")
     voice_rate: float = Field(default=1.0, description="语音速率")
     resolution: Optional[str] = Field(default="1024*1024", description="分辨率")

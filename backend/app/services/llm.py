@@ -759,6 +759,32 @@ class LLMService:
         story_segments = await self.generate_story(
             request,
         )
+        subject = (getattr(request, "subject", None) or "").strip()
+        if subject:
+            topic_text = (request.story_prompt or "").strip()
+            if len(topic_text) > 120:
+                topic_text = topic_text[:117].rstrip() + "..."
+            if topic_text:
+                topic_text = re.sub(r"^(subject|topic)\s*[:\-]\s*", "", topic_text, flags=re.I).strip()
+            cover_script = f"Today we're going to learn {subject}."
+            if topic_text:
+                cover_script = f"{cover_script} {topic_text}"
+            cover_scene_prompt = "Create a simple, friendly title card background for kids. "
+            cover_scene_prompt += f"Theme: {subject}. "
+            if topic_text:
+                cover_scene_prompt += f"Context: {topic_text}. "
+            cover_scene_prompt += "Use large, clear lettering and clean shapes. "
+            cover_scene_prompt += "Bright, warm colors, no realism, no clutter."
+            cover_segment = {
+                "script": cover_script,
+                "scene_prompt": cover_scene_prompt,
+                "objects": [],
+                "keywords": [],
+                "url": None,
+                "is_cover": True,
+                "subject": subject,
+            }
+            story_segments = [cover_segment] + story_segments
 
         def soften_object_count(obj: str) -> str:
             if not obj:
@@ -992,13 +1018,13 @@ class LLMService:
 
         # Extract 1-2 keywords for the whole video
         keywords = await extract_keywords_from_scripts(
-            [s.get("script", "") for s in story_segments],
+            [s.get("script", "") for s in story_segments if not s.get("is_cover")],
             count=2,
         )
         if not keywords:
             # Simple fallback: pick first verb-like word from script
             fallback_verbs = ["walk", "run", "look", "smile", "hold", "pull", "talk", "say", "go", "play", "learn"]
-            joined = " ".join([s.get("script", "") for s in story_segments]).lower()
+            joined = " ".join([s.get("script", "") for s in story_segments if not s.get("is_cover")]).lower()
             picked = None
             for v in fallback_verbs:
                 if re.search(rf"\\b{re.escape(v)}\\b", joined):
@@ -1013,7 +1039,7 @@ class LLMService:
                 }]
         logger.info(f"Extracted keywords: {keywords}")
         for s in story_segments:
-            s["keywords"] = keywords
+            s["keywords"] = [] if s.get("is_cover") else keywords
 
         # 为每个场景生成图片
         used_objects = set()
@@ -1045,35 +1071,40 @@ class LLMService:
                     f"model={request.image_llm_model or settings.image_llm_model} | "
                     f"resolution={request.resolution}"
                 )
+                is_cover = bool(segment.get("is_cover"))
                 segment["script"] = remove_named_characters(segment.get("script", ""))
                 segment["scene_prompt"] = remove_named_characters(segment.get("scene_prompt", ""))
-                if is_edu_topic and not use_exact_counts:
+                if is_edu_topic and not use_exact_counts and not is_cover:
                     segment["script"] = soften_counts_in_text(segment.get("script", ""))
                     segment["scene_prompt"] = soften_counts_in_text(segment.get("scene_prompt", ""))
                 objs = []
-                if is_edu_topic:
+                if is_edu_topic and not is_cover:
                     objs = ensure_unique_objects(segment, idx, used_objects)
                     ensure_objects_in_script(segment, objs, use_exact_counts)
                 else:
                     segment["objects"] = segment.get("objects", [])
-                add_role_hints(segment)
-                variation_hint = await build_variation_hint(segment.get("script", ""), idx, request) if idx > 1 else ""
+                if not is_cover:
+                    add_role_hints(segment)
+                variation_hint = ""
+                if idx > 1 and not is_cover:
+                    variation_hint = await build_variation_hint(segment.get("script", ""), idx, request)
                 img2img_kwargs = {}
-                if use_inpainting and previous_base64:
+                if use_inpainting and previous_base64 and not is_cover:
                     img2img_kwargs = {"init_image_base64": previous_base64}
                 logger.info(
                     f"Scene {idx} image mode | "
                     f"img2img={'yes' if img2img_kwargs else 'no'} | "
                     f"init_image_bytes={'present' if img2img_kwargs else 'none'}"
                 )
-                segment["scene_prompt"] = enhance_scene_prompt_for_education(
-                    segment.get("script", ""),
-                    segment.get("scene_prompt", ""),
-                    segment.get("objects", []),
-                    use_exact_counts,
-                    is_edu_topic,
-                )
-                if getattr(request, "topic_type", None) in ("dialogue", "scene"):
+                if not is_cover:
+                    segment["scene_prompt"] = enhance_scene_prompt_for_education(
+                        segment.get("script", ""),
+                        segment.get("scene_prompt", ""),
+                        segment.get("objects", []),
+                        use_exact_counts,
+                        is_edu_topic,
+                    )
+                if getattr(request, "topic_type", None) in ("dialogue", "scene") and not is_cover:
                     segment["scene_prompt"] = (
                         segment["scene_prompt"]
                         + "\nKeep the overall look and feel identical; only change motion or add small details. Keep the same characters and background."
@@ -1122,7 +1153,7 @@ class LLMService:
                     except Exception as e:
                         logger.warning(f"Scene {idx} output size check failed: {e}")
                 # Orientation recheck removed per request (no retry)
-                if image_url:
+                if image_url and not is_cover:
                     try:
                         if os.path.exists(image_url):
                             with open(image_url, "rb") as f:

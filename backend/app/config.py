@@ -34,6 +34,9 @@ class Settings(BaseSettings):
     ollama_api_key: str = ""
     siliconflow_api_key: str = ""
 
+    # Google Cloud TTS
+    google_application_credentials: str = ""
+
     text_llm_model: str = "meta/llama-3.1-70b-instruct" #"gpt-4o"
     image_llm_model: str = "black-forest-labs/flux-1-dev" #"dall-e-3"
     

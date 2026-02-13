@@ -156,6 +156,7 @@ async def create_video_with_scenes(
         voice_name: str, 
         voice_rate: float, 
         language: str = "en-US",
+        voice_provider: str = "gtts",
         test_mode: bool = False,
         resolution: str = None) -> str:
     """创建带有场景的视频
@@ -286,6 +287,8 @@ async def create_video_with_scenes(
         highlight_word: str | None = None,
         highlight_bg_rgba=(255, 241, 153, 180),
         highlight_text_color: str | None = None,
+        stroke_width: int = 0,
+        stroke_fill: str | None = None,
     ) -> Image.Image | None:
         if not text:
             return None
@@ -328,9 +331,23 @@ async def create_video_with_scenes(
                     [x + pre_w - hi_pad_x, y - hi_pad_y, x + pre_w + mid_w + hi_pad_x, y + h + hi_pad_y],
                     fill=highlight_bg_rgba,
                 )
-            draw.text((x, y - bbox[1]), line, font=font, fill=color)
+            draw.text(
+                (x, y - bbox[1]),
+                line,
+                font=font,
+                fill=color,
+                stroke_width=stroke_width,
+                stroke_fill=stroke_fill,
+            )
             if highlight and match and highlight_text_color:
-                draw.text((x + pre_w, y - bbox[1]), mid, font=font, fill=highlight_text_color)
+                draw.text(
+                    (x + pre_w, y - bbox[1]),
+                    mid,
+                    font=font,
+                    fill=highlight_text_color,
+                    stroke_width=stroke_width,
+                    stroke_fill=stroke_fill,
+                )
             y += h + line_spacing
         return img
 
@@ -405,11 +422,12 @@ async def create_video_with_scenes(
         base = Image.fromarray(frame).convert("RGBA")
         for item in items:
             if item["start"] <= t <= item["end"]:
+                if item.get("cover_img") is not None:
+                    base.alpha_composite(item["cover_img"], item["cover_pos"])
                 if item.get("kw_img") is not None:
                     base.alpha_composite(item["kw_img"], item["kw_pos"])
                 if item.get("sub_img") is not None:
                     base.alpha_composite(item["sub_img"], item["sub_pos"])
-                break
         return np.array(base.convert("RGB"))
 
     def imageclip_from_png(file_path: str) -> ImageClip:
@@ -441,19 +459,33 @@ async def create_video_with_scenes(
             else:
                 # 正式模式下生成所需文件
                 logger.info(f"Processing scene {i}")
+                lead_silence_ms = 0
+                trail_silence_ms = 0
+                sentence_pause_ms = None
+                if getattr(scene, "is_cover", False) and (voice_provider or "gtts") == "gtts":
+                    lead_silence_ms = 300
+                    trail_silence_ms = 900
+                    sentence_pause_ms = 550
                 audio_file, subtitle_file = await generate_voice(
                     scene.script,
                     voice_name,
                     voice_rate,
                     audio_file,
                     subtitle_file,
-                    language
+                    language,
+                    voice_provider,
+                    lead_silence_ms=lead_silence_ms,
+                    trail_silence_ms=trail_silence_ms,
+                    sentence_pause_ms=sentence_pause_ms,
                 )
             
             # 获取字幕的总时长
             subs = subtitles.file_to_subtitles(subtitle_file, encoding="utf-8")
             subtitle_duration = max([tb for ((ta, tb), txt) in subs])
-                    
+            # 创建音频剪辑
+            audio_clip = AudioFileClip(audio_file)
+            if audio_clip.duration and audio_clip.duration > subtitle_duration:
+                subtitle_duration = audio_clip.duration
             # 创建图片剪辑（统一尺寸，避免拉伸/拼贴）
             if target_w is None or target_h is None:
                 base_img = Image.open(image_file)
@@ -466,8 +498,6 @@ async def create_video_with_scenes(
                 duration=subtitle_duration,
                 image_scale=1.2
             )
-            # 创建音频剪辑  
-            audio_clip = AudioFileClip(audio_file)
             # audio will be attached to the final composite clip
             # 使用系统字体
             font_path = os.path.join(utils.resource_dir(), "fonts", "STHeitiLight.ttc")
@@ -508,6 +538,34 @@ async def create_video_with_scenes(
                 try:
                     sub = subtitles.file_to_subtitles(subtitle_file, encoding="utf-8")
                     subtitle_items = []
+                    cover_text = (getattr(scene, "subject", None) or "").strip()
+                    if getattr(scene, "is_cover", False) and cover_text:
+                        cover_font_size = max(72, int(origin_image_h * 0.08))
+                        cover_img = render_text_rgba(
+                            cover_text,
+                            subtitle_font_path,
+                            cover_font_size,
+                            "#22C55E",
+                            max_width=int(origin_image_w * 0.85),
+                            bg_rgba=(0, 0, 0, 0),
+                            stroke_width=max(2, int(cover_font_size * 0.08)),
+                            stroke_fill="#0F172A",
+                        )
+                        if cover_img is not None:
+                            cover_x = (origin_image_w - cover_img.width) // 2
+                            cover_y = (origin_image_h - cover_img.height) // 2
+                            subtitle_items.append(
+                                {
+                                    "start": 0.0,
+                                    "end": subtitle_duration,
+                                    "cover_img": cover_img,
+                                    "cover_pos": (cover_x, cover_y),
+                                    "sub_img": None,
+                                    "sub_pos": (0, 0),
+                                    "kw_img": None,
+                                    "kw_pos": (0, 0),
+                                }
+                            )
                     for item_idx, item in enumerate(sub, 1):
                         phrase = clean_subtitle_text(item[1])
                         if not phrase:
@@ -559,7 +617,9 @@ async def create_video_with_scenes(
                             }
                         )
                         if kw:
-                            logger.info(f"Keyword overlay added: {(kw.get('word') or '').strip()} for subtitle '{phrase}'")
+                            logger.info(
+                                f"Keyword overlay added: {(kw.get('word') or '').strip()} for subtitle '{phrase}'"
+                            )
                     base_clip = CompositeVideoClip([bg_clip, fg_clip], (origin_image_w, origin_image_h))
                     if subtitle_items:
                         logger.info(f"Subtitle items rendered for scene {i}: {len(subtitle_items)}")
@@ -635,6 +695,8 @@ async def generate_video(request: VideoGenerateRequest):
                         objects=scene.get("objects", []),
                         keywords=scene.get("keywords", []),
                         url=scene.get("url"),
+                        is_cover=scene.get("is_cover", False),
+                        subject=scene.get("subject"),
                     )
                 )
         else:
@@ -652,7 +714,8 @@ async def generate_video(request: VideoGenerateRequest):
                 image_llm_model=request.image_llm_model,
                 use_inpainting=request.use_inpainting,
                 avoid_exact_counts=request.avoid_exact_counts,
-                topic_type=request.topic_type
+                topic_type=request.topic_type,
+                subject=request.subject,
             )
             logger.info(f"generate_video StoryGenerationRequest: {req}")
             story_list = await llm_service.generate_story_with_images(
@@ -693,6 +756,8 @@ async def generate_video(request: VideoGenerateRequest):
                     objects=scene.get("objects", []),
                     keywords=scene.get("keywords", []),
                     url=scene.get("url"),
+                    is_cover=scene.get("is_cover", False),
+                    subject=scene.get("subject"),
                 )
                 for scene in story_list
             ]
@@ -736,13 +801,14 @@ async def generate_video(request: VideoGenerateRequest):
         # return ""
         # 生成视频
         return await create_video_with_scenes(
-            task_dir,
-            scenes,
-            request.voice_name,
-            request.voice_rate,
-            request.language,
-            request.test_mode,
-            request.resolution,
+            task_dir=task_dir,
+            scenes=scenes,
+            voice_name=request.voice_name,
+            voice_rate=request.voice_rate,
+            language=request.language,
+            voice_provider=getattr(request, "voice_provider", "gtts"),
+            test_mode=request.test_mode,
+            resolution=request.resolution,
         )
     except Exception as e:
         logger.error(f"Failed to generate video: {e}")

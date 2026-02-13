@@ -14,9 +14,13 @@ from typing import Tuple
 from xml.sax.saxutils import unescape
 from fake_useragent import UserAgent
 import websockets
-from functools import partial
+from functools import partial, lru_cache
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from gtts import gTTS
+from google.cloud import texttospeech
+from pathlib import Path
+from app.config import get_settings
+import io
 from pydub import AudioSegment
 from pydub.silence import detect_nonsilent
 
@@ -80,6 +84,116 @@ def split_string_by_punctuations(s):
     
     result = list(filter(is_valid_segment, result))
     return result
+
+def sanitize_text_for_tts(raw_text: str) -> str:
+    if not raw_text:
+        return raw_text
+    cleaned = raw_text.replace("“", '"').replace("”", '"').replace("‘", "'").replace("’", "'")
+    cleaned = re.sub(r"(?<!\\w)['\\\"](?!\\w)", "", cleaned)
+    cleaned = re.sub(r"\\s+", " ", cleaned).strip()
+    return cleaned
+
+def expand_contractions(raw_text: str) -> str:
+    if not raw_text:
+        return raw_text
+    replacements = {
+        "we're": "we are",
+        "you're": "you are",
+        "they're": "they are",
+        "I'm": "I am",
+        "i'm": "I am",
+        "it's": "it is",
+        "that's": "that is",
+        "there's": "there is",
+        "can't": "cannot",
+        "don't": "do not",
+        "doesn't": "does not",
+        "isn't": "is not",
+        "won't": "will not",
+        "let's": "let us",
+    }
+    text = raw_text
+    for k, v in replacements.items():
+        text = re.sub(rf"\\b{re.escape(k)}\\b", v, text)
+    return text
+
+def build_srt_from_audio(audio: AudioSegment, clean_text: str, subtitle_file: str) -> None:
+    total_duration_ms = len(audio)
+    total_duration_s = total_duration_ms / 1000.0
+    nonsilent_chunks = detect_nonsilent(audio, min_silence_len=400, silence_thresh=-40)
+    lines = split_string_by_punctuations(clean_text)
+    num_lines = len(lines)
+
+    def normalize_srt_times(time_pairs, total_s, min_gap=0.05, min_dur=0.25):
+        normalized = []
+        prev_end = 0.0
+        for start_s, end_s in time_pairs:
+            start_s = max(0.0, float(start_s))
+            end_s = max(float(end_s), start_s)
+            if start_s < prev_end + min_gap:
+                start_s = prev_end + min_gap
+            if end_s < start_s + min_dur:
+                end_s = start_s + min_dur
+            if end_s > total_s:
+                end_s = total_s
+                if end_s - start_s < min_dur:
+                    start_s = max(0.0, end_s - min_dur)
+                    if start_s < prev_end + min_gap:
+                        start_s = prev_end + min_gap
+                        end_s = min(total_s, start_s + min_dur)
+            normalized.append((start_s, end_s))
+            prev_end = end_s
+        if normalized and normalized[0][0] > 0.2:
+            shift = min(0.2, normalized[0][0] - 0.05)
+            shifted = []
+            for start_s, end_s in normalized:
+                start_s = max(0.0, start_s - shift)
+                end_s = max(start_s + min_dur, end_s - shift)
+                shifted.append((start_s, min(end_s, total_s)))
+            normalized = shifted
+        return normalized
+
+    if num_lines == 0:
+        logger.warning("No lines for SRT")
+        with open(subtitle_file, "w", encoding="utf-8") as f:
+            f.write("")
+        return
+
+    if len(nonsilent_chunks) >= num_lines:
+        with open(subtitle_file, "w", encoding="utf-8") as f:
+            raw_pairs = []
+            for i in range(num_lines):
+                start_ms, end_ms = nonsilent_chunks[i]
+                raw_pairs.append((start_ms / 1000.0, end_ms / 1000.0))
+            norm_pairs = normalize_srt_times(raw_pairs, total_duration_s)
+            for i, line in enumerate(lines, 1):
+                start_s, end_s = norm_pairs[i - 1]
+                start_hms = f"{int(start_s // 3600):02d}:{int((start_s % 3600) // 60):02d}:{int(start_s % 60):02d},{int((start_s % 1)*1000):03d}"
+                end_hms   = f"{int(end_s // 3600):02d}:{int((end_s % 3600) // 60):02d}:{int(end_s % 60):02d},{int((end_s % 1)*1000):03d}"
+                f.write(f"{i}\n")
+                f.write(f"{start_hms} --> {end_hms}\n")
+                f.write(f"{line.strip()}\n\n")
+        logger.info("SRT aligned with real speech chunks")
+        return
+
+    time_per_line = (total_duration_s - 1.0) / num_lines if num_lines > 0 else 5.0
+    with open(subtitle_file, "w", encoding="utf-8") as f:
+        current_time = 0.5
+        raw_pairs = []
+        for _ in range(num_lines):
+            start_s = current_time
+            end_s = min(start_s + time_per_line, total_duration_s - 0.5)
+            raw_pairs.append((start_s, end_s))
+            current_time = end_s
+        norm_pairs = normalize_srt_times(raw_pairs, total_duration_s)
+        for i, line in enumerate(lines, 1):
+            start_s, end_s = norm_pairs[i - 1]
+            start_hms = f"{int(start_s // 3600):02d}:{int((start_s % 3600) // 60):02d}:{int(start_s % 60):02d},{int((start_s % 1)*1000):03d}"
+            end_hms   = f"{int(end_s // 3600):02d}:{int((end_s % 3600) // 60):02d}:{int(end_s % 60):02d},{int((end_s % 1)*1000):03d}"
+            f.write(f"{i}\n")
+            f.write(f"{start_hms} --> {end_hms}\n")
+            f.write(f"{line.strip()}\n\n")
+    logger.info("SRT fallback with silence trim")
 
 def get_all_azure_voices(filter_locals=None) -> list[str]:
     if filter_locals is None:
@@ -1084,6 +1198,121 @@ def parse_voice_name(name: str):
     name = name.replace("-Female", "").replace("-Male", "").strip()
     return name
 
+def normalize_language_code(language: str) -> str:
+    if not language:
+        return language
+    if language.startswith("fixed-"):
+        return language.replace("fixed-", "")
+    return language
+
+def _resolve_credentials_path(path_str: str) -> str:
+    if not path_str:
+        return ""
+    if os.path.isabs(path_str) and os.path.exists(path_str):
+        return path_str
+    if os.path.exists(path_str):
+        return os.path.abspath(path_str)
+    repo_root = Path(__file__).resolve().parents[3]
+    candidate = repo_root / path_str
+    if candidate.exists():
+        return str(candidate)
+    backend_root = Path(__file__).resolve().parents[2]
+    candidate = backend_root / path_str
+    if candidate.exists():
+        return str(candidate)
+    return path_str
+
+def ensure_google_credentials() -> None:
+    settings = get_settings()
+    env_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
+    if env_path and os.path.exists(env_path):
+        return
+    cred = _resolve_credentials_path(env_path) if env_path else ""
+    if not cred:
+        cred = _resolve_credentials_path(settings.google_application_credentials)
+    if cred:
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = cred
+        logger.info(f"Google credentials set: {cred}")
+
+@lru_cache(maxsize=1)
+def _google_voices_cached():
+    ensure_google_credentials()
+    client = texttospeech.TextToSpeechClient()
+    return client.list_voices().voices
+
+def list_google_tts_languages(allowed: list[str] | None = None) -> list[str]:
+    try:
+        ensure_google_credentials()
+        langs = set()
+        for voice in _google_voices_cached():
+            if not _google_voice_tier(voice.name):
+                continue
+            for lang in voice.language_codes:
+                langs.add(lang)
+        results = sorted(langs)
+    except Exception as e:
+        logger.warning(f"Google TTS list languages failed: {e}")
+        results = allowed or []
+    if allowed:
+        results = [lang for lang in results if lang in allowed]
+    return results
+
+def list_google_tts_voices(language: str | None = None, allowed: list[str] | None = None) -> list[str]:
+    lang = normalize_language_code(language) if language else None
+    try:
+        ensure_google_credentials()
+        voices = []
+        for voice in _google_voices_cached():
+            if not _google_voice_tier(voice.name):
+                continue
+            if lang and lang not in voice.language_codes:
+                continue
+            if allowed and lang and lang not in allowed:
+                continue
+            voices.append(voice.name)
+        def sort_key(v: str):
+            tier = _google_voice_tier(v)
+            return (0 if tier == "chirp3-hd" else 1, v)
+        return sorted(set(voices), key=sort_key)
+    except Exception as e:
+        logger.warning(f"Google TTS list voices failed: {e}")
+        return []
+
+def _google_voice_tier(name: str) -> str | None:
+    if "Chirp3-HD" in name:
+        return "chirp3-hd"
+    if "Standard" in name:
+        return "standard"
+    return None
+
+def list_edge_tts_languages(allowed: list[str] | None = None) -> list[str]:
+    langs = set()
+    for v in get_all_azure_voices():
+        parts = v.split("-")
+        if len(parts) >= 2:
+            langs.add(f"{parts[0]}-{parts[1]}")
+    results = sorted(langs)
+    if allowed:
+        results = [lang for lang in results if lang in allowed]
+    return results
+
+def list_edge_tts_voices(language: str | None = None, allowed: list[str] | None = None) -> list[str]:
+    voices = get_all_azure_voices(allowed)
+    if language:
+        lang = normalize_language_code(language)
+        voices = [v for v in voices if v.startswith(lang)]
+    return voices
+
+def get_voice_options(allowed_langs: list[str] | None = None) -> dict:
+    allowed = allowed_langs or []
+    return {
+        "providers": ["gtts", "edge-tts", "google-tts"],
+        "languages": {
+            "gtts": ["fixed-en-GB"],
+            "edge-tts": list_edge_tts_languages(allowed or None),
+            "google-tts": list_google_tts_languages(allowed or None),
+        },
+    }
 
 def convert_rate_to_percent(rate: float) -> str:
     if rate == 1.0:
@@ -1101,7 +1330,11 @@ async def generate_voice(
         voice_rate: float = 0, 
         audio_file: str = None, 
         subtitle_file: str = None,
-        language: str = "en-US"
+        language: str = "en-US",
+        voice_provider: str = "gtts",
+        lead_silence_ms: int = 0,
+        trail_silence_ms: int = 0,
+        sentence_pause_ms: int | None = None,
         ) -> Tuple[str, str]:
     """生成语音和字幕
 
@@ -1120,14 +1353,26 @@ async def generate_voice(
     if subtitle_file is None:
         subtitle_file = f"temp_{uuid.uuid4()}.srt"
 
-    if not voice_name or voice_name == "default":
-        logger.info("Using default gTTS voice (no specific name needed)")
-
-    # generate with edge tts 
-    # await edge_tts_voice_notwork(text, voice_name, audio_file, subtitle_file, voice_rate)
-     
-    # Generate audio with gTTS with UK support
-    await gtts_voice(text, audio_file, subtitle_file, language, voice_rate)
+    provider = (voice_provider or "gtts").lower()
+    if provider in ("gtts", "google-tts", "google", "google-cloud-tts"):
+        if not voice_name or voice_name == "default":
+            logger.info("Using default voice")
+    if provider == "edge-tts":
+        voice_name = parse_voice_name(voice_name or "")
+        await edge_tts_voice_notwork(text, voice_name, audio_file, subtitle_file, voice_rate)
+    elif provider in ("google-tts", "google", "google-cloud-tts"):
+        await google_cloud_tts_voice(text, audio_file, subtitle_file, language, voice_name, voice_rate)
+    else:
+        await gtts_voice(
+            text,
+            audio_file,
+            subtitle_file,
+            language,
+            voice_rate,
+            lead_silence_ms=lead_silence_ms,
+            trail_silence_ms=trail_silence_ms,
+            sentence_pause_ms=sentence_pause_ms,
+        )
     
     return audio_file, subtitle_file
 
@@ -1137,7 +1382,16 @@ async def generate_voice(
     retry=retry_if_exception_type((Exception,)),  # retry on all errors, including 403
     reraise=True
 )
-async def gtts_voice(text: str, voice_file: str, subtitle_file: str, language: str, voice_rate: float = 0):
+async def gtts_voice(
+    text: str,
+    voice_file: str,
+    subtitle_file: str,
+    language: str,
+    voice_rate: float = 0,
+    lead_silence_ms: int = 0,
+    trail_silence_ms: int = 0,
+    sentence_pause_ms: int | None = None,
+):
     """
     Fallback to gTTS (Google TTS) — stable, no 403 issues.
     Note: gTTS doesn't support exact rate or SubMaker subtitles — use simple text split for .srt if needed.
@@ -1151,172 +1405,77 @@ async def gtts_voice(text: str, voice_file: str, subtitle_file: str, language: s
         logger.info("Using gTTS with US English")
 
     logger.info(f"gTTS generating | text length: {len(text)} | voice: {tld} | rate approx: {voice_rate}")
-    
-    def sanitize_text_for_tts(raw_text: str) -> str:
-        if not raw_text:
-            return raw_text
-        # Normalize smart quotes to simple quotes
-        cleaned = raw_text.replace("“", '"').replace("”", '"').replace("‘", "'").replace("’", "'")
-        # Remove standalone quotes (keep apostrophes inside words like Timmy's)
-        cleaned = re.sub(r"(?<!\\w)['\\\"](?!\\w)", "", cleaned)
-        # Collapse whitespace
-        cleaned = re.sub(r"\\s+", " ", cleaned).strip()
-        return cleaned
-  
-    def expand_contractions(raw_text: str) -> str:
-        if not raw_text:
-            return raw_text
-        # Expand common contractions for clearer TTS pronunciation
-        replacements = {
-            "we're": "we are",
-            "you're": "you are",
-            "they're": "they are",
-            "I'm": "I am",
-            "i'm": "I am",
-            "it's": "it is",
-            "that's": "that is",
-            "there's": "there is",
-            "can't": "cannot",
-            "don't": "do not",
-            "doesn't": "does not",
-            "isn't": "is not",
-            "won't": "will not",
-            "let's": "let us",
-        }
-        text = raw_text
-        for k, v in replacements.items():
-            text = re.sub(rf"\\b{re.escape(k)}\\b", v, text)
-        return text
-  
-    def compress_silence(
-        audio: AudioSegment,
-        min_silence_len: int = 350,
-        silence_thresh: int = -40,
-        keep_silence: int = 80,
-        gap_ms: int = 120,
-    ) -> AudioSegment:
-        """Reduce long pauses between sentences to improve cadence."""
-        ranges = detect_nonsilent(audio, min_silence_len=min_silence_len, silence_thresh=silence_thresh)
-        if not ranges:
-            return audio
-        segments = []
-        for start_ms, end_ms in ranges:
-            start_ms = max(0, start_ms - keep_silence)
-            end_ms = min(len(audio), end_ms + keep_silence)
-            if end_ms > start_ms:
-                segments.append(audio[start_ms:end_ms])
-        if not segments:
-            return audio
-        result = segments[0]
-        gap = AudioSegment.silent(duration=gap_ms)
-        for seg in segments[1:]:
-            result += gap + seg
-        return result
 
     try:
         clean_text = sanitize_text_for_tts(text)
         tts_text = expand_contractions(clean_text)
         # Approximate rate: slow=True for slower speech
         slow = voice_rate < 0.8
-        tts = gTTS(text=tts_text, lang="en", tld=tld, slow=slow)
-        tts.save(voice_file)
+        segments = split_string_by_punctuations(clean_text)
+        if len(segments) <= 1:
+            tts = gTTS(text=tts_text, lang="en", tld=tld, slow=slow)
+            tts.save(voice_file)
+        else:
+            pause_ms = 220 if sentence_pause_ms is None else max(0, int(sentence_pause_ms))
+            combined = AudioSegment.empty()
+            for idx, segment in enumerate(segments):
+                seg_text = expand_contractions(sanitize_text_for_tts(segment))
+                tts = gTTS(text=seg_text, lang="en", tld=tld, slow=slow)
+                buffer = io.BytesIO()
+                tts.write_to_fp(buffer)
+                buffer.seek(0)
+                seg_audio = AudioSegment.from_file(buffer, format="mp3")
+                combined += seg_audio
+                if idx < len(segments) - 1:
+                    combined += AudioSegment.silent(duration=pause_ms)
+            combined.export(voice_file, format="mp3")
         
         logger.info(f"gTTS success → saved: {voice_file}")
 
         # Get real audio duration
         audio = AudioSegment.from_mp3(voice_file)
-        audio = compress_silence(audio)
-        audio.export(voice_file, format="mp3")
-        total_duration_ms = len(audio)
-        total_duration_s = total_duration_ms / 1000.0
-
-        # Detect nonsilent chunks to remove silence
-        nonsilent_chunks = detect_nonsilent(audio, min_silence_len=400, silence_thresh=-40)
-
-        lines = split_string_by_punctuations(clean_text)
-        num_lines = len(lines)
-
-        def normalize_srt_times(time_pairs, total_s, min_gap=0.05, min_dur=0.25):
-            normalized = []
-            prev_end = 0.0
-            for start_s, end_s in time_pairs:
-                start_s = max(0.0, float(start_s))
-                end_s = max(float(end_s), start_s)
-                if start_s < prev_end + min_gap:
-                    start_s = prev_end + min_gap
-                if end_s < start_s + min_dur:
-                    end_s = start_s + min_dur
-                if end_s > total_s:
-                    end_s = total_s
-                    if end_s - start_s < min_dur:
-                        start_s = max(0.0, end_s - min_dur)
-                        if start_s < prev_end + min_gap:
-                            start_s = prev_end + min_gap
-                            end_s = min(total_s, start_s + min_dur)
-                normalized.append((start_s, end_s))
-                prev_end = end_s
-            # If the first subtitle starts noticeably late, shift earlier a bit
-            if normalized and normalized[0][0] > 0.2:
-                shift = min(0.2, normalized[0][0] - 0.05)
-                shifted = []
-                for start_s, end_s in normalized:
-                    start_s = max(0.0, start_s - shift)
-                    end_s = max(start_s + min_dur, end_s - shift)
-                    shifted.append((start_s, min(end_s, total_s)))
-                normalized = shifted
-            return normalized
-
-        if num_lines == 0:
-            logger.warning("No lines for SRT")
-            with open(subtitle_file, "w", encoding="utf-8") as f:
-                f.write("")
-        else:
-            if len(nonsilent_chunks) >= num_lines:
-                # Use real speech chunk timings
-                with open(subtitle_file, "w", encoding="utf-8") as f:
-                    raw_pairs = []
-                    for i in range(num_lines):
-                        start_ms, end_ms = nonsilent_chunks[i]
-                        raw_pairs.append((start_ms / 1000.0, end_ms / 1000.0))
-                    norm_pairs = normalize_srt_times(raw_pairs, total_duration_s)
-                    for i, line in enumerate(lines, 1):
-                        start_s, end_s = norm_pairs[i-1]
-                        
-                        start_hms = f"{int(start_s // 3600):02d}:{int((start_s % 3600) // 60):02d}:{int(start_s % 60):02d},{int((start_s % 1)*1000):03d}"
-                        end_hms   = f"{int(end_s // 3600):02d}:{int((end_s % 3600) // 60):02d}:{int(end_s % 60):02d},{int((end_s % 1)*1000):03d}"
-                        
-                        f.write(f"{i}\n")
-                        f.write(f"{start_hms} --> {end_hms}\n")
-                        f.write(f"{line.strip()}\n\n")
-                
-                logger.info(f"SRT aligned with real speech chunks")
-            else:
-                # Even timing, but trim 0.5s silence from end/start
-                time_per_line = (total_duration_s - 1.0) / num_lines if num_lines > 0 else 5.0  # subtract buffer silence
-                
-                with open(subtitle_file, "w", encoding="utf-8") as f:
-                    current_time = 0.5  # start 0.5s in to skip leading silence
-                    raw_pairs = []
-                    for _ in range(num_lines):
-                        start_s = current_time
-                        end_s = min(start_s + time_per_line, total_duration_s - 0.5)
-                        raw_pairs.append((start_s, end_s))
-                        current_time = end_s
-                    norm_pairs = normalize_srt_times(raw_pairs, total_duration_s)
-                    for i, line in enumerate(lines, 1):
-                        start_s, end_s = norm_pairs[i-1]
-                        
-                        start_hms = f"{int(start_s // 3600):02d}:{int((start_s % 3600) // 60):02d}:{int(start_s % 60):02d},{int((start_s % 1)*1000):03d}"
-                        end_hms   = f"{int(end_s // 3600):02d}:{int((end_s % 3600) // 60):02d}:{int(end_s % 60):02d},{int((end_s % 1)*1000):03d}"
-                        
-                        f.write(f"{i}\n")
-                        f.write(f"{start_hms} --> {end_hms}\n")
-                        f.write(f"{line.strip()}\n\n")
-                
-                logger.info(f"SRT fallback with silence trim")
+        if lead_silence_ms or trail_silence_ms:
+            audio = AudioSegment.silent(duration=int(lead_silence_ms)) + audio + AudioSegment.silent(duration=int(trail_silence_ms))
+            audio.export(voice_file, format="mp3")
+        build_srt_from_audio(audio, clean_text, subtitle_file)
     except Exception as e:
         logger.error(f"gTTS failed: {str(e)}")
         raise
+
+async def google_cloud_tts_voice(
+    text: str,
+    voice_file: str,
+    subtitle_file: str,
+    language: str,
+    voice_name: str | None = None,
+    voice_rate: float = 1.0,
+):
+    clean_text = sanitize_text_for_tts(text)
+    tts_text = expand_contractions(clean_text)
+    lang = normalize_language_code(language) or "en-GB"
+    if not voice_name:
+        candidates = list_google_tts_voices(lang)
+        voice_name = candidates[0] if candidates else None
+    if not voice_name:
+        raise RuntimeError(f"No Google TTS voices available for language {lang}")
+    logger.info(f"Google TTS | language={lang} | voice={voice_name} | rate={voice_rate}")
+    client = texttospeech.TextToSpeechClient()
+    synthesis_input = texttospeech.SynthesisInput(text=tts_text)
+    voice = texttospeech.VoiceSelectionParams(language_code=lang, name=voice_name)
+    speaking_rate = min(4.0, max(0.25, float(voice_rate or 1.0)))
+    audio_config = texttospeech.AudioConfig(
+        audio_encoding=texttospeech.AudioEncoding.MP3,
+        speaking_rate=speaking_rate,
+    )
+    response = client.synthesize_speech(
+        input=synthesis_input,
+        voice=voice,
+        audio_config=audio_config,
+    )
+    with open(voice_file, "wb") as out:
+        out.write(response.audio_content)
+    audio = AudioSegment.from_mp3(voice_file)
+    build_srt_from_audio(audio, clean_text, subtitle_file)
 
 async def edge_tts_voice_notwork(text: str, voice_name: str, voice_file: str, subtitle_file:str, voice_rate: float = 0):
     """使用 Edge TTS 生成语音"""

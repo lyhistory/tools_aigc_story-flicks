@@ -38,3 +38,9 @@ export const VOICE_LANGUAGES_LABELS = [
         value: 'ko-KR'
     }
 ]
+
+export const VOICE_PROVIDERS = [
+    { label: "gTTS (Fixed UK)", value: "gtts" },
+    { label: "Edge TTS", value: "edge-tts" },
+    { label: "Google Cloud TTS", value: "google-tts" },
+];

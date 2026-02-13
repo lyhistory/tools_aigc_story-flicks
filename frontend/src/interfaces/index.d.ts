@@ -3,6 +3,11 @@ interface VoiceListRes {
     voices: string[];
 }
 
+interface VoiceOptionsRes {
+    providers: string[];
+    languages: Record<string, string[]>;
+}
+
 interface LLMProvidersRes {
     textLLMProviders: string[];
     imageLLMProviders: string[];
@@ -27,6 +32,8 @@ interface VideoGenerateReq {
     story_prompt?: string; // 故事提示词，测试模式不需要，非测试模式必填
     topic_type?: "dialogue" | "explanation" | "scene";
     image_style?: string; // 图片风格，测试模式不需要，非测试模式必填
+    subject?: string; // optional cover subject
+    voice_provider?: string; // gtts | edge-tts | google-tts
     voice_name: string; // 语音名称，需要和语言匹配
     voice_rate: number; // 语音速率，默认写1
 }

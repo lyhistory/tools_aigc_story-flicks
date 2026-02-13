@@ -10,6 +10,9 @@ services:
       - backend/.env
     volumes:
       - ./backend:/app
+      - ./backend/credentials:/app/backend/credentials:ro
+    environment:
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/backend/credentials/kidenglish-485304-06b70f9353bf.json
     networks:
       - app-network
     depends_on:

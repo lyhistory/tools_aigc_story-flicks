@@ -67,6 +67,10 @@ local_settings.py
 db.sqlite3-journal
 media/
 
+# Credentials (do not commit)
+backend/credentials/
+**/credentials/*.json
+
 # Documentation
 docs/_build/
 site/

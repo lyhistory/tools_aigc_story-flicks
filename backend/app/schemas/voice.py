@@ -3,6 +3,8 @@ from pydantic import BaseModel, Field
 
 class VoiceGenerationRequest(BaseModel):
     text: str = Field(..., min_length=1, max_length=5000, description="要转换为语音的文本内容")
+    voice_provider: str = Field(default="gtts", description="语音提供商: gtts, edge-tts, google-tts")
+    language: str = Field(default="fixed-en-GB", description="语音语言")
     voice_name: str = Field(
         default="zh-CN-XiaoxiaoNeural", 
         description="语音名称，如：zh-CN-XiaoxiaoNeural, zh-CN-YunxiNeural"

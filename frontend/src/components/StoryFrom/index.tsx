@@ -2,9 +2,8 @@ import React, { useState, useEffect } from 'react';
 import type { FormProps } from 'antd';
 import { Button, Form, Input, Select, message, Switch, Tooltip } from 'antd';
 import { useTranslation } from 'react-i18next'
-import { getVoiceList, getLLMProviders, generateVideo } from '../../services/index';
-import { VOICE_LANGUAGES, VOICE_LANGUAGES_LABELS } from '../../constants';
-import { getSelectVoiceList } from '../../utils/index';
+import { getVoiceList, getLLMProviders, generateVideo, getVoiceOptions } from '../../services/index';
+import { VOICE_LANGUAGES, VOICE_LANGUAGES_LABELS, VOICE_PROVIDERS } from '../../constants';
 import styles from './index.module.css'
 import { useVideoStore } from "../../stores/index";
 
@@ -23,6 +22,8 @@ type FieldType = {
     story_prompt?: string; // 故事提示词，测试模式不需要，非测试模式必填
     topic_type?: "dialogue" | "explanation" | "scene";
     image_style?: string; // 图片风格，测试模式不需要，非测试模式必填
+    subject?: string; // Optional cover subject
+    voice_provider?: string; // gtts | edge-tts | google-tts
     voice_name: string; // 语音名称，需要和语言匹配
     voice_rate: number; // 语音速率，默认写1
 };
@@ -32,7 +33,8 @@ const App: React.FC = () => {
     const { setVideoUrl }  = useVideoStore();
     const { t } = useTranslation();
     const [form] = Form.useForm();
-    const [allVoiceList, setAllVoiceList] = useState<string[]>([]);
+    const [voiceOptions, setVoiceOptions] = useState<{ providers: string[]; languages: Record<string, string[]> }>({ providers: [], languages: {} });
+    const [voiceLanguages, setVoiceLanguages] = useState<string[]>(VOICE_LANGUAGES);
     const [nowVoiceList, setNowVoiceList] = useState<string[]>([]);
     const [llmProviders, setLLMProviders] = useState<{ 
 		textLLMProviders: string[], 
@@ -61,14 +63,27 @@ const App: React.FC = () => {
         }).catch(err => {
             console.log(err);
         })
-        getVoiceList({ area: VOICE_LANGUAGES }).then(res => {
-            console.log('voiceList', res?.voices);
-            if (res?.voices?.length > 0) {
-                setAllVoiceList(res?.voices)
+        getVoiceOptions().then(res => {
+            setVoiceOptions(res);
+            const provider = res.providers?.[0] || 'gtts';
+            form.setFieldsValue({ voice_provider: provider });
+            const langs = res.languages?.[provider] || VOICE_LANGUAGES;
+            setVoiceLanguages(langs);
+            const initLang = provider === 'gtts' ? 'fixed-en-GB' : (langs[0] || 'en-GB');
+            form.setFieldsValue({ language: initLang });
+            if (provider === 'gtts') {
+                form.setFieldsValue({ voice_name: 'default' });
+            } else {
+                getVoiceList({ provider, language: initLang }).then(vres => {
+                    setNowVoiceList(vres?.voices || []);
+                    if (vres?.voices?.length > 0) {
+                        form.setFieldsValue({ voice_name: vres.voices[0].replace('-Female', '').replace('-Male', '') });
+                    }
+                });
             }
         }).catch(err => {
             console.log(err);
-        })
+        });
     }, []);
     const onFinish: FormProps<FieldType>['onFinish'] = (values) => {
         console.log('Success:', values);
@@ -91,6 +106,28 @@ const App: React.FC = () => {
     
     const onFinishFailed: FormProps<FieldType>['onFinishFailed'] = (errorInfo) => {
         console.log('Failed:', errorInfo);
+    };
+    const languageLabelMap = new Map(VOICE_LANGUAGES_LABELS.map((l) => [l.value, l.label]));
+
+    const handleVoiceProviderChange = (provider: string) => {
+        const fallbackLangs = provider === 'gtts'
+            ? ['fixed-en-GB']
+            : VOICE_LANGUAGES.filter((l) => !l.startsWith('fixed-'));
+        const langs = voiceOptions.languages?.[provider] || fallbackLangs;
+        setVoiceLanguages(langs);
+        const nextLang = provider === 'gtts' ? 'fixed-en-GB' : (langs[0] || 'en-GB');
+        form.setFieldsValue({ language: nextLang });
+        if (provider === 'gtts') {
+            setNowVoiceList([]);
+            form.setFieldsValue({ voice_name: 'default' });
+            return;
+        }
+        getVoiceList({ provider, language: nextLang }).then(res => {
+            setNowVoiceList(res?.voices || []);
+            if (res?.voices?.length > 0) {
+                form.setFieldsValue({ voice_name: res.voices[0].replace('-Female', '').replace('-Male', '') });
+            }
+        });
     };
     // defaults are set from backend in the initial load effect
         return (
@@ -177,24 +214,40 @@ const App: React.FC = () => {
                         <Switch defaultChecked />
                     </Form.Item>
                     <Form.Item<FieldType>
+                        label="Voice Provider"
+                        name="voice_provider"
+                        rules={[{ required: true, message: "Please select a voice provider" }]}
+                    >
+                        <Select onChange={handleVoiceProviderChange}>
+                            {VOICE_PROVIDERS.map((p) => (
+                                <Select.Option value={p.value}>{p.label}</Select.Option>
+                            ))}
+                        </Select>
+                    </Form.Item>
+                    <Form.Item<FieldType>
                         label={t('storyForm.videoLanguage')}
                         name="language"
                         rules={[{ required: true, message: t('storyForm.videoLanguageMissMsg') }]}
                     >
                         <Select
                             onChange={(value) => {
-                                if (value?.startsWith('fixed')) {
+                                const provider = form.getFieldValue('voice_provider') || 'gtts';
+                                if (provider === 'gtts' || value?.startsWith('fixed')) {
+                                    setNowVoiceList([]);
                                     form.setFieldsValue({ voice_name: 'default' });
-                                }else{
-                                    let voiceList = getSelectVoiceList(value, allVoiceList);
-                                    setNowVoiceList(voiceList);
-                                    form.setFieldsValue({ voice_name: voiceList[0].replace('-Female', '').replace('-Male', '') });
+                                    return;
                                 }
+                                getVoiceList({ provider, language: value }).then(res => {
+                                    setNowVoiceList(res?.voices || []);
+                                    if (res?.voices?.length > 0) {
+                                        form.setFieldsValue({ voice_name: res.voices[0].replace('-Female', '').replace('-Male', '') });
+                                    }
+                                });
                             }}
                         >
                             {
-                                VOICE_LANGUAGES_LABELS.map((language) => {
-                                    return <Select.Option value={language.value}>{language.label}</Select.Option>
+                                voiceLanguages.map((lang) => {
+                                    return <Select.Option value={lang}>{languageLabelMap.get(lang) || lang}</Select.Option>
                                 })
                             }
                         </Select>
@@ -228,6 +281,12 @@ const App: React.FC = () => {
                                 </Form.Item>
                             );
                         }}
+                    </Form.Item>
+                    <Form.Item<FieldType>
+                        label="Subject (Optional)"
+                        name="subject"
+                    >
+                        <Input placeholder="Plural" />
                     </Form.Item>
                     <Form.Item<FieldType>
                         label={t('storyForm.textPrompt')}
