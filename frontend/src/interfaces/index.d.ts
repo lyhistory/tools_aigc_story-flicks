@@ -33,9 +33,11 @@ interface VideoGenerateReq {
     topic_type?: "dialogue" | "explanation" | "scene";
     image_style?: string; // 图片风格，测试模式不需要，非测试模式必填
     subject?: string; // optional cover subject
+    learner_age?: "3-5" | "6-8" | "9-12" | "13-15" | "16-18";
     voice_provider?: string; // gtts | edge-tts | google-tts
     voice_name: string; // 语音名称，需要和语言匹配
     voice_rate: number; // 语音速率，默认写1
+    karaoke?: boolean; // Karaoke word-level highlight
 }
 
 // 假设 Language 和 ImageStyle 是其他接口或枚举

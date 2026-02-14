@@ -16,6 +16,7 @@ class StoryGenerationRequest(BaseModel):
     use_inpainting: Optional[bool] = Field(default=False, description="Whether to use img2img/inpainting for image generation")
     avoid_exact_counts: Optional[bool] = Field(default=None, description="Avoid exact numeric counts in prompts")
     subject: Optional[str] = Field(default=None, description="Optional cover subject")
+    learner_age: Optional[str] = Field(default="3-5", description="Learner age band: 3-5, 6-8, 9-12, 13-15, 16-18")
 
 
 class StorySegment(BaseModel):

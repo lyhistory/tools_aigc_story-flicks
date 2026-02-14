@@ -3,7 +3,7 @@ import type { FormProps } from 'antd';
 import { Button, Form, Input, Select, message, Switch, Tooltip } from 'antd';
 import { useTranslation } from 'react-i18next'
 import { getVoiceList, getLLMProviders, generateVideo, getVoiceOptions } from '../../services/index';
-import { VOICE_LANGUAGES, VOICE_LANGUAGES_LABELS, VOICE_PROVIDERS } from '../../constants';
+import { VOICE_LANGUAGES, VOICE_LANGUAGES_LABELS, VOICE_PROVIDERS, LEARNER_AGE_OPTIONS } from '../../constants';
 import styles from './index.module.css'
 import { useVideoStore } from "../../stores/index";
 
@@ -23,9 +23,11 @@ type FieldType = {
     topic_type?: "dialogue" | "explanation" | "scene";
     image_style?: string; // 图片风格，测试模式不需要，非测试模式必填
     subject?: string; // Optional cover subject
+    learner_age?: "3-5" | "6-8" | "9-12" | "13-15" | "16-18";
     voice_provider?: string; // gtts | edge-tts | google-tts
     voice_name: string; // 语音名称，需要和语言匹配
     voice_rate: number; // 语音速率，默认写1
+    karaoke?: boolean; // Karaoke word-level highlight
 };
 
 
@@ -59,6 +61,7 @@ const App: React.FC = () => {
                     avoid_exact_counts: true,
                     text_llm_provider: res.text_llm_provider || res.textLLMProviders?.[0],
                     image_llm_provider: res.image_llm_provider || res.imageLLMProviders?.[0],
+                    learner_age: '3-5',
                 });
         }).catch(err => {
             console.log(err);
@@ -283,10 +286,31 @@ const App: React.FC = () => {
                         }}
                     </Form.Item>
                     <Form.Item<FieldType>
+                        label="Karaoke"
+                        name="karaoke"
+                        valuePropName="checked"
+                        initialValue={false}
+                    >
+                        <Switch />
+                    </Form.Item>
+                    <Form.Item<FieldType>
                         label="Subject (Optional)"
                         name="subject"
                     >
                         <Input placeholder="Plural" />
+                    </Form.Item>
+                    <Form.Item<FieldType>
+                        label="Learner Age"
+                        name="learner_age"
+                        initialValue="3-5"
+                    >
+                        <Select>
+                            {LEARNER_AGE_OPTIONS.map((item) => (
+                                <Select.Option key={item.value} value={item.value}>
+                                    {item.label}
+                                </Select.Option>
+                            ))}
+                        </Select>
                     </Form.Item>
                     <Form.Item<FieldType>
                         label={t('storyForm.textPrompt')}

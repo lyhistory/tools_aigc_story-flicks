@@ -157,6 +157,7 @@ async def create_video_with_scenes(
         voice_rate: float, 
         language: str = "en-US",
         voice_provider: str = "gtts",
+        karaoke: bool = False,
         test_mode: bool = False,
         resolution: str = None) -> str:
     """创建带有场景的视频
@@ -194,6 +195,35 @@ async def create_video_with_scenes(
             if t.endswith(suf) and len(t) > len(suf) + 2:
                 return t[: -len(suf)]
         return t
+
+    def tokenize_karaoke_words(text: str) -> list[str]:
+        if not text:
+            return []
+        return [m.group(0) for m in re.finditer(r"[A-Za-z]+(?:'[A-Za-z]+)?|\d+", text)]
+
+    def load_karaoke_words(words_file: str) -> list[dict]:
+        if not os.path.exists(words_file):
+            return []
+        try:
+            with open(words_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            words = data.get("words", []) if isinstance(data, dict) else []
+            out = []
+            for w in words:
+                if not isinstance(w, dict):
+                    continue
+                word = str(w.get("word", "")).strip()
+                if not word:
+                    continue
+                start = float(w.get("start", 0.0) or 0.0)
+                end = float(w.get("end", start + 0.03) or (start + 0.03))
+                if end <= start:
+                    end = start + 0.03
+                out.append({"word": word, "start": start, "end": end})
+            return out
+        except Exception as e:
+            logger.warning(f"Failed to load karaoke words from {words_file}: {e}")
+            return []
 
     def find_keyword_in_text(text: str, keywords: list) -> dict:
         if not text or not keywords:
@@ -287,6 +317,7 @@ async def create_video_with_scenes(
         highlight_word: str | None = None,
         highlight_bg_rgba=(255, 241, 153, 180),
         highlight_text_color: str | None = None,
+        highlight_token_index: int | None = None,
         stroke_width: int = 0,
         stroke_fill: str | None = None,
     ) -> Image.Image | None:
@@ -311,11 +342,22 @@ async def create_video_with_scenes(
         highlight = (highlight_word or "").strip()
         highlight_norm = normalize_token(highlight) if highlight else ""
         y = pad_y
+        token_cursor = 0
+        token_highlight_done = False
         for line, bbox, w, h in line_sizes:
             x = (width - w) // 2 - bbox[0]
             match = None
-            if highlight_norm:
-                for m in re.finditer(r"[A-Za-z']+", line):
+            line_tokens = list(re.finditer(r"[A-Za-z']+|\d+", line))
+            if highlight_token_index is not None and not token_highlight_done:
+                for m in line_tokens:
+                    if token_cursor == highlight_token_index:
+                        match = m
+                        token_highlight_done = True
+                    token_cursor += 1
+            elif highlight_token_index is not None:
+                token_cursor += len(line_tokens)
+            elif highlight_norm:
+                for m in line_tokens:
                     token = m.group(0)
                     if normalize_token(token) == highlight_norm:
                         match = m
@@ -426,8 +468,19 @@ async def create_video_with_scenes(
                     base.alpha_composite(item["cover_img"], item["cover_pos"])
                 if item.get("kw_img") is not None:
                     base.alpha_composite(item["kw_img"], item["kw_pos"])
-                if item.get("sub_img") is not None:
-                    base.alpha_composite(item["sub_img"], item["sub_pos"])
+                sub_img = item.get("sub_img")
+                karaoke_words = item.get("karaoke_words") or []
+                karaoke_imgs = item.get("sub_karaoke_imgs") or {}
+                if karaoke_words and karaoke_imgs:
+                    active_idx = None
+                    for w in karaoke_words:
+                        if float(w["start"]) <= t <= float(w["end"]):
+                            active_idx = int(w["token_index"])
+                            break
+                    if active_idx is not None and active_idx in karaoke_imgs:
+                        sub_img = karaoke_imgs[active_idx]
+                if sub_img is not None:
+                    base.alpha_composite(sub_img, item["sub_pos"])
         return np.array(base.convert("RGB"))
 
     def imageclip_from_png(file_path: str) -> ImageClip:
@@ -444,6 +497,7 @@ async def create_video_with_scenes(
             logger.warning(f"Failed to load PNG with alpha for overlay: {file_path} ({e})")
             return ImageClip(file_path)
 
+    shown_keyword_words = set()
     for i, scene in enumerate(scenes, 1):
         try:
             # 获取文件路径
@@ -477,6 +531,7 @@ async def create_video_with_scenes(
                     lead_silence_ms=lead_silence_ms,
                     trail_silence_ms=trail_silence_ms,
                     sentence_pause_ms=sentence_pause_ms,
+                    karaoke=karaoke,
                 )
             
             # 获取字幕的总时长
@@ -538,6 +593,10 @@ async def create_video_with_scenes(
                 try:
                     sub = subtitles.file_to_subtitles(subtitle_file, encoding="utf-8")
                     subtitle_items = []
+                    karaoke_enabled = bool(karaoke)
+                    words_file = os.path.join(task_dir, f"{i}.words.json")
+                    karaoke_words_all = load_karaoke_words(words_file) if karaoke_enabled else []
+                    karaoke_word_ptr = 0
                     cover_text = (getattr(scene, "subject", None) or "").strip()
                     if getattr(scene, "is_cover", False) and cover_text:
                         cover_font_size = max(72, int(origin_image_h * 0.08))
@@ -572,6 +631,7 @@ async def create_video_with_scenes(
                             continue
                         kw = find_keyword_in_text(phrase, scene.keywords)
                         highlight_word = (kw.get("word") or "").strip() if kw else ""
+                        highlight_norm = normalize_token(highlight_word) if highlight_word else ""
                         sub_img = render_text_rgba(
                             phrase,
                             subtitle_font_path,
@@ -583,23 +643,73 @@ async def create_video_with_scenes(
                             highlight_bg_rgba=(254, 240, 138, 220),
                             highlight_text_color="#111827",
                         )
+                        line_start = float(item[0][0])
+                        line_end = float(item[0][1])
+                        phrase_tokens = tokenize_karaoke_words(phrase)
+                        karaoke_words_line = []
+                        if karaoke_enabled and phrase_tokens:
+                            line_dur = max(0.05, line_end - line_start)
+                            approx_step = line_dur / len(phrase_tokens)
+                            for token_idx, token in enumerate(phrase_tokens):
+                                ws = line_start + token_idx * approx_step
+                                we = line_end if token_idx == len(phrase_tokens) - 1 else line_start + (token_idx + 1) * approx_step
+                                if karaoke_word_ptr < len(karaoke_words_all):
+                                    w = karaoke_words_all[karaoke_word_ptr]
+                                    karaoke_word_ptr += 1
+                                    ws = max(line_start, float(w.get("start", ws)))
+                                    we = min(line_end, float(w.get("end", we)))
+                                    if we <= ws:
+                                        we = min(line_end, ws + max(0.03, approx_step * 0.8))
+                                karaoke_words_line.append(
+                                    {
+                                        "token_index": token_idx,
+                                        "word": token,
+                                        "start": round(ws, 4),
+                                        "end": round(max(ws + 0.03, we), 4),
+                                    }
+                                )
+                        sub_karaoke_imgs = {}
+                        if karaoke_enabled and karaoke_words_line:
+                            for word_info in karaoke_words_line:
+                                token_idx = int(word_info["token_index"])
+                                token_norm = normalize_token(word_info.get("word", ""))
+                                is_keyword_token = bool(highlight_norm and token_norm == highlight_norm)
+                                kara_bg = (147, 197, 253, 210)
+                                if is_keyword_token:
+                                    kara_bg = (254, 240, 138, 230)
+                                kara_img = render_text_rgba(
+                                    phrase,
+                                    subtitle_font_path,
+                                    58,
+                                    "#F472B6",
+                                    max_width=int(origin_image_w * 0.9),
+                                    bg_rgba=(0, 0, 0, 0),
+                                    highlight_token_index=token_idx,
+                                    highlight_bg_rgba=kara_bg,
+                                    highlight_text_color="#111827",
+                                )
+                                if kara_img is not None:
+                                    sub_karaoke_imgs[token_idx] = kara_img
                         kw_img = None
                         if kw:
                             word = (kw.get("word") or "").strip()
-                            pron_us = sanitize_pronunciation(kw.get("pronunciation_us", ""))
-                            pron_uk = sanitize_pronunciation(kw.get("pronunciation_uk", ""))
-                            expl = (kw.get("explanation") or "").strip()
-                            kw_img = build_keyword_panel(
-                                word=word,
-                                pron_us=pron_us,
-                                pron_uk=pron_uk,
-                                expl=expl,
-                                word_font_path=keyword_font_path,
-                                pron_font_path=keyword_pron_font_path,
-                                expl_font_path=keyword_expl_font_path,
-                                max_width=int(origin_image_w * 0.9),
-                                origin_image_h=origin_image_h,
-                            )
+                            word_key = normalize_token(word)
+                            if word_key and word_key not in shown_keyword_words:
+                                pron_us = sanitize_pronunciation(kw.get("pronunciation_us", ""))
+                                pron_uk = sanitize_pronunciation(kw.get("pronunciation_uk", ""))
+                                expl = (kw.get("explanation") or "").strip()
+                                kw_img = build_keyword_panel(
+                                    word=word,
+                                    pron_us=pron_us,
+                                    pron_uk=pron_uk,
+                                    expl=expl,
+                                    word_font_path=keyword_font_path,
+                                    pron_font_path=keyword_pron_font_path,
+                                    expl_font_path=keyword_expl_font_path,
+                                    max_width=int(origin_image_w * 0.9),
+                                    origin_image_h=origin_image_h,
+                                )
+                                shown_keyword_words.add(word_key)
                         if sub_img is None and kw_img is None:
                             continue
                         sub_x = (origin_image_w - sub_img.width) // 2 if sub_img else 0
@@ -614,9 +724,11 @@ async def create_video_with_scenes(
                                 "sub_pos": (sub_x, sub_y),
                                 "kw_img": kw_img,
                                 "kw_pos": (kw_x, kw_y),
+                                "karaoke_words": karaoke_words_line,
+                                "sub_karaoke_imgs": sub_karaoke_imgs,
                             }
                         )
-                        if kw:
+                        if kw_img is not None:
                             logger.info(
                                 f"Keyword overlay added: {(kw.get('word') or '').strip()} for subtitle '{phrase}'"
                             )
@@ -716,6 +828,7 @@ async def generate_video(request: VideoGenerateRequest):
                 avoid_exact_counts=request.avoid_exact_counts,
                 topic_type=request.topic_type,
                 subject=request.subject,
+                learner_age=request.learner_age,
             )
             logger.info(f"generate_video StoryGenerationRequest: {req}")
             story_list = await llm_service.generate_story_with_images(
@@ -807,6 +920,7 @@ async def generate_video(request: VideoGenerateRequest):
             voice_rate=request.voice_rate,
             language=request.language,
             voice_provider=getattr(request, "voice_provider", "gtts"),
+            karaoke=getattr(request, "karaoke", False),
             test_mode=request.test_mode,
             resolution=request.resolution,
         )

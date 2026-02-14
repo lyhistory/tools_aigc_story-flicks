@@ -25,6 +25,7 @@ from pydub import AudioSegment
 from pydub.silence import detect_nonsilent
 
 ua = UserAgent()  # global fake-useragent instance
+KARAOKE_WORD_PATTERN = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?|\d+")
 
 PUNCTUATIONS = [
     "?",
@@ -116,6 +117,65 @@ def expand_contractions(raw_text: str) -> str:
     for k, v in replacements.items():
         text = re.sub(rf"\\b{re.escape(k)}\\b", v, text)
     return text
+
+def karaoke_tokenize(text: str) -> list[str]:
+    if not text:
+        return []
+    return [m.group(0) for m in KARAOKE_WORD_PATTERN.finditer(text)]
+
+def _write_karaoke_words_file(subtitle_file: str, provider: str, words: list[dict]) -> None:
+    words_file = os.path.splitext(subtitle_file)[0] + ".words.json"
+    payload = {
+        "provider": provider,
+        "words": words,
+    }
+    with open(words_file, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    logger.info(f"Karaoke words saved: {words_file} ({len(words)} words)")
+
+def _karaoke_words_from_subtitle(subtitle_file: str) -> list[dict]:
+    words: list[dict] = []
+    try:
+        sbs = subtitles.file_to_subtitles(subtitle_file, encoding="utf-8")
+        for ((start_s, end_s), line_text) in sbs:
+            tokens = karaoke_tokenize(line_text or "")
+            if not tokens:
+                continue
+            line_start = float(start_s)
+            line_end = float(end_s)
+            line_dur = max(0.05, line_end - line_start)
+            step = line_dur / len(tokens)
+            for idx, token in enumerate(tokens):
+                ws = line_start + idx * step
+                we = line_end if idx == len(tokens) - 1 else line_start + (idx + 1) * step
+                words.append(
+                    {
+                        "word": token,
+                        "start": round(ws, 4),
+                        "end": round(max(ws + 0.03, we), 4),
+                    }
+                )
+    except Exception as e:
+        logger.warning(f"Failed to build fallback karaoke timings from subtitle: {e}")
+    return words
+
+def _build_google_ssml_with_marks(text: str) -> tuple[str, list[str]]:
+    marks: list[str] = []
+    parts: list[str] = []
+    last = 0
+    token_index = 0
+    for m in KARAOKE_WORD_PATTERN.finditer(text or ""):
+        if m.start() > last:
+            parts.append(xml.sax.saxutils.escape(text[last:m.start()]))
+        parts.append(f'<mark name="w{token_index}"/>')
+        token = m.group(0)
+        parts.append(xml.sax.saxutils.escape(token))
+        marks.append(token)
+        token_index += 1
+        last = m.end()
+    if text and last < len(text):
+        parts.append(xml.sax.saxutils.escape(text[last:]))
+    return f"<speak>{''.join(parts)}</speak>", marks
 
 def build_srt_from_audio(audio: AudioSegment, clean_text: str, subtitle_file: str) -> None:
     total_duration_ms = len(audio)
@@ -1335,6 +1395,7 @@ async def generate_voice(
         lead_silence_ms: int = 0,
         trail_silence_ms: int = 0,
         sentence_pause_ms: int | None = None,
+        karaoke: bool = False,
         ) -> Tuple[str, str]:
     """生成语音和字幕
 
@@ -1359,9 +1420,9 @@ async def generate_voice(
             logger.info("Using default voice")
     if provider == "edge-tts":
         voice_name = parse_voice_name(voice_name or "")
-        await edge_tts_voice_notwork(text, voice_name, audio_file, subtitle_file, voice_rate)
+        await edge_tts_voice_notwork(text, voice_name, audio_file, subtitle_file, voice_rate, karaoke=karaoke)
     elif provider in ("google-tts", "google", "google-cloud-tts"):
-        await google_cloud_tts_voice(text, audio_file, subtitle_file, language, voice_name, voice_rate)
+        await google_cloud_tts_voice(text, audio_file, subtitle_file, language, voice_name, voice_rate, karaoke=karaoke)
     else:
         await gtts_voice(
             text,
@@ -1372,6 +1433,7 @@ async def generate_voice(
             lead_silence_ms=lead_silence_ms,
             trail_silence_ms=trail_silence_ms,
             sentence_pause_ms=sentence_pause_ms,
+            karaoke=karaoke,
         )
     
     return audio_file, subtitle_file
@@ -1391,6 +1453,7 @@ async def gtts_voice(
     lead_silence_ms: int = 0,
     trail_silence_ms: int = 0,
     sentence_pause_ms: int | None = None,
+    karaoke: bool = False,
 ):
     """
     Fallback to gTTS (Google TTS) — stable, no 403 issues.
@@ -1438,6 +1501,9 @@ async def gtts_voice(
             audio = AudioSegment.silent(duration=int(lead_silence_ms)) + audio + AudioSegment.silent(duration=int(trail_silence_ms))
             audio.export(voice_file, format="mp3")
         build_srt_from_audio(audio, clean_text, subtitle_file)
+        if karaoke:
+            words = _karaoke_words_from_subtitle(subtitle_file)
+            _write_karaoke_words_file(subtitle_file, "gtts", words)
     except Exception as e:
         logger.error(f"gTTS failed: {str(e)}")
         raise
@@ -1449,9 +1515,9 @@ async def google_cloud_tts_voice(
     language: str,
     voice_name: str | None = None,
     voice_rate: float = 1.0,
+    karaoke: bool = False,
 ):
     clean_text = sanitize_text_for_tts(text)
-    tts_text = expand_contractions(clean_text)
     lang = normalize_language_code(language) or "en-GB"
     if not voice_name:
         candidates = list_google_tts_voices(lang)
@@ -1460,24 +1526,79 @@ async def google_cloud_tts_voice(
         raise RuntimeError(f"No Google TTS voices available for language {lang}")
     logger.info(f"Google TTS | language={lang} | voice={voice_name} | rate={voice_rate}")
     client = texttospeech.TextToSpeechClient()
-    synthesis_input = texttospeech.SynthesisInput(text=tts_text)
     voice = texttospeech.VoiceSelectionParams(language_code=lang, name=voice_name)
     speaking_rate = min(4.0, max(0.25, float(voice_rate or 1.0)))
     audio_config = texttospeech.AudioConfig(
         audio_encoding=texttospeech.AudioEncoding.MP3,
         speaking_rate=speaking_rate,
     )
-    response = client.synthesize_speech(
-        input=synthesis_input,
-        voice=voice,
-        audio_config=audio_config,
-    )
+    response = None
+    mark_tokens: list[str] = []
+    if karaoke:
+        try:
+            ssml, mark_tokens = _build_google_ssml_with_marks(clean_text)
+            synthesis_input = texttospeech.SynthesisInput(ssml=ssml)
+            response = client.synthesize_speech(
+                input=synthesis_input,
+                voice=voice,
+                audio_config=audio_config,
+                enable_time_pointing=[
+                    texttospeech.SynthesizeSpeechRequest.TimepointType.SSML_MARK
+                ],
+            )
+        except Exception as e:
+            logger.warning(f"Google TTS karaoke timing request failed, fallback to plain synthesis: {e}")
+            response = None
+    if response is None:
+        synthesis_input = texttospeech.SynthesisInput(text=clean_text)
+        response = client.synthesize_speech(
+            input=synthesis_input,
+            voice=voice,
+            audio_config=audio_config,
+        )
     with open(voice_file, "wb") as out:
         out.write(response.audio_content)
     audio = AudioSegment.from_mp3(voice_file)
     build_srt_from_audio(audio, clean_text, subtitle_file)
+    if karaoke:
+        audio_duration = max(0.0, len(audio) / 1000.0)
+        words: list[dict] = []
+        timepoints = getattr(response, "timepoints", None) or []
+        timeline: list[tuple[int, float]] = []
+        for tp in timepoints:
+            mark_name = str(getattr(tp, "mark_name", "") or "")
+            m = re.match(r"^w(\d+)$", mark_name)
+            if not m:
+                continue
+            idx = int(m.group(1))
+            start_s = float(getattr(tp, "time_seconds", 0.0) or 0.0)
+            timeline.append((idx, start_s))
+        timeline.sort(key=lambda x: x[0])
+        for pos, (idx, start_s) in enumerate(timeline):
+            if idx >= len(mark_tokens):
+                continue
+            next_start = audio_duration
+            if pos + 1 < len(timeline):
+                next_start = max(start_s + 0.03, timeline[pos + 1][1])
+            words.append(
+                {
+                    "word": mark_tokens[idx],
+                    "start": round(max(0.0, start_s), 4),
+                    "end": round(min(audio_duration, next_start), 4),
+                }
+            )
+        if not words:
+            words = _karaoke_words_from_subtitle(subtitle_file)
+        _write_karaoke_words_file(subtitle_file, "google-tts", words)
 
-async def edge_tts_voice_notwork(text: str, voice_name: str, voice_file: str, subtitle_file:str, voice_rate: float = 0):
+async def edge_tts_voice_notwork(
+    text: str,
+    voice_name: str,
+    voice_file: str,
+    subtitle_file: str,
+    voice_rate: float = 0,
+    karaoke: bool = False,
+):
     """使用 Edge TTS 生成语音"""
     rate_str = convert_rate_to_percent(voice_rate)
 
@@ -1498,6 +1619,7 @@ async def edge_tts_voice_notwork(text: str, voice_name: str, voice_file: str, su
         communicate = edge_tts.Communicate(text, voice_name, rate=rate_str)
         sub_maker = edge_tts.SubMaker()
         
+        karaoke_words: list[dict] = []
         with open(voice_file, "wb") as file:
             async for chunk in communicate.stream():
                 if chunk["type"] == "audio":
@@ -1506,6 +1628,20 @@ async def edge_tts_voice_notwork(text: str, voice_name: str, voice_file: str, su
                     logger.debug(f"Got word boundary: {chunk}")
                     # 使用 SubMaker 的 create_sub 方法创建字幕
                     sub_maker.create_sub((chunk["offset"], chunk["duration"]), chunk["text"])
+                    if karaoke:
+                        raw_word = (chunk.get("text") or "").strip()
+                        word = sanitize_text_for_tts(raw_word)
+                        if word:
+                            start_s = float(chunk.get("offset", 0)) / 10000000.0
+                            duration_s = float(chunk.get("duration", 0)) / 10000000.0
+                            end_s = start_s + max(0.03, duration_s)
+                            karaoke_words.append(
+                                {
+                                    "word": word,
+                                    "start": round(max(0.0, start_s), 4),
+                                    "end": round(max(start_s + 0.03, end_s), 4),
+                                }
+                            )
 
         if not sub_maker or not sub_maker.subs:
             raise RuntimeError("No subtitles generated")
@@ -1515,6 +1651,10 @@ async def edge_tts_voice_notwork(text: str, voice_name: str, voice_file: str, su
         # 生成字幕
         if sub_maker:
             await generate_subtitle(sub_maker, text, subtitle_file)
+            if karaoke:
+                if not karaoke_words:
+                    karaoke_words = _karaoke_words_from_subtitle(subtitle_file)
+                _write_karaoke_words_file(subtitle_file, "edge-tts", karaoke_words)
         else:
             logger.error("Failed to generate sub_maker")
     except Exception as e:

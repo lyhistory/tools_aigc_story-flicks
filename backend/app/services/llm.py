@@ -108,6 +108,9 @@ class LLMService:
         extra_requirements = ""
         sp = (request.story_prompt or "").lower()
         topic_type = getattr(request, "topic_type", None)
+        age_band = (getattr(request, "learner_age", None) or "3-5").strip()
+        if age_band not in {"3-5", "6-8", "9-12", "13-15", "16-18"}:
+            age_band = "3-5"
         is_edu_topic = (
             topic_type == "explanation"
             or any(k in sp for k in ["plural", "plurals", "grammar", "english", "learning", "teach", "lesson"])
@@ -123,9 +126,11 @@ class LLMService:
             """
         elif topic_type == "dialogue":
             extra_requirements = """
-        4. Create a short two-person dialogue. Use simple, kid-friendly lines.
-        5. The scene_prompt should show both speakers interacting naturally.
-        6. Avoid forced teaching objects unless the topic explicitly needs them.
+        4. Create a short two-person dialogue, but write `script` as a single-speaker voice-over narration.
+        5. Add speaker attribution in narration style (e.g., The child says, "...". Daddy says, "...".).
+        6. Do not output raw alternating quotes like "..." , "..." and do not use screenplay format like Kid: ... Dad: ....
+        7. The scene_prompt should show both speakers interacting naturally.
+        8. Avoid forced teaching objects unless the topic explicitly needs them.
             """
         elif topic_type == "scene":
             extra_requirements = """
@@ -133,6 +138,7 @@ class LLMService:
         5. The scene_prompt should emphasize environment, objects, and atmosphere.
         6. Do not force a teacher or classroom unless the topic explicitly requires it.
             """
+        extra_requirements += f"\n        10. Keep vocabulary and sentence complexity suitable for learner age band {age_band}."
 
         messages = [
             {"role": "system", "content": system_content},
@@ -767,8 +773,6 @@ class LLMService:
             if topic_text:
                 topic_text = re.sub(r"^(subject|topic)\s*[:\-]\s*", "", topic_text, flags=re.I).strip()
             cover_script = f"Today we're going to learn {subject}."
-            if topic_text:
-                cover_script = f"{cover_script} {topic_text}"
             cover_scene_prompt = "Create a simple, friendly title card background for kids. "
             cover_scene_prompt += f"Theme: {subject}. "
             if topic_text:
@@ -838,15 +842,6 @@ class LLMService:
                 count_hint_text = "Quantity emphasis: " + "; ".join(count_hints) + "."
             return f"{base}\n\n{obj_hint}\n{count_hint_text}\n{guidance}".strip()
 
-        def remove_named_characters(text: str) -> str:
-            if not text:
-                return text
-            # Replace "named X" patterns
-            cleaned = re.sub(r"\bnamed\s+[A-Z][a-z]+\b", "a child", text)
-            # Replace possessive names like "Timmy's"
-            cleaned = re.sub(r"\b[A-Z][a-z]{2,}'s\b", "the child's", cleaned)
-            return cleaned
-
         def add_role_hints(scene: dict):
             script = (scene.get("script", "") or "").lower()
             hints = []
@@ -862,6 +857,48 @@ class LLMService:
                 hints.append("Include a girl.")
             if hints:
                 scene["scene_prompt"] = (scene.get("scene_prompt", "") + "\n" + " ".join(hints)).strip()
+
+        def to_voiceover_dialogue(script: str) -> str:
+            if not script:
+                return script
+            text = script.strip()
+            if re.search(r"\b(said|says|asked|asks|replied|replies|told|tells)\b", text, flags=re.I):
+                return text
+
+            def with_end_punct(s: str) -> str:
+                s = s.strip().strip('"').strip("'")
+                if not s:
+                    return s
+                if s[-1] not in ".!?":
+                    s += "."
+                return s
+
+            # Fallback for raw quote-only dialogue
+            quotes = re.findall(r"[\"“”']([^\"“”']{2,180})[\"“”']", text)
+            quotes = [with_end_punct(q) for q in quotes if q and q.strip()]
+            if len(quotes) >= 2:
+                return f'The child says, "{quotes[0]}" Daddy says, "{quotes[1]}"'
+            if len(quotes) == 1:
+                return f'The child says, "{quotes[0]}"'
+
+            # Fallback for screenplay-style dialogue (Kid: ... Dad: ...)
+            parts = re.findall(r"\b([A-Za-z ]{2,20})\s*:\s*([^:]+?)(?=(?:\b[A-Za-z ]{2,20}\s*:)|$)", text)
+            lines = []
+            for speaker, utter in parts[:2]:
+                role = "the child"
+                sp = speaker.strip().lower()
+                if any(k in sp for k in ["dad", "daddy", "father"]):
+                    role = "Daddy"
+                elif any(k in sp for k in ["mom", "mommy", "mother", "mum"]):
+                    role = "Mummy"
+                elif "teacher" in sp:
+                    role = "the teacher"
+                u = with_end_punct(utter)
+                if u:
+                    lines.append(f'{role} says, "{u}"')
+            if lines:
+                return " ".join(lines)
+            return text
 
         def ensure_unique_objects(scene: dict, idx: int, used_objects: set) -> list:
             fallback_objects = [
@@ -981,6 +1018,9 @@ class LLMService:
             return ""
 
         previous_base64 = None
+        raw_age_band = (getattr(request, "learner_age", None) or "3-5").strip()
+        allowed_age_bands = {"3-5", "6-8", "9-12", "13-15", "16-18"}
+        age_band = raw_age_band if raw_age_band in allowed_age_bands else "3-5"
 
         async def extract_keywords_from_scripts(scripts: List[str], count: int = 2):
             if not scripts:
@@ -994,7 +1034,11 @@ class LLMService:
                 {
                     "role": "user",
                     "content": (
-                        "Pick 1-2 important verbs or nouns from the script. "
+                        f"Target learner age band: {age_band}. "
+                        "Pick 1-2 important learning words from the script. "
+                        "Prefer action or concept words (e.g., wave, turn, count, plural, wheel) over very basic object words (e.g., bird, cat, dog). "
+                        "Choose words that are slightly challenging but still age-appropriate for the target age band. "
+                        "Avoid proper names and function words. "
                         "For each word, return both US and UK pronunciation (IPA) and a short kid-friendly explanation. "
                         "Use clean IPA without syllable dots (no '.' or '·') and use length mark like 'ː' when needed.\n"
                         "Return JSON: {\"keywords\":[{\"word\":\"...\",\"pronunciation_us\":\"...\",\"pronunciation_uk\":\"...\",\"explanation\":\"...\"}]}\n\n"
@@ -1016,15 +1060,161 @@ class LLMService:
                 logger.warning(f"Keyword extraction failed: {e}")
             return []
 
+        def refine_keywords(raw_keywords: List[Dict[str, str]], scripts: List[str], count: int = 2):
+            joined_text = " ".join([s for s in scripts if s]).lower()
+            if not joined_text:
+                return []
+            age_vocab_profiles = {
+                "3-5": {
+                    "preferred": {
+                        "wave", "wheel", "turn", "count", "color", "shape", "open", "close",
+                        "happy", "sad", "fast", "slow", "up", "down", "stop", "go",
+                    }
+                },
+                "6-8": {
+                    "preferred": {
+                        "compare", "group", "notice", "pattern", "before", "after", "around",
+                        "through", "question", "answer", "plural", "singular", "measure",
+                    }
+                },
+                "9-12": {
+                    "preferred": {
+                        "describe", "observe", "predict", "explain", "similar", "different",
+                        "category", "sequence", "position", "direction", "grammar", "sentence",
+                        "prefix", "suffix", "verb", "noun",
+                    }
+                },
+                "13-15": {
+                    "preferred": {
+                        "analyze", "interpret", "contrast", "evidence", "summary", "inference",
+                        "perspective", "context", "structure", "function", "precision",
+                    }
+                },
+                "16-18": {
+                    "preferred": {
+                        "evaluate", "synthesize", "argument", "hypothesis", "nuance", "cohesion",
+                        "coherence", "rhetoric", "semantics", "implication", "framework",
+                    }
+                },
+            }
+            basic_words = {
+                "bird", "cat", "dog", "apple", "book", "toy", "tree", "boy", "girl",
+                "child", "kids", "kid", "teacher", "father", "mother", "dad", "daddy",
+                "mom", "mommy", "bus", "car", "house", "school",
+            }
+            universal_preferred_words = {
+                "wave", "wheel", "turn", "count", "plural", "singular", "group",
+                "compare", "describe", "notice", "observe", "listen", "speak", "say",
+                "talk", "walk", "hold", "pull", "push", "learn", "practice",
+            }
+            age_preferred_words = age_vocab_profiles.get(age_band, {}).get("preferred", set())
+            stop_words = {
+                "the", "a", "an", "and", "or", "but", "if", "then", "that", "this",
+                "those", "these", "there", "here", "with", "from", "into", "about",
+                "your", "their", "our", "my", "his", "her", "its", "are", "is", "was",
+                "were", "be", "been", "being", "to", "of", "in", "on", "for", "as",
+            }
+
+            def norm_word(word: str) -> str:
+                return re.sub(r"[^a-z]", "", (word or "").lower())
+
+            def word_score(w: str) -> int:
+                if not w:
+                    return -999
+                freq = len(re.findall(rf"\b{re.escape(w)}\b", joined_text))
+                score = min(4, freq)
+                if w in universal_preferred_words:
+                    score += 5
+                if w in age_preferred_words:
+                    score += 6
+                if w.endswith("ing") or w.endswith("ed"):
+                    score += 2
+                if w in basic_words:
+                    score -= 5
+                if len(w) <= 3:
+                    score -= 2
+                if age_band in {"13-15", "16-18"} and w in {"wave", "wheel", "walk", "bird", "cat", "dog"}:
+                    score -= 2
+                return score
+
+            refined = []
+            seen = set()
+
+            for kw in raw_keywords or []:
+                if not isinstance(kw, dict):
+                    continue
+                word_raw = (kw.get("word") or "").strip()
+                w = norm_word(word_raw)
+                if (
+                    not w
+                    or w in stop_words
+                    or w in basic_words
+                    or w in seen
+                    or len(w) < 3
+                ):
+                    continue
+                item = {
+                    "word": w,
+                    "pronunciation_us": (kw.get("pronunciation_us") or "").strip(),
+                    "pronunciation_uk": (kw.get("pronunciation_uk") or "").strip(),
+                    "explanation": (kw.get("explanation") or "").strip(),
+                    "_score": word_score(w),
+                }
+                refined.append(item)
+                seen.add(w)
+
+            # Fill missing slots from script tokens with a score-based fallback.
+            if len(refined) < count:
+                tokens = [norm_word(t) for t in re.findall(r"[A-Za-z']+", joined_text)]
+                candidates = []
+                first_pos = {}
+                for idx, t in enumerate(tokens):
+                    if t and t not in first_pos:
+                        first_pos[t] = idx
+                for t in set(tokens):
+                    if (
+                        not t
+                        or t in seen
+                        or t in stop_words
+                        or t in basic_words
+                        or len(t) < 3
+                    ):
+                        continue
+                    candidates.append((word_score(t), -first_pos.get(t, 9999), t))
+                candidates.sort(reverse=True)
+                for _, _, cand in candidates:
+                    refined.append(
+                        {
+                            "word": cand,
+                            "pronunciation_us": "",
+                            "pronunciation_uk": "",
+                            "explanation": f"{cand} is an important word in this story.",
+                            "_score": word_score(cand),
+                        }
+                    )
+                    seen.add(cand)
+                    if len(refined) >= count:
+                        break
+
+            refined.sort(key=lambda x: x.get("_score", 0), reverse=True)
+            out = []
+            for item in refined[:count]:
+                clean_item = dict(item)
+                clean_item.pop("_score", None)
+                out.append(clean_item)
+            return out
+
         # Extract 1-2 keywords for the whole video
+        script_list = [s.get("script", "") for s in story_segments if not s.get("is_cover")]
         keywords = await extract_keywords_from_scripts(
-            [s.get("script", "") for s in story_segments if not s.get("is_cover")],
+            script_list,
             count=2,
         )
+        keywords = refine_keywords(keywords, script_list, count=2)
         if not keywords:
             # Simple fallback: pick first verb-like word from script
-            fallback_verbs = ["walk", "run", "look", "smile", "hold", "pull", "talk", "say", "go", "play", "learn"]
-            joined = " ".join([s.get("script", "") for s in story_segments if not s.get("is_cover")]).lower()
+            fallback_verbs = ["wave", "wheel", "turn", "walk", "run", "hold", "pull", "talk", "say", "learn"]
+            joined = " ".join(script_list).lower()
             picked = None
             for v in fallback_verbs:
                 if re.search(rf"\\b{re.escape(v)}\\b", joined):
@@ -1053,6 +1243,7 @@ class LLMService:
             getattr(request, "topic_type", None) == "explanation"
             or any(k in (request.story_prompt or "").lower() for k in ["plural", "plurals", "grammar", "english", "learning", "teach", "lesson"])
         )
+        is_dialogue_topic = getattr(request, "topic_type", None) == "dialogue"
         target_w, target_h = None, None
         if request.resolution:
             try:
@@ -1072,8 +1263,8 @@ class LLMService:
                     f"resolution={request.resolution}"
                 )
                 is_cover = bool(segment.get("is_cover"))
-                segment["script"] = remove_named_characters(segment.get("script", ""))
-                segment["scene_prompt"] = remove_named_characters(segment.get("scene_prompt", ""))
+                if is_dialogue_topic and not is_cover:
+                    segment["script"] = to_voiceover_dialogue(segment.get("script", ""))
                 if is_edu_topic and not use_exact_counts and not is_cover:
                     segment["script"] = soften_counts_in_text(segment.get("script", ""))
                     segment["scene_prompt"] = soften_counts_in_text(segment.get("scene_prompt", ""))
