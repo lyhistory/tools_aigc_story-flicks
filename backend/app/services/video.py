@@ -12,6 +12,7 @@ from app.services.voice import generate_voice
 from app.utils import utils
 from moviepy import (
     VideoFileClip,
+    VideoClip,
     ImageClip,
     AudioFileClip,
     TextClip,
@@ -184,7 +185,16 @@ async def create_video_with_scenes(
     def clean_subtitle_text(text: str) -> str:
         if not text:
             return ""
-        cleaned = text.replace("\u200b", "").replace("\u200c", "").replace("\u200d", "")
+        cleaned = (
+            str(text)
+            .replace("\\u200b", "")
+            .replace("\\u200c", "")
+            .replace("\\u200d", "")
+            .replace("\\ufeff", "")
+            .replace("\u200b", "")
+            .replace("\u200c", "")
+            .replace("\u200d", "")
+        )
         cleaned = cleaned.replace("\ufeff", "")
         cleaned = cleaned.replace("“", "\"").replace("”", "\"").replace("’", "'").replace("‘", "'")
         return cleaned.strip()
@@ -513,10 +523,12 @@ async def create_video_with_scenes(
             else:
                 # 正式模式下生成所需文件
                 logger.info(f"Processing scene {i}")
+                is_cover_scene = bool(getattr(scene, "is_cover", False)) or bool((getattr(scene, "subject", None) or "").strip())
+                is_sequence_scene = (getattr(scene, "topic_type", None) == "sequence") and not is_cover_scene
                 lead_silence_ms = 0
                 trail_silence_ms = 0
                 sentence_pause_ms = None
-                if getattr(scene, "is_cover", False) and (voice_provider or "gtts") == "gtts":
+                if is_cover_scene and (voice_provider or "gtts") == "gtts":
                     lead_silence_ms = 300
                     trail_silence_ms = 900
                     sentence_pause_ms = 550
@@ -531,7 +543,8 @@ async def create_video_with_scenes(
                     lead_silence_ms=lead_silence_ms,
                     trail_silence_ms=trail_silence_ms,
                     sentence_pause_ms=sentence_pause_ms,
-                    karaoke=karaoke,
+                    karaoke=(karaoke or is_sequence_scene),
+                    sequence_mode=is_sequence_scene,
                 )
             
             # 获取字幕的总时长
@@ -594,21 +607,31 @@ async def create_video_with_scenes(
                     sub = subtitles.file_to_subtitles(subtitle_file, encoding="utf-8")
                     subtitle_items = []
                     karaoke_enabled = bool(karaoke)
+                    is_cover_scene = bool(getattr(scene, "is_cover", False)) or bool((getattr(scene, "subject", None) or "").strip())
+                    is_sequence_scene = (getattr(scene, "topic_type", None) == "sequence") and not is_cover_scene
+                    sequence_timing_enabled = is_sequence_scene
                     words_file = os.path.join(task_dir, f"{i}.words.json")
-                    karaoke_words_all = load_karaoke_words(words_file) if karaoke_enabled else []
+                    karaoke_words_all = load_karaoke_words(words_file) if (karaoke_enabled or sequence_timing_enabled) else []
                     karaoke_word_ptr = 0
                     cover_text = (getattr(scene, "subject", None) or "").strip()
-                    if getattr(scene, "is_cover", False) and cover_text:
+                    if not cover_text and is_cover_scene:
+                        script_text = clean_subtitle_text(getattr(scene, "script", "") or "")
+                        m = re.search(r"learn\s+(.+?)[\.\!\?]?$", script_text, flags=re.IGNORECASE)
+                        if m:
+                            cover_text = m.group(1).strip()
+                        elif script_text:
+                            cover_text = script_text
+                    if is_cover_scene and cover_text:
                         cover_font_size = max(72, int(origin_image_h * 0.08))
                         cover_img = render_text_rgba(
                             cover_text,
                             subtitle_font_path,
                             cover_font_size,
-                            "#22C55E",
+                            "#0F172A",
                             max_width=int(origin_image_w * 0.85),
-                            bg_rgba=(0, 0, 0, 0),
-                            stroke_width=max(2, int(cover_font_size * 0.08)),
-                            stroke_fill="#0F172A",
+                            bg_rgba=(255, 255, 255, 210),
+                            stroke_width=max(2, int(cover_font_size * 0.06)),
+                            stroke_fill="#FFFFFF",
                         )
                         if cover_img is not None:
                             cover_x = (origin_image_w - cover_img.width) // 2
@@ -625,125 +648,175 @@ async def create_video_with_scenes(
                                     "kw_pos": (0, 0),
                                 }
                             )
-                    for item_idx, item in enumerate(sub, 1):
-                        phrase = clean_subtitle_text(item[1])
-                        if not phrase:
-                            continue
-                        kw = find_keyword_in_text(phrase, scene.keywords)
-                        highlight_word = (kw.get("word") or "").strip() if kw else ""
-                        highlight_norm = normalize_token(highlight_word) if highlight_word else ""
-                        sub_img = render_text_rgba(
-                            phrase,
-                            subtitle_font_path,
-                            58,
-                            "#F472B6",
-                            max_width=int(origin_image_w * 0.9),
-                            bg_rgba=(0, 0, 0, 0),
-                            highlight_word=highlight_word,
-                            highlight_bg_rgba=(254, 240, 138, 220),
-                            highlight_text_color="#111827",
-                        )
-                        line_start = float(item[0][0])
-                        line_end = float(item[0][1])
-                        phrase_tokens = tokenize_karaoke_words(phrase)
-                        karaoke_words_line = []
-                        if karaoke_enabled and phrase_tokens:
-                            line_dur = max(0.05, line_end - line_start)
-                            approx_step = line_dur / len(phrase_tokens)
-                            for token_idx, token in enumerate(phrase_tokens):
-                                ws = line_start + token_idx * approx_step
-                                we = line_end if token_idx == len(phrase_tokens) - 1 else line_start + (token_idx + 1) * approx_step
-                                if karaoke_word_ptr < len(karaoke_words_all):
-                                    w = karaoke_words_all[karaoke_word_ptr]
-                                    karaoke_word_ptr += 1
-                                    ws = max(line_start, float(w.get("start", ws)))
-                                    we = min(line_end, float(w.get("end", we)))
-                                    if we <= ws:
-                                        we = min(line_end, ws + max(0.03, approx_step * 0.8))
-                                karaoke_words_line.append(
-                                    {
-                                        "token_index": token_idx,
-                                        "word": token,
-                                        "start": round(ws, 4),
-                                        "end": round(max(ws + 0.03, we), 4),
-                                    }
-                                )
-                        sub_karaoke_imgs = {}
-                        if karaoke_enabled and karaoke_words_line:
-                            for word_info in karaoke_words_line:
-                                token_idx = int(word_info["token_index"])
-                                token_norm = normalize_token(word_info.get("word", ""))
-                                is_keyword_token = bool(highlight_norm and token_norm == highlight_norm)
-                                kara_bg = (147, 197, 253, 210)
-                                if is_keyword_token:
-                                    kara_bg = (254, 240, 138, 230)
-                                kara_img = render_text_rgba(
-                                    phrase,
-                                    subtitle_font_path,
-                                    58,
-                                    "#F472B6",
-                                    max_width=int(origin_image_w * 0.9),
-                                    bg_rgba=(0, 0, 0, 0),
-                                    highlight_token_index=token_idx,
-                                    highlight_bg_rgba=kara_bg,
-                                    highlight_text_color="#111827",
-                                )
-                                if kara_img is not None:
-                                    sub_karaoke_imgs[token_idx] = kara_img
-                        kw_img = None
-                        if kw:
-                            word = (kw.get("word") or "").strip()
-                            word_key = normalize_token(word)
-                            if word_key and word_key not in shown_keyword_words:
-                                pron_us = sanitize_pronunciation(kw.get("pronunciation_us", ""))
-                                pron_uk = sanitize_pronunciation(kw.get("pronunciation_uk", ""))
-                                expl = (kw.get("explanation") or "").strip()
-                                kw_img = build_keyword_panel(
-                                    word=word,
-                                    pron_us=pron_us,
-                                    pron_uk=pron_uk,
-                                    expl=expl,
-                                    word_font_path=keyword_font_path,
-                                    pron_font_path=keyword_pron_font_path,
-                                    expl_font_path=keyword_expl_font_path,
-                                    max_width=int(origin_image_w * 0.9),
-                                    origin_image_h=origin_image_h,
-                                )
-                                shown_keyword_words.add(word_key)
-                        if sub_img is None and kw_img is None:
-                            continue
-                        sub_x = (origin_image_w - sub_img.width) // 2 if sub_img else 0
-                        sub_y = int(origin_image_h * 0.95 - (sub_img.height if sub_img else 0) - 50)
-                        kw_x = (origin_image_w - kw_img.width) // 2 if kw_img else 0
-                        kw_y = 20
-                        subtitle_items.append(
-                            {
-                                "start": item[0][0],
-                                "end": item[0][1],
-                                "sub_img": sub_img,
-                                "sub_pos": (sub_x, sub_y),
-                                "kw_img": kw_img,
-                                "kw_pos": (kw_x, kw_y),
-                                "karaoke_words": karaoke_words_line,
-                                "sub_karaoke_imgs": sub_karaoke_imgs,
-                            }
-                        )
-                        if kw_img is not None:
-                            logger.info(
-                                f"Keyword overlay added: {(kw.get('word') or '').strip()} for subtitle '{phrase}'"
+                            logger.info(f"Cover overlay added for scene {i}: '{cover_text}' size={cover_img.width}x{cover_img.height}")
+                        else:
+                            logger.warning(f"Cover overlay render returned None for scene {i}")
+                    # Cover scene: keep it clean and stable by showing subject title only.
+                    render_cover_only = bool(is_cover_scene and cover_text)
+                    if is_sequence_scene and karaoke_words_all:
+                        lead_display_s = 0.28
+                        for w in karaoke_words_all:
+                            token = clean_subtitle_text(str(w.get("word", "")).strip())
+                            if not token:
+                                continue
+                            ws = float(w.get("start", 0.0) or 0.0)
+                            we = float(w.get("end", ws + 0.08) or (ws + 0.08))
+                            start_t = max(0.0, ws - lead_display_s)
+                            end_t = max(start_t + 0.08, we)
+                            sub_img = render_text_rgba(
+                                token,
+                                subtitle_font_path,
+                                max(176, int(origin_image_h * 0.2)),
+                                "#2563EB",
+                                max_width=int(origin_image_w * 0.9),
+                                bg_rgba=(0, 0, 0, 0),
+                                stroke_width=max(3, int(origin_image_h * 0.008)),
+                                stroke_fill="#FFFFFF",
                             )
+                            if sub_img is None:
+                                continue
+                            sub_x = (origin_image_w - sub_img.width) // 2
+                            sub_y = (origin_image_h - sub_img.height) // 2
+                            subtitle_items.append(
+                                {
+                                    "start": start_t,
+                                    "end": end_t,
+                                    "sub_img": sub_img,
+                                    "sub_pos": (sub_x, sub_y),
+                                    "kw_img": None,
+                                    "kw_pos": (0, 0),
+                                    "karaoke_words": [],
+                                    "sub_karaoke_imgs": {},
+                                }
+                            )
+                    if not render_cover_only and not (is_sequence_scene and karaoke_words_all):
+                        for item_idx, item in enumerate(sub, 1):
+                            phrase = clean_subtitle_text(item[1])
+                            if not phrase:
+                                continue
+                            kw = {} if is_sequence_scene else find_keyword_in_text(phrase, scene.keywords)
+                            highlight_word = (kw.get("word") or "").strip() if kw else ""
+                            highlight_norm = normalize_token(highlight_word) if highlight_word else ""
+                            sub_img = render_text_rgba(
+                                phrase,
+                                subtitle_font_path,
+                                (148 if is_sequence_scene else 58),
+                                ("#1F2937" if is_sequence_scene else "#F472B6"),
+                                max_width=int(origin_image_w * 0.9),
+                                bg_rgba=(0, 0, 0, 0),
+                                highlight_word=highlight_word,
+                                highlight_bg_rgba=(254, 240, 138, 220),
+                                highlight_text_color="#111827",
+                                stroke_width=(max(3, int(origin_image_h * 0.008)) if is_sequence_scene else 0),
+                                stroke_fill=("#FFFFFF" if is_sequence_scene else None),
+                            )
+                            line_start = float(item[0][0])
+                            line_end = float(item[0][1])
+                            phrase_tokens = tokenize_karaoke_words(phrase)
+                            karaoke_words_line = []
+                            if karaoke_enabled and phrase_tokens:
+                                line_dur = max(0.05, line_end - line_start)
+                                approx_step = line_dur / len(phrase_tokens)
+                                for token_idx, token in enumerate(phrase_tokens):
+                                    ws = line_start + token_idx * approx_step
+                                    we = line_end if token_idx == len(phrase_tokens) - 1 else line_start + (token_idx + 1) * approx_step
+                                    if karaoke_word_ptr < len(karaoke_words_all):
+                                        w = karaoke_words_all[karaoke_word_ptr]
+                                        karaoke_word_ptr += 1
+                                        ws = max(line_start, float(w.get("start", ws)))
+                                        we = min(line_end, float(w.get("end", we)))
+                                        if we <= ws:
+                                            we = min(line_end, ws + max(0.03, approx_step * 0.8))
+                                    karaoke_words_line.append(
+                                        {
+                                            "token_index": token_idx,
+                                            "word": token,
+                                            "start": round(ws, 4),
+                                            "end": round(max(ws + 0.03, we), 4),
+                                        }
+                                    )
+                            sub_karaoke_imgs = {}
+                            if karaoke_enabled and karaoke_words_line and not is_sequence_scene:
+                                for word_info in karaoke_words_line:
+                                    token_idx = int(word_info["token_index"])
+                                    token_norm = normalize_token(word_info.get("word", ""))
+                                    is_keyword_token = bool(highlight_norm and token_norm == highlight_norm)
+                                    kara_bg = (147, 197, 253, 210)
+                                    if is_keyword_token:
+                                        kara_bg = (254, 240, 138, 230)
+                                    kara_img = render_text_rgba(
+                                        phrase,
+                                        subtitle_font_path,
+                                        58,
+                                        "#F472B6",
+                                        max_width=int(origin_image_w * 0.9),
+                                        bg_rgba=(0, 0, 0, 0),
+                                        highlight_token_index=token_idx,
+                                        highlight_bg_rgba=kara_bg,
+                                        highlight_text_color="#111827",
+                                    )
+                                    if kara_img is not None:
+                                        sub_karaoke_imgs[token_idx] = kara_img
+                            kw_img = None
+                            if kw:
+                                word = (kw.get("word") or "").strip()
+                                word_key = normalize_token(word)
+                                if word_key and word_key not in shown_keyword_words:
+                                    pron_us = sanitize_pronunciation(kw.get("pronunciation_us", ""))
+                                    pron_uk = sanitize_pronunciation(kw.get("pronunciation_uk", ""))
+                                    expl = (kw.get("explanation") or "").strip()
+                                    kw_img = build_keyword_panel(
+                                        word=word,
+                                        pron_us=pron_us,
+                                        pron_uk=pron_uk,
+                                        expl=expl,
+                                        word_font_path=keyword_font_path,
+                                        pron_font_path=keyword_pron_font_path,
+                                        expl_font_path=keyword_expl_font_path,
+                                        max_width=int(origin_image_w * 0.9),
+                                        origin_image_h=origin_image_h,
+                                    )
+                                    shown_keyword_words.add(word_key)
+                            if sub_img is None and kw_img is None:
+                                continue
+                            sub_x = (origin_image_w - sub_img.width) // 2 if sub_img else 0
+                            if is_sequence_scene:
+                                sub_y = (origin_image_h - (sub_img.height if sub_img else 0)) // 2
+                            else:
+                                sub_y = int(origin_image_h * 0.95 - (sub_img.height if sub_img else 0) - 50)
+                            kw_x = (origin_image_w - kw_img.width) // 2 if kw_img else 0
+                            kw_y = 20
+                            subtitle_items.append(
+                                {
+                                    "start": (max(0.0, float(item[0][0]) - 0.25) if is_sequence_scene else item[0][0]),
+                                    "end": item[0][1],
+                                    "sub_img": sub_img,
+                                    "sub_pos": (sub_x, sub_y),
+                                    "kw_img": kw_img,
+                                    "kw_pos": (kw_x, kw_y),
+                                    "karaoke_words": karaoke_words_line,
+                                    "sub_karaoke_imgs": sub_karaoke_imgs,
+                                }
+                            )
+                            if kw_img is not None:
+                                logger.info(
+                                    f"Keyword overlay added: {(kw.get('word') or '').strip()} for subtitle '{phrase}'"
+                                )
                     base_clip = CompositeVideoClip([bg_clip, fg_clip], (origin_image_w, origin_image_h))
                     if subtitle_items:
                         logger.info(f"Subtitle items rendered for scene {i}: {len(subtitle_items)}")
                         fps = 24
-                        total_frames = max(1, int(math.ceil(subtitle_duration * fps)))
-                        frames = []
-                        for frame_idx in range(total_frames):
-                            t = frame_idx / fps
-                            frame = base_clip.get_frame(t)
-                            frame = overlay_frame_with_subs(frame, t, subtitle_items)
-                            frames.append(frame)
-                        video_clip = ImageSequenceClip(frames, fps=fps)
+                        # Bind per-scene objects in default args to avoid late-binding closure bugs
+                        # when clips are rendered later during final write.
+                        def make_frame(t, _base_clip=base_clip, _subtitle_items=subtitle_items):
+                            frame = _base_clip.get_frame(t)
+                            return overlay_frame_with_subs(frame, t, _subtitle_items)
+                        # Render overlays on-demand to avoid keeping all frames in memory.
+                        # moviepy 2.x uses `frame_function`; some older variants used `make_frame`.
+                        try:
+                            video_clip = VideoClip(frame_function=make_frame, duration=subtitle_duration).with_fps(fps)
+                        except TypeError:
+                            video_clip = VideoClip(make_frame=make_frame, duration=subtitle_duration).with_fps(fps)
                     else:
                         logger.warning(f"No subtitle items rendered for scene {i}")
                         video_clip = base_clip
@@ -809,6 +882,7 @@ async def generate_video(request: VideoGenerateRequest):
                         url=scene.get("url"),
                         is_cover=scene.get("is_cover", False),
                         subject=scene.get("subject"),
+                        topic_type=scene.get("topic_type"),
                     )
                 )
         else:
@@ -871,6 +945,7 @@ async def generate_video(request: VideoGenerateRequest):
                     url=scene.get("url"),
                     is_cover=scene.get("is_cover", False),
                     subject=scene.get("subject"),
+                    topic_type=scene.get("topic_type"),
                 )
                 for scene in story_list
             ]

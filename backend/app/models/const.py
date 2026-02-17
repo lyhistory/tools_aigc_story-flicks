@@ -31,6 +31,7 @@ class TopicType(str, Enum):
     dialogue = "dialogue"      # two people dialog
     explanation = "explanation"  # explain a word/grammar/science
     scene = "scene"            # describe a scene or setting
+    sequence = "sequence"      # counting/months/weekdays style sequence
 
 # 语言名称映射
 LANGUAGE_NAMES = {

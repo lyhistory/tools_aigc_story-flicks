@@ -71,6 +71,191 @@ class LLMService:
         self.nvidia_client = nvidia_client
         self.text_llm_model = settings.text_llm_model
         self.image_llm_model = settings.image_llm_model
+
+    @staticmethod
+    def _strip_invisible_chars(text: str) -> str:
+        if not text:
+            return text
+        cleaned = str(text)
+        # Remove literal escaped zero-width sequences if they were passed as raw text.
+        cleaned = (
+            cleaned.replace("\\u200b", "")
+            .replace("\\u200c", "")
+            .replace("\\u200d", "")
+            .replace("\\ufeff", "")
+            .replace("\\u2060", "")
+            .replace("\\u00ad", "")
+        )
+        # Remove actual invisible unicode control/format chars.
+        cleaned = re.sub(r"[\u200b\u200c\u200d\ufeff\u2060\u00ad]", "", cleaned)
+        cleaned = cleaned.replace("\r\n", "\n").replace("\r", "\n")
+        return cleaned
+
+    @staticmethod
+    def _collapse_prompt_whitespace(text: str) -> str:
+        if not text:
+            return text
+        return re.sub(r"\s+", " ", str(text)).strip()
+
+    @staticmethod
+    def _word_number_to_int(token: str) -> int | None:
+        if token is None:
+            return None
+        raw = str(token).strip().lower()
+        if not raw:
+            return None
+        if raw.isdigit():
+            return int(raw)
+        raw = raw.replace("-", " ")
+        raw = re.sub(r"\band\b", " ", raw)
+        raw = re.sub(r"\s+", " ", raw).strip()
+        if not raw:
+            return None
+        units = {
+            "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+            "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+            "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14,
+            "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18,
+            "nineteen": 19,
+        }
+        tens = {
+            "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
+            "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90,
+        }
+        total = 0
+        current = 0
+        for part in raw.split():
+            if part in units:
+                current += units[part]
+            elif part in tens:
+                current += tens[part]
+            elif part == "hundred":
+                if current == 0:
+                    current = 1
+                current *= 100
+            elif part == "thousand":
+                if current == 0:
+                    current = 1
+                total += current * 1000
+                current = 0
+            else:
+                return None
+        return total + current
+
+    @staticmethod
+    def _int_to_english(n: int) -> str:
+        if n < 0:
+            return str(n)
+        if n == 0:
+            return "zero"
+        units = [
+            "", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+            "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen",
+            "seventeen", "eighteen", "nineteen",
+        ]
+        tens = ["", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"]
+
+        def under_1000(x: int) -> str:
+            parts = []
+            if x >= 100:
+                parts.append(f"{units[x // 100]} hundred")
+                x %= 100
+            if x >= 20:
+                t = tens[x // 10]
+                u = x % 10
+                parts.append(f"{t}-{units[u]}" if u else t)
+            elif x > 0:
+                parts.append(units[x])
+            return " ".join(parts).strip()
+
+        if n < 1000:
+            return under_1000(n)
+        if n < 1_000_000:
+            thousands = n // 1000
+            rem = n % 1000
+            if rem:
+                return f"{under_1000(thousands)} thousand {under_1000(rem)}".strip()
+            return f"{under_1000(thousands)} thousand".strip()
+        return str(n)
+
+    @staticmethod
+    def _is_ordered_sequence_prompt(story_prompt: str) -> bool:
+        lower = (story_prompt or "").lower()
+        ordered_tokens = ["count", "counting", "number", "numbers", "month", "months", "weekday", "weekdays", "days of week"]
+        if any(token in lower for token in ordered_tokens):
+            return True
+        if re.search(r"\b(\d{1,4})\s*(?:to|-)\s*(\d{1,4})\b", lower):
+            return True
+        for m in re.finditer(r"\b([a-z][a-z\s-]{0,40}?)\s*(?:to|-)\s*([a-z][a-z\s-]{0,40}?)\b", lower):
+            a = LLMService._word_number_to_int(m.group(1))
+            b = LLMService._word_number_to_int(m.group(2))
+            if a is not None and b is not None:
+                return True
+        return False
+
+    @staticmethod
+    def _build_sequence_items(story_prompt: str) -> List[str]:
+        prompt = (story_prompt or "").strip()
+        lower = prompt.lower()
+        months = [
+            "January", "February", "March", "April", "May", "June",
+            "July", "August", "September", "October", "November", "December",
+        ]
+        weekdays = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+        category_items = {
+            "fruit": [
+                "apple", "banana", "orange", "grape", "strawberry", "watermelon", "pear", "peach",
+                "pineapple", "mango", "kiwi", "cherry", "blueberry", "lemon", "tomato",
+            ],
+            "vegetable": [
+                "carrot", "potato", "tomato", "cucumber", "broccoli", "spinach", "onion", "pepper",
+                "corn", "cabbage", "pumpkin", "eggplant", "lettuce", "pea", "bean",
+            ],
+            "tree": [
+                "oak tree", "pine tree", "maple tree", "palm tree", "apple tree", "cherry tree", "willow tree",
+                "birch tree", "bamboo", "fir tree", "cedar tree", "spruce tree",
+            ],
+            "houseware": [
+                "cup", "plate", "spoon", "fork", "knife", "bowl", "bottle", "kettle", "pan", "pot",
+                "chair", "table", "lamp", "clock", "blanket",
+            ],
+        }
+
+        if any(k in lower for k in ["month", "months"] + [m.lower() for m in months]):
+            return months
+        if any(k in lower for k in ["weekday", "weekdays", "days of week"] + [d.lower() for d in weekdays]):
+            return weekdays
+
+        range_match = re.search(r"\b(\d{1,4})\s*(?:to|-)\s*(\d{1,4})\b", lower)
+        if range_match:
+            start = int(range_match.group(1))
+            end = int(range_match.group(2))
+            if start <= end:
+                max_items = 300
+                return [str(n) for n in range(start, min(end, start + max_items - 1) + 1)]
+
+        for m in re.finditer(r"\b([a-z][a-z\s-]{0,40}?)\s*(?:to|-)\s*([a-z][a-z\s-]{0,40}?)\b", lower):
+            start = LLMService._word_number_to_int(m.group(1))
+            end = LLMService._word_number_to_int(m.group(2))
+            if start is None or end is None or start > end:
+                continue
+            max_items = 300
+            return [LLMService._int_to_english(n) for n in range(start, min(end, start + max_items - 1) + 1)]
+
+        if any(k in lower for k in ["fruit", "fruits"]):
+            return category_items["fruit"]
+        if any(k in lower for k in ["vegetable", "vegetables"]):
+            return category_items["vegetable"]
+        if any(k in lower for k in ["tree", "trees"]):
+            return category_items["tree"]
+        if any(k in lower for k in ["houseware", "housewares", "household", "kitchenware"]):
+            return category_items["houseware"]
+
+        csv_items = [p.strip() for p in re.split(r"[,\n;]+", prompt) if p.strip()]
+        if len(csv_items) >= 2:
+            return csv_items[:200]
+
+        return [str(n) for n in range(1, 21)]
     
     async def generate_story(self, request: StoryGenerationRequest) -> List[Dict[str, Any]]:
         """生成故事场景
@@ -81,6 +266,52 @@ class LLMService:
         Returns:
             List[Dict[str, Any]]: 故事场景列表
         """
+        request.story_prompt = self._strip_invisible_chars((request.story_prompt or "")).strip()
+        topic_type = getattr(request, "topic_type", None)
+        if topic_type == "sequence":
+            items = self._build_sequence_items(request.story_prompt)
+            ordered_mode = self._is_ordered_sequence_prompt(request.story_prompt)
+
+            if ordered_mode or int(getattr(request, "segments", 1) or 1) <= 1:
+                script = ". ".join(items).strip()
+                if script and script[-1] not in ".!?":
+                    script += "."
+                return [{
+                    "script": script,
+                    "scene_prompt": (
+                        "Create a clean, minimal educational background with soft colors and no text. "
+                        "No characters. No objects that distract. Keep the center area clear for overlaid words."
+                    ),
+                    "objects": [],
+                    "topic_type": "sequence",
+                }]
+
+            scene_count = max(1, min(int(request.segments), len(items)))
+            multi_segments = []
+            for item in items[:scene_count]:
+                word = self._strip_invisible_chars(item).strip()
+                if not word:
+                    continue
+                article = "an" if re.match(r"^[aeiouAEIOU]", word) else "a"
+                multi_segments.append(
+                    {
+                        "script": f"{word}.",
+                        "scene_prompt": (
+                            "Create a clean educational flashcard-style illustration for kids. "
+                            f"Show {article} large clear {word} centered. "
+                            "Simple background, no clutter, no text, no characters."
+                        ),
+                        "objects": [word],
+                        "topic_type": "sequence",
+                    }
+                )
+            return multi_segments or [{
+                "script": "word.",
+                "scene_prompt": "Create a clean educational flashcard-style illustration with one large centered object.",
+                "objects": [],
+                "topic_type": "sequence",
+            }]
+
         if request.segments == 1:
             # Special case: exactly 1 segment → skip LLM, directly use user-provided prompt
             logger.info("segments == 1 → skipping LLM, using story_prompt directly as single scene")
@@ -107,7 +338,6 @@ class LLMService:
         
         extra_requirements = ""
         sp = (request.story_prompt or "").lower()
-        topic_type = getattr(request, "topic_type", None)
         age_band = (getattr(request, "learner_age", None) or "3-5").strip()
         if age_band not in {"3-5", "6-8", "9-12", "13-15", "16-18"}:
             age_band = "3-5"
@@ -211,6 +441,7 @@ class LLMService:
         
         image_llm_provider =  image_llm_provider or settings.image_provider
         image_llm_model = image_llm_model or settings.image_llm_model
+        prompt = self._collapse_prompt_whitespace(self._strip_invisible_chars(prompt or "").strip())
 
         logger.info(f"generate_image called | provider: {image_llm_provider} | model: {image_llm_model} | resolution: {resolution}")
         
@@ -219,12 +450,31 @@ class LLMService:
                 "Bright, simple, friendly children's illustration, clean shapes, pastel colors, "
                 "clear objects for teaching, no realism, no horror. "
             )
-            neg_style = (
+            prompt_lc = prompt.lower()
+            role_constraints = ""
+            role_neg_terms = []
+            has_father = bool(re.search(r"\b(father|dad|daddy)\b", prompt_lc))
+            has_mother = bool(re.search(r"\b(mother|mom|mommy)\b", prompt_lc))
+            if has_father and not has_mother:
+                role_constraints = "Important: include father only as the adult (adult man), and do not include any mother/adult woman."
+                role_neg_terms.extend(["mother", "mom", "mommy", "adult woman", "female parent", "woman"])
+            elif has_mother and not has_father:
+                role_constraints = "Important: include mother only as the adult (adult woman), and do not include any father/adult man."
+                role_neg_terms.extend(["father", "dad", "daddy", "adult man", "male parent", "man"])
+
+            neg_style_base = (
                 "photorealistic, horror, creepy, scary, gore, deformed, mutated, "
                 "animal-human hybrid, extra limbs, distorted anatomy, uncanny, low quality"
             )
+            neg_style = neg_style_base + (", " + ", ".join(role_neg_terms) if role_neg_terms else "")
             # 添加安全提示词
-            safe_prompt = f"Create a safe, family-friendly illustration. {prompt} The image should be appropriate for all ages, non-violent, and non-controversial."
+            safe_prompt = (
+                "Create a safe, family-friendly illustration. "
+                f"{prompt} "
+                f"{role_constraints} "
+                "The image should be appropriate for all ages, non-violent, and non-controversial."
+            )
+            safe_prompt = self._collapse_prompt_whitespace(safe_prompt)
             
             if image_llm_provider == "aliyun":
                 rsp = ImageSynthesis.call(model=image_llm_model,
@@ -546,35 +796,31 @@ class LLMService:
                         preserve_hint = ""
                         if is_img2img:
                             preserve_hint = ""
+                        image_edit_prompt = (
+                            f"{style_prefix} "
+                            "Using the attached image as a strict visual reference. "
+                            "Keep the same characters, faces, body proportions, clothing, and skin tones. "
+                            "Keep the same background, environment, lighting, camera angle, and art style. "
+                            "Do NOT change character identity or scene composition. "
+                            f"Only make the following changes: {prompt}. "
+                            f"{preserve_hint} "
+                            "Focus changes on the characters (pose/action/expression), keep the background unchanged. "
+                            "The result should look like the same moment in the same scene, with subtle action changes or added details, not a new illustration. "
+                            "Style: consistent, cohesive, high visual continuity. "
+                            "Content: safe, family-friendly, non-violent, appropriate for all ages."
+                        )
+                        image_edit_negative = (
+                            "blurry, low quality, deformed, "
+                            "different character, different face, different body, "
+                            "changed background, new environment, "
+                            "distorted anatomy, wide body, short body, "
+                            "stretched proportions, deformed limbs, "
+                            "style change, camera change, perspective change, "
+                            f"{neg_style}"
+                        )
                         payload = {
-                            "prompt": f"""
-                                    {style_prefix}
-                                    Using the attached image as a strict visual reference:
-
-                                    - Keep the same characters, faces, body proportions, clothing, and skin tones
-                                    - Keep the same background, environment, lighting, camera angle, and art style
-                                    - Do NOT change character identity or scene composition
-                                    Only make the following changes:
-                                    {prompt}
-                                    {preserve_hint}
-                                    Focus changes on the characters (pose/action/expression),
-                                    keep the background unchanged.
-                                    The result should look like the same moment in the same scene,
-                                    with subtle action changes or added details,
-                                    not a new illustration.
-
-                                    Style: consistent, cohesive, high visual continuity
-                                    Content: safe, family-friendly, non-violent, appropriate for all ages
-                                    """,
-                            "negative_prompt": f"""
-                                blurry, low quality, deformed, 
-                                different character, different face, different body,
-                                changed background, new environment,
-                                distorted anatomy, wide body, short body,
-                                stretched proportions, deformed limbs,
-                                style change, camera change, perspective change,
-                                {neg_style}
-                                """,
+                            "prompt": self._collapse_prompt_whitespace(image_edit_prompt),
+                            "negative_prompt": self._collapse_prompt_whitespace(image_edit_negative),
                             "image_b64": init_b64,
                             "mask": list(mask_bytes),
                             "num_steps": 20,
@@ -611,8 +857,8 @@ class LLMService:
                     logger.warning("No init_image provided - falling back to text-to-image")
                     # Switch to text model or use same model without image/mask
                     payload = {
-                        "prompt": f"{style_prefix}{safe_prompt}",
-                        "negative_prompt": f"blurry, low quality, {neg_style}",
+                        "prompt": self._collapse_prompt_whitespace(f"{style_prefix}{safe_prompt}"),
+                        "negative_prompt": self._collapse_prompt_whitespace(f"blurry, low quality, {neg_style}"),
                         "width": width,
                         "height": height,
                         "num_steps": 20,
@@ -765,9 +1011,11 @@ class LLMService:
         story_segments = await self.generate_story(
             request,
         )
+        req_topic_type = getattr(request, "topic_type", None)
         subject = (getattr(request, "subject", None) or "").strip()
+        subject = self._strip_invisible_chars(subject)
         if subject:
-            topic_text = (request.story_prompt or "").strip()
+            topic_text = self._strip_invisible_chars((request.story_prompt or "")).strip()
             if len(topic_text) > 120:
                 topic_text = topic_text[:117].rstrip() + "..."
             if topic_text:
@@ -787,6 +1035,7 @@ class LLMService:
                 "url": None,
                 "is_cover": True,
                 "subject": subject,
+                "topic_type": req_topic_type,
             }
             story_segments = [cover_segment] + story_segments
 
@@ -846,9 +1095,11 @@ class LLMService:
             script = (scene.get("script", "") or "").lower()
             hints = []
             if "father" in script or "dad" in script:
-                hints.append("Show the father (adult man), not the mother.")
+                hints.append("Include exactly one parent: the father (adult man).")
+                hints.append("Do not include mother, mom, mommy, or any adult woman.")
             if "mother" in script or "mom" in script:
-                hints.append("Show the mother (adult woman), not the father.")
+                hints.append("Include exactly one parent: the mother (adult woman).")
+                hints.append("Do not include father, dad, daddy, or any adult man.")
             if "teacher" in script:
                 hints.append("Include a teacher (adult).")
             if "boy" in script:
@@ -856,7 +1107,9 @@ class LLMService:
             if "girl" in script:
                 hints.append("Include a girl.")
             if hints:
-                scene["scene_prompt"] = (scene.get("scene_prompt", "") + "\n" + " ".join(hints)).strip()
+                scene["scene_prompt"] = self._collapse_prompt_whitespace(
+                    f"{scene.get('scene_prompt', '')}. {' '.join(hints)}"
+                )
 
         def to_voiceover_dialogue(script: str) -> str:
             if not script:
@@ -1204,29 +1457,31 @@ class LLMService:
                 out.append(clean_item)
             return out
 
-        # Extract 1-2 keywords for the whole video
-        script_list = [s.get("script", "") for s in story_segments if not s.get("is_cover")]
-        keywords = await extract_keywords_from_scripts(
-            script_list,
-            count=2,
-        )
-        keywords = refine_keywords(keywords, script_list, count=2)
-        if not keywords:
-            # Simple fallback: pick first verb-like word from script
-            fallback_verbs = ["wave", "wheel", "turn", "walk", "run", "hold", "pull", "talk", "say", "learn"]
-            joined = " ".join(script_list).lower()
-            picked = None
-            for v in fallback_verbs:
-                if re.search(rf"\\b{re.escape(v)}\\b", joined):
-                    picked = v
-                    break
-            if picked:
-                keywords = [{
-                    "word": picked,
-                    "pronunciation_us": "",
-                    "pronunciation_uk": "",
-                    "explanation": f"to {picked}"
-                }]
+        # Extract 1-2 keywords for the whole video (skip for sequence mode)
+        keywords = []
+        script_list = [self._strip_invisible_chars(s.get("script", "")) for s in story_segments if not s.get("is_cover")]
+        if req_topic_type != "sequence":
+            keywords = await extract_keywords_from_scripts(
+                script_list,
+                count=2,
+            )
+            keywords = refine_keywords(keywords, script_list, count=2)
+            if not keywords:
+                # Simple fallback: pick first verb-like word from script
+                fallback_verbs = ["wave", "wheel", "turn", "walk", "run", "hold", "pull", "talk", "say", "learn"]
+                joined = " ".join(script_list).lower()
+                picked = None
+                for v in fallback_verbs:
+                    if re.search(rf"\\b{re.escape(v)}\\b", joined):
+                        picked = v
+                        break
+                if picked:
+                    keywords = [{
+                        "word": picked,
+                        "pronunciation_us": "",
+                        "pronunciation_uk": "",
+                        "explanation": f"to {picked}"
+                    }]
         logger.info(f"Extracted keywords: {keywords}")
         for s in story_segments:
             s["keywords"] = [] if s.get("is_cover") else keywords
@@ -1252,9 +1507,10 @@ class LLMService:
             except Exception:
                 target_w, target_h = None, None
         for idx, segment in enumerate(story_segments, 1):
-            logger.info(f"Wait for 2 mins, free api have concurrency limits")
-            time.sleep(120)
-            logger.info(f"2 mins passed")
+            if req_topic_type != "sequence":
+                logger.info(f"Wait for 2 mins, free api have concurrency limits")
+                time.sleep(120)
+                logger.info(f"2 mins passed")
             
             try:
                 logger.info(
@@ -1263,6 +1519,9 @@ class LLMService:
                     f"resolution={request.resolution}"
                 )
                 is_cover = bool(segment.get("is_cover"))
+                segment["topic_type"] = segment.get("topic_type") or req_topic_type
+                segment["script"] = self._strip_invisible_chars(segment.get("script", ""))
+                segment["scene_prompt"] = self._strip_invisible_chars(segment.get("scene_prompt", ""))
                 if is_dialogue_topic and not is_cover:
                     segment["script"] = to_voiceover_dialogue(segment.get("script", ""))
                 if is_edu_topic and not use_exact_counts and not is_cover:

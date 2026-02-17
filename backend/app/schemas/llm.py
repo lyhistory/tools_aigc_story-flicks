@@ -27,6 +27,7 @@ class StorySegment(BaseModel):
     url: str = Field(None, description="Generated image URL")
     is_cover: bool = Field(default=False, description="Whether this segment is a cover/title scene")
     subject: Optional[str] = Field(default=None, description="Optional cover subject")
+    topic_type: Optional[TopicType] = Field(default=None, description="Topic type of this segment")
 
 
 class StoryGenerationResponse(BaseModel):

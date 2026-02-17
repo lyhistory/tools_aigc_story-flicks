@@ -297,6 +297,7 @@ class StoryScene(BaseModel):
     url: Optional[str] = Field(default=None, description="生成的图片 URL")
     is_cover: Optional[bool] = Field(default=False, description="Whether this scene is a cover/title scene")
     subject: Optional[str] = Field(default=None, description="Optional cover subject")
+    topic_type: Optional[TopicType] = Field(default=None, description="Topic type of this scene")
 
 class VideoGenerateRequest(BaseModel):
     """视频生成请求"""

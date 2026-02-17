@@ -89,7 +89,20 @@ def split_string_by_punctuations(s):
 def sanitize_text_for_tts(raw_text: str) -> str:
     if not raw_text:
         return raw_text
-    cleaned = raw_text.replace("“", '"').replace("”", '"').replace("‘", "'").replace("’", "'")
+    cleaned = (
+        str(raw_text)
+        .replace("\\u200b", "")
+        .replace("\\u200c", "")
+        .replace("\\u200d", "")
+        .replace("\\ufeff", "")
+        .replace("\\u2060", "")
+        .replace("​", "")
+        .replace("‌", "")
+        .replace("‍", "")
+        .replace("\ufeff", "")
+        .replace("\u2060", "")
+    )
+    cleaned = cleaned.replace("“", '"').replace("”", '"').replace("‘", "'").replace("’", "'")
     cleaned = re.sub(r"(?<!\\w)['\\\"](?!\\w)", "", cleaned)
     cleaned = re.sub(r"\\s+", " ", cleaned).strip()
     return cleaned
@@ -254,6 +267,28 @@ def build_srt_from_audio(audio: AudioSegment, clean_text: str, subtitle_file: st
             f.write(f"{start_hms} --> {end_hms}\n")
             f.write(f"{line.strip()}\n\n")
     logger.info("SRT fallback with silence trim")
+
+def _format_srt_ts(seconds: float) -> str:
+    s = max(0.0, float(seconds))
+    hh = int(s // 3600)
+    mm = int((s % 3600) // 60)
+    ss = int(s % 60)
+    ms = int((s - int(s)) * 1000)
+    return f"{hh:02d}:{mm:02d}:{ss:02d},{ms:03d}"
+
+def build_srt_from_word_timings(word_timings: list[dict], subtitle_file: str) -> None:
+    with open(subtitle_file, "w", encoding="utf-8") as f:
+        for idx, item in enumerate(word_timings, 1):
+            text = str(item.get("word", "")).strip()
+            if not text:
+                continue
+            start_s = float(item.get("start", 0.0) or 0.0)
+            end_s = float(item.get("end", start_s + 0.03) or (start_s + 0.03))
+            if end_s <= start_s:
+                end_s = start_s + 0.03
+            f.write(f"{idx}\n")
+            f.write(f"{_format_srt_ts(start_s)} --> {_format_srt_ts(end_s)}\n")
+            f.write(f"{text}\n\n")
 
 def get_all_azure_voices(filter_locals=None) -> list[str]:
     if filter_locals is None:
@@ -1396,6 +1431,7 @@ async def generate_voice(
         trail_silence_ms: int = 0,
         sentence_pause_ms: int | None = None,
         karaoke: bool = False,
+        sequence_mode: bool = False,
         ) -> Tuple[str, str]:
     """生成语音和字幕
 
@@ -1422,7 +1458,17 @@ async def generate_voice(
         voice_name = parse_voice_name(voice_name or "")
         await edge_tts_voice_notwork(text, voice_name, audio_file, subtitle_file, voice_rate, karaoke=karaoke)
     elif provider in ("google-tts", "google", "google-cloud-tts"):
-        await google_cloud_tts_voice(text, audio_file, subtitle_file, language, voice_name, voice_rate, karaoke=karaoke)
+        await google_cloud_tts_voice(
+            text,
+            audio_file,
+            subtitle_file,
+            language,
+            voice_name,
+            voice_rate,
+            karaoke=karaoke,
+            sentence_pause_ms=sentence_pause_ms,
+            sequence_mode=sequence_mode,
+        )
     else:
         await gtts_voice(
             text,
@@ -1434,6 +1480,7 @@ async def generate_voice(
             trail_silence_ms=trail_silence_ms,
             sentence_pause_ms=sentence_pause_ms,
             karaoke=karaoke,
+            sequence_mode=sequence_mode,
         )
     
     return audio_file, subtitle_file
@@ -1454,6 +1501,7 @@ async def gtts_voice(
     trail_silence_ms: int = 0,
     sentence_pause_ms: int | None = None,
     karaoke: bool = False,
+    sequence_mode: bool = False,
 ):
     """
     Fallback to gTTS (Google TTS) — stable, no 403 issues.
@@ -1474,32 +1522,90 @@ async def gtts_voice(
         tts_text = expand_contractions(clean_text)
         # Approximate rate: slow=True for slower speech
         slow = voice_rate < 0.8
-        segments = split_string_by_punctuations(clean_text)
-        if len(segments) <= 1:
-            tts = gTTS(text=tts_text, lang="en", tld=tld, slow=slow)
-            tts.save(voice_file)
-        else:
-            pause_ms = 220 if sentence_pause_ms is None else max(0, int(sentence_pause_ms))
+        segment_word_timings: list[dict] = []
+        if sequence_mode:
+            tokens = [m.group(0) for m in KARAOKE_WORD_PATTERN.finditer(clean_text or "")]
+            if not tokens:
+                tokens = split_string_by_punctuations(clean_text)
+            pause_ms = 120 if sentence_pause_ms is None else max(0, int(sentence_pause_ms))
             combined = AudioSegment.empty()
-            for idx, segment in enumerate(segments):
-                seg_text = expand_contractions(sanitize_text_for_tts(segment))
+            cursor_ms = 0
+            for idx, token in enumerate(tokens):
+                seg_text = expand_contractions(sanitize_text_for_tts(token))
+                if not seg_text:
+                    continue
                 tts = gTTS(text=seg_text, lang="en", tld=tld, slow=slow)
                 buffer = io.BytesIO()
                 tts.write_to_fp(buffer)
                 buffer.seek(0)
                 seg_audio = AudioSegment.from_file(buffer, format="mp3")
+                seg_start_ms = cursor_ms
                 combined += seg_audio
-                if idx < len(segments) - 1:
+                cursor_ms += len(seg_audio)
+                seg_end_ms = cursor_ms
+                segment_word_timings.append(
+                    {
+                        "word": sanitize_text_for_tts(token),
+                        "start": round(seg_start_ms / 1000.0, 4),
+                        "end": round(max((seg_start_ms + 30) / 1000.0, seg_end_ms / 1000.0), 4),
+                    }
+                )
+                if idx < len(tokens) - 1:
                     combined += AudioSegment.silent(duration=pause_ms)
+                    cursor_ms += pause_ms
             combined.export(voice_file, format="mp3")
-        
+        else:
+            segments = split_string_by_punctuations(clean_text)
+            if len(segments) <= 1:
+                tts = gTTS(text=tts_text, lang="en", tld=tld, slow=slow)
+                tts.save(voice_file)
+            else:
+                pause_ms = 220 if sentence_pause_ms is None else max(0, int(sentence_pause_ms))
+                combined = AudioSegment.empty()
+                cursor_ms = 0
+                for idx, segment in enumerate(segments):
+                    seg_text = expand_contractions(sanitize_text_for_tts(segment))
+                    tts = gTTS(text=seg_text, lang="en", tld=tld, slow=slow)
+                    buffer = io.BytesIO()
+                    tts.write_to_fp(buffer)
+                    buffer.seek(0)
+                    seg_audio = AudioSegment.from_file(buffer, format="mp3")
+                    combined += seg_audio
+                    cursor_ms += len(seg_audio)
+                    if idx < len(segments) - 1:
+                        combined += AudioSegment.silent(duration=pause_ms)
+                        cursor_ms += pause_ms
+                combined.export(voice_file, format="mp3")
+
         logger.info(f"gTTS success → saved: {voice_file}")
 
         # Get real audio duration
         audio = AudioSegment.from_mp3(voice_file)
+        lead_shift_s = max(0.0, float(lead_silence_ms or 0) / 1000.0)
         if lead_silence_ms or trail_silence_ms:
             audio = AudioSegment.silent(duration=int(lead_silence_ms)) + audio + AudioSegment.silent(duration=int(trail_silence_ms))
             audio.export(voice_file, format="mp3")
+
+        if sequence_mode and segment_word_timings:
+            words: list[dict] = []
+            for idx, item in enumerate(segment_word_timings):
+                start_s = float(item["start"]) + lead_shift_s
+                end_s = float(item["end"]) + lead_shift_s
+                if idx + 1 < len(segment_word_timings):
+                    next_start_s = float(segment_word_timings[idx + 1]["start"]) + lead_shift_s
+                    end_s = max(end_s, next_start_s - 0.01)
+                words.append(
+                    {
+                        "word": item["word"],
+                        "start": round(max(0.0, start_s), 4),
+                        "end": round(max(start_s + 0.03, end_s), 4),
+                    }
+                )
+            build_srt_from_word_timings(words, subtitle_file)
+            if karaoke or sequence_mode:
+                _write_karaoke_words_file(subtitle_file, "gtts", words)
+            return
+
         build_srt_from_audio(audio, clean_text, subtitle_file)
         if karaoke:
             words = _karaoke_words_from_subtitle(subtitle_file)
@@ -1516,6 +1622,8 @@ async def google_cloud_tts_voice(
     voice_name: str | None = None,
     voice_rate: float = 1.0,
     karaoke: bool = False,
+    sentence_pause_ms: int | None = None,
+    sequence_mode: bool = False,
 ):
     clean_text = sanitize_text_for_tts(text)
     lang = normalize_language_code(language) or "en-GB"
@@ -1532,6 +1640,45 @@ async def google_cloud_tts_voice(
         audio_encoding=texttospeech.AudioEncoding.MP3,
         speaking_rate=speaking_rate,
     )
+
+    if sequence_mode:
+        tokens = [m.group(0) for m in KARAOKE_WORD_PATTERN.finditer(clean_text or "")]
+        if not tokens:
+            tokens = split_string_by_punctuations(clean_text)
+        pause_ms = 120 if sentence_pause_ms is None else max(0, int(sentence_pause_ms))
+        combined = AudioSegment.empty()
+        cursor_ms = 0
+        words: list[dict] = []
+        for idx, token in enumerate(tokens):
+            token_text = sanitize_text_for_tts(token)
+            if not token_text:
+                continue
+            response = client.synthesize_speech(
+                input=texttospeech.SynthesisInput(text=token_text),
+                voice=voice,
+                audio_config=audio_config,
+            )
+            seg_audio = AudioSegment.from_file(io.BytesIO(response.audio_content), format="mp3")
+            seg_start_ms = cursor_ms
+            combined += seg_audio
+            cursor_ms += len(seg_audio)
+            seg_end_ms = cursor_ms
+            words.append(
+                {
+                    "word": token_text,
+                    "start": round(seg_start_ms / 1000.0, 4),
+                    "end": round(max((seg_start_ms + 30) / 1000.0, seg_end_ms / 1000.0), 4),
+                }
+            )
+            if idx < len(tokens) - 1:
+                combined += AudioSegment.silent(duration=pause_ms)
+                cursor_ms += pause_ms
+        combined.export(voice_file, format="mp3")
+        build_srt_from_word_timings(words, subtitle_file)
+        if karaoke or sequence_mode:
+            _write_karaoke_words_file(subtitle_file, "google-tts", words)
+        return
+
     response = None
     mark_tokens: list[str] = []
     if karaoke:

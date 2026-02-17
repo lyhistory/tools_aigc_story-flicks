@@ -30,7 +30,7 @@ interface VideoGenerateReq {
     segments: number; // 分段数量 (1-10)
     language?: Language; // 故事语言
     story_prompt?: string; // 故事提示词，测试模式不需要，非测试模式必填
-    topic_type?: "dialogue" | "explanation" | "scene";
+    topic_type?: "dialogue" | "explanation" | "scene" | "sequence";
     image_style?: string; // 图片风格，测试模式不需要，非测试模式必填
     subject?: string; // optional cover subject
     learner_age?: "3-5" | "6-8" | "9-12" | "13-15" | "16-18";
