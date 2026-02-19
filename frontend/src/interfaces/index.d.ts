@@ -38,6 +38,7 @@ interface VideoGenerateReq {
     voice_name: string; // 语音名称，需要和语言匹配
     voice_rate: number; // 语音速率，默认写1
     karaoke?: boolean; // Karaoke word-level highlight
+    chinese_subtitle_enabled?: boolean; // Optional Chinese translation under English subtitle
 }
 
 // 假设 Language 和 ImageStyle 是其他接口或枚举

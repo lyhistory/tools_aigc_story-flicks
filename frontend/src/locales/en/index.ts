@@ -32,5 +32,6 @@ export default {
         imageLLMPlaceholder: 'dall-e-3 or flux-dev or others',
         resolutionPlaceholder: '1024*1024',
         storyPromptPlaceholder: 'Tell a story about a little white rabbit and a big gray wolf.',
+        chineseSubtitle: 'Chinese Subtitle Translation',
     },
 }

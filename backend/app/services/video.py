@@ -160,7 +160,8 @@ async def create_video_with_scenes(
         voice_provider: str = "gtts",
         karaoke: bool = False,
         test_mode: bool = False,
-        resolution: str = None) -> str:
+        resolution: str = None,
+        chinese_subtitle_enabled: bool = False) -> str:
     """创建带有场景的视频
 
     Args:
@@ -174,6 +175,7 @@ async def create_video_with_scenes(
     target_w, target_h = parse_resolution(resolution) if resolution else (None, None)
     overlay_dir = os.path.join(task_dir, "overlays")
     os.makedirs(overlay_dir, exist_ok=True)
+    zh_subtitle_cache: dict[str, str] = {}
     def sanitize_pronunciation(text: str) -> str:
         if not text:
             return ""
@@ -198,6 +200,45 @@ async def create_video_with_scenes(
         cleaned = cleaned.replace("\ufeff", "")
         cleaned = cleaned.replace("“", "\"").replace("”", "\"").replace("’", "'").replace("‘", "'")
         return cleaned.strip()
+
+    def should_translate_to_zh(text: str) -> bool:
+        if not text:
+            return False
+        return bool(re.search(r"[A-Za-z]", text))
+
+    def translate_to_zh(text: str) -> str:
+        phrase = clean_subtitle_text(text)
+        if not phrase:
+            return ""
+        cached = zh_subtitle_cache.get(phrase)
+        if cached is not None:
+            return cached
+        try:
+            response = requests.get(
+                "https://translate.googleapis.com/translate_a/single",
+                params={
+                    "client": "gtx",
+                    "sl": "auto",
+                    "tl": "zh-CN",
+                    "dt": "t",
+                    "q": phrase,
+                },
+                timeout=8,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            translated = ""
+            if isinstance(payload, list) and payload and isinstance(payload[0], list):
+                translated = "".join(
+                    str(part[0]) for part in payload[0] if isinstance(part, list) and part and part[0] is not None
+                )
+            translated = clean_subtitle_text(translated)
+            zh_subtitle_cache[phrase] = translated
+            return translated
+        except Exception as e:
+            logger.warning(f"Subtitle translation failed, keep English only: {e}")
+            zh_subtitle_cache[phrase] = ""
+            return ""
 
     def normalize_token(token: str) -> str:
         t = re.sub(r"[^a-zA-Z]", "", token.lower())
@@ -403,6 +444,18 @@ async def create_video_with_scenes(
             y += h + line_spacing
         return img
 
+    def stack_subtitle_images(primary_img: Image.Image | None, secondary_img: Image.Image | None, gap: int = 8) -> Image.Image | None:
+        if primary_img is None:
+            return secondary_img
+        if secondary_img is None:
+            return primary_img
+        width = max(primary_img.width, secondary_img.width)
+        height = primary_img.height + max(0, gap) + secondary_img.height
+        stacked = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        stacked.alpha_composite(primary_img, ((width - primary_img.width) // 2, 0))
+        stacked.alpha_composite(secondary_img, ((width - secondary_img.width) // 2, primary_img.height + max(0, gap)))
+        return stacked
+
     def build_keyword_panel(
         word: str,
         pron_us: str,
@@ -571,6 +624,7 @@ async def create_video_with_scenes(
             font_path = os.path.join(utils.resource_dir(), "fonts", "STHeitiLight.ttc")
             keyword_font_path = os.path.join(utils.resource_dir(), "fonts", "MicrosoftYaHeiNormal.ttc")
             subtitle_font_path = os.path.join(utils.resource_dir(), "fonts", "MicrosoftYaHeiBold.ttc")
+            chinese_subtitle_font_path = os.path.join(utils.resource_dir(), "fonts", "MicrosoftYaHeiNormal.ttc")
             ipa_font_path = os.path.join(
                 utils.resource_dir(),
                 "fonts",
@@ -598,6 +652,8 @@ async def create_video_with_scenes(
                 subtitle_font_path = noto_bold
             if os.path.exists(noto_semibold):
                 keyword_font_path = noto_semibold
+            if not os.path.exists(chinese_subtitle_font_path):
+                chinese_subtitle_font_path = subtitle_font_path
             keyword_pron_font_path = noto_regular if os.path.exists(noto_regular) else keyword_font_path
             keyword_expl_font_path = noto_light if os.path.exists(noto_light) else keyword_font_path
             # 添加字幕 (PIL render directly onto frames)
@@ -697,7 +753,7 @@ async def create_video_with_scenes(
                             kw = {} if is_sequence_scene else find_keyword_in_text(phrase, scene.keywords)
                             highlight_word = (kw.get("word") or "").strip() if kw else ""
                             highlight_norm = normalize_token(highlight_word) if highlight_word else ""
-                            sub_img = render_text_rgba(
+                            sub_img_en = render_text_rgba(
                                 phrase,
                                 subtitle_font_path,
                                 (148 if is_sequence_scene else 58),
@@ -709,6 +765,29 @@ async def create_video_with_scenes(
                                 highlight_text_color="#111827",
                                 stroke_width=(max(3, int(origin_image_h * 0.008)) if is_sequence_scene else 0),
                                 stroke_fill=("#FFFFFF" if is_sequence_scene else None),
+                            )
+                            zh_sub_img = None
+                            if (
+                                chinese_subtitle_enabled
+                                and not is_sequence_scene
+                                and should_translate_to_zh(phrase)
+                            ):
+                                zh_phrase = translate_to_zh(phrase)
+                                if zh_phrase:
+                                    zh_sub_img = render_text_rgba(
+                                        zh_phrase,
+                                        chinese_subtitle_font_path,
+                                        max(20, int(origin_image_h * 0.024)),
+                                        "#F8FAFC",
+                                        max_width=int(origin_image_w * 0.85),
+                                        bg_rgba=(0, 0, 0, 0),
+                                        stroke_width=max(1, int(origin_image_h * 0.002)),
+                                        stroke_fill="#111827",
+                                    )
+                            sub_img = stack_subtitle_images(
+                                sub_img_en,
+                                zh_sub_img,
+                                gap=max(6, int(origin_image_h * 0.006)),
                             )
                             line_start = float(item[0][0])
                             line_end = float(item[0][1])
@@ -744,7 +823,7 @@ async def create_video_with_scenes(
                                     kara_bg = (147, 197, 253, 210)
                                     if is_keyword_token:
                                         kara_bg = (254, 240, 138, 230)
-                                    kara_img = render_text_rgba(
+                                    kara_img_en = render_text_rgba(
                                         phrase,
                                         subtitle_font_path,
                                         58,
@@ -754,6 +833,11 @@ async def create_video_with_scenes(
                                         highlight_token_index=token_idx,
                                         highlight_bg_rgba=kara_bg,
                                         highlight_text_color="#111827",
+                                    )
+                                    kara_img = stack_subtitle_images(
+                                        kara_img_en,
+                                        zh_sub_img,
+                                        gap=max(6, int(origin_image_h * 0.006)),
                                     )
                                     if kara_img is not None:
                                         sub_karaoke_imgs[token_idx] = kara_img
@@ -996,6 +1080,7 @@ async def generate_video(request: VideoGenerateRequest):
             language=request.language,
             voice_provider=getattr(request, "voice_provider", "gtts"),
             karaoke=getattr(request, "karaoke", False),
+            chinese_subtitle_enabled=getattr(request, "chinese_subtitle_enabled", False),
             test_mode=request.test_mode,
             resolution=request.resolution,
         )

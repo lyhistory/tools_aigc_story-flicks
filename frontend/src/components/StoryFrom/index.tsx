@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import type { FormProps } from 'antd';
-import { Button, Form, Input, Select, message, Switch, Tooltip } from 'antd';
+import { Button, Form, Input, InputNumber, Select, message, Switch, Tooltip } from 'antd';
 import { useTranslation } from 'react-i18next'
 import { getVoiceList, getLLMProviders, generateVideo, getVoiceOptions } from '../../services/index';
 import { VOICE_LANGUAGES, VOICE_LANGUAGES_LABELS, VOICE_PROVIDERS, LEARNER_AGE_OPTIONS } from '../../constants';
@@ -28,6 +28,7 @@ type FieldType = {
     voice_name: string; // 语音名称，需要和语言匹配
     voice_rate: number; // 语音速率，默认写1
     karaoke?: boolean; // Karaoke word-level highlight
+    chinese_subtitle_enabled?: boolean; // Chinese subtitle translation under English subtitle
 };
 
 
@@ -91,7 +92,11 @@ const App: React.FC = () => {
     const onFinish: FormProps<FieldType>['onFinish'] = (values) => {
         console.log('Success:', values);
         message.loading('Generating Video, please wait...', 0);
-        generateVideo(values).then(res => {
+        const payload = {
+            ...values,
+            segments: values.topic_type === 'sequence' ? 1 : values.segments,
+        };
+        generateVideo(payload).then(res => {
             message.destroy();
             if (res?.success === false) {
                 throw new Error(res?.message || 'Generate Video Failed');
@@ -294,6 +299,14 @@ const App: React.FC = () => {
                         <Switch />
                     </Form.Item>
                     <Form.Item<FieldType>
+                        label={t('storyForm.chineseSubtitle')}
+                        name="chinese_subtitle_enabled"
+                        valuePropName="checked"
+                        initialValue={false}
+                    >
+                        <Switch />
+                    </Form.Item>
+                    <Form.Item<FieldType>
                         label="Subject (Optional)"
                         name="subject"
                     >
@@ -338,12 +351,20 @@ const App: React.FC = () => {
                             <Select.Option value="sequence">Sequence (counting/months/weekdays)</Select.Option>
                         </Select>
                     </Form.Item>
-                    <Form.Item<FieldType>
-                        label={t('storyForm.segments')}
-                        name="segments"
-                        rules={[{ required: true, message: t('storyForm.segmentsMissMsg'), min: 1, max: 10 }]}
-                    >
-                        <Input type='number' min={1} max={10} placeholder="3" />
+                    <Form.Item noStyle shouldUpdate={(prev, curr) => prev.topic_type !== curr.topic_type}>
+                        {({ getFieldValue }) => {
+                            const isSequence = getFieldValue('topic_type') === 'sequence';
+                            return (
+                                <Form.Item<FieldType>
+                                    label={t('storyForm.segments')}
+                                    name="segments"
+                                    initialValue={3}
+                                    rules={[{ required: true, type: 'number', min: 1, max: 10, message: t('storyForm.segmentsMissMsg') }]}
+                                >
+                                    <InputNumber min={1} max={10} placeholder="3" style={{ width: '100%' }} disabled={isSequence} />
+                                </Form.Item>
+                            );
+                        }}
                     </Form.Item>
                     <Form.Item label={null}>
                         <Button type="primary" htmlType="submit">

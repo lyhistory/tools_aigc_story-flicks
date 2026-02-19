@@ -32,5 +32,6 @@ export default {
         imageLLMPlaceholder: 'dall-e-3 或 flux-dev 或其他',
         resolutionPlaceholder: '1024*1024',
         storyPromptPlaceholder: '讲一个小白兔和大灰狼的故事。',
+        chineseSubtitle: '中文字幕翻译',
     },
 }

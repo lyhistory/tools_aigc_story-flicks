@@ -318,6 +318,7 @@ class VideoGenerateRequest(BaseModel):
     voice_name: str = Field(default="zh-CN-XiaoxiaoNeural", description="语音名称")
     voice_rate: float = Field(default=1.0, description="语音速率")
     karaoke: bool = Field(default=False, description="是否启用卡拉OK逐词高亮")
+    chinese_subtitle_enabled: bool = Field(default=False, description="是否启用中文字幕翻译")
     resolution: Optional[str] = Field(default="1024*1024", description="分辨率")
     use_inpainting: Optional[bool] = Field(default=False, description="是否使用图生图/修复模式")
     avoid_exact_counts: Optional[bool] = Field(default=None, description="是否避免精确数量")
