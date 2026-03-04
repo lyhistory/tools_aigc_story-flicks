@@ -97,6 +97,71 @@ class LLMService:
             return text
         return re.sub(r"\s+", " ", str(text)).strip()
 
+    async def _normalize_story_prompt(
+        self,
+        story_prompt: str,
+        language: Language = Language.CHINESE_CN,
+        text_llm_provider: str = None,
+        text_llm_model: str = None,
+    ) -> str:
+        cleaned = self._collapse_prompt_whitespace(
+            self._strip_invisible_chars((story_prompt or "")).strip()
+        )
+        if not cleaned:
+            return cleaned
+
+        language_name = LANGUAGE_NAMES.get(language, "the same language as the input")
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You improve user-entered topic text. "
+                    "If grammar is incorrect or phrasing sounds non-native, rewrite it naturally. "
+                    "If it is already natural and correct, keep the meaning unchanged. "
+                    "Return JSON only."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "Rewrite the topic only when needed.\n"
+                    "Return strictly JSON: {\"corrected_prompt\":\"...\"}\n"
+                    "Rules:\n"
+                    "1. Preserve original meaning and scope.\n"
+                    "2. Keep numbers, ranges, and sequence terms intact whenever possible.\n"
+                    "3. Do not add examples, teaching content, or extra context.\n"
+                    f"4. Output in {language_name}.\n"
+                    f"Topic: {cleaned}"
+                ),
+            },
+        ]
+        try:
+            result = await self._generate_response(
+                text_llm_provider=text_llm_provider,
+                text_llm_model=text_llm_model,
+                messages=messages,
+                response_format="json_object",
+            )
+            if isinstance(result, dict):
+                candidate = (
+                    result.get("corrected_prompt")
+                    or result.get("corrected_topic")
+                    or result.get("prompt")
+                    or result.get("text")
+                )
+                if isinstance(candidate, str):
+                    normalized = self._collapse_prompt_whitespace(
+                        self._strip_invisible_chars(candidate).strip()
+                    )
+                    if normalized:
+                        if normalized != cleaned:
+                            logger.info(f"story_prompt normalized: '{cleaned}' -> '{normalized}'")
+                        return normalized
+            logger.warning(f"story_prompt normalization returned unexpected payload: {result}")
+        except Exception as e:
+            logger.warning(f"story_prompt normalization failed, using original prompt: {e}")
+        return cleaned
+
     @staticmethod
     def _word_number_to_int(token: str) -> int | None:
         if token is None:
@@ -267,6 +332,13 @@ class LLMService:
             List[Dict[str, Any]]: 故事场景列表
         """
         request.story_prompt = self._strip_invisible_chars((request.story_prompt or "")).strip()
+        if request.story_prompt:
+            request.story_prompt = await self._normalize_story_prompt(
+                request.story_prompt,
+                request.language,
+                request.text_llm_provider or None,
+                request.text_llm_model or None,
+            )
         topic_type = getattr(request, "topic_type", None)
         if topic_type == "sequence":
             items = self._build_sequence_items(request.story_prompt)
@@ -313,8 +385,8 @@ class LLMService:
             }]
 
         if request.segments == 1:
-            # Special case: exactly 1 segment → skip LLM, directly use user-provided prompt
-            logger.info("segments == 1 → skipping LLM, using story_prompt directly as single scene")
+            # Special case: exactly 1 segment -> skip scene-generation LLM and use normalized prompt
+            logger.info("segments == 1 -> skipping scene-generation LLM, using normalized story_prompt")
             
             # Create scene prompt from story_prompt (you can customize this logic)
             scene_prompt = f"Clear, family-friendly illustration teaching: {request.story_prompt}. Suitable for children, bright colors, no violence. Include concrete plural objects."
