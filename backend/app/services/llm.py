@@ -97,6 +97,97 @@ class LLMService:
             return text
         return re.sub(r"\s+", " ", str(text)).strip()
 
+    @staticmethod
+    def _normalize_claim_part(text: str) -> str:
+        if not text:
+            return ""
+        part = LLMService._collapse_prompt_whitespace(str(text).lower())
+        part = re.sub(r"[^a-z0-9\s-]", "", part)
+        part = re.sub(r"^(?:the|a|an|some|this|that|these|those)\s+", "", part)
+        return re.sub(r"\s+", " ", part).strip()
+
+    @classmethod
+    def _extract_simple_claims(cls, text: str) -> Dict[str, bool]:
+        if not text:
+            return {}
+        cleaned = cls._collapse_prompt_whitespace(cls._strip_invisible_chars(text))
+        cleaned = cleaned.lower().replace("’", "'")
+        clauses = [c.strip(" ,") for c in re.split(r"[.!?;,\n]+", cleaned) if c and c.strip()]
+        claims: Dict[str, bool] = {}
+        claim_patterns = [
+            (r"^(?P<subject>.+?)\s+can(?P<neg>\s+not|not|'t)?\s+(?P<predicate>.+)$", "can"),
+            (r"^(?P<subject>.+?)\s+(?:have|has)(?P<neg>\s+not|'t)?\s+got\s+(?P<predicate>.+)$", "have_got"),
+            (r"^(?P<subject>.+?)\s+(?:have|has)(?P<neg>\s+not|'t)?\s+(?P<predicate>.+)$", "have"),
+            (r"^(?P<subject>.+?)\s+(?:is|are|am|was|were)(?P<neg>\s+not|'t)?\s+(?P<predicate>.+)$", "be"),
+        ]
+        for clause in clauses:
+            parts = [
+                cls._collapse_prompt_whitespace(p)
+                for p in re.split(r"\b(?:but|however|yet)\b", clause)
+                if p and cls._collapse_prompt_whitespace(p)
+            ]
+            last_subject_raw = ""
+            for part in parts:
+                normalized_clause = part
+                if last_subject_raw and re.match(r"^(?:can|have|has|is|are|am|was|were)\b", normalized_clause):
+                    normalized_clause = f"{last_subject_raw} {normalized_clause}"
+                for pattern, relation in claim_patterns:
+                    m = re.match(pattern, normalized_clause, flags=re.I)
+                    if not m:
+                        continue
+                    subject_raw = cls._collapse_prompt_whitespace(m.group("subject"))
+                    subject = cls._normalize_claim_part(subject_raw)
+                    predicate = cls._normalize_claim_part(m.group("predicate"))
+                    if not subject or not predicate:
+                        break
+                    key = f"{subject}|{relation}|{predicate}"
+                    claims[key] = not bool(m.group("neg"))
+                    last_subject_raw = subject_raw
+                    break
+        return claims
+
+    @classmethod
+    def _find_claim_conflicts(cls, source_text: str, candidate_text: str) -> List[str]:
+        source_claims = cls._extract_simple_claims(source_text)
+        if not source_claims:
+            return []
+        candidate_claims = cls._extract_simple_claims(candidate_text)
+        if not candidate_claims:
+            return []
+        relation_map = {
+            "can": "can",
+            "have_got": "have got",
+            "have": "have",
+            "be": "are",
+        }
+        conflicts: List[str] = []
+        for key, source_positive in source_claims.items():
+            candidate_positive = candidate_claims.get(key)
+            if candidate_positive is None or candidate_positive == source_positive:
+                continue
+            subject, relation, predicate = key.split("|", 2)
+            relation_text = relation_map.get(relation, relation)
+            expected = (
+                f"{subject} {relation_text} {predicate}"
+                if source_positive
+                else f"{subject} {relation_text} not {predicate}"
+            )
+            conflicts.append(expected)
+        return conflicts
+
+    @staticmethod
+    def _join_scene_scripts(scenes: List[Dict[str, Any]]) -> str:
+        if not isinstance(scenes, list):
+            return ""
+        scripts = []
+        for scene in scenes:
+            if not isinstance(scene, dict):
+                continue
+            script = scene.get("script")
+            if isinstance(script, str) and script.strip():
+                scripts.append(script.strip())
+        return " ".join(scripts)
+
     async def _normalize_story_prompt(
         self,
         story_prompt: str,
@@ -115,9 +206,9 @@ class LLMService:
             {
                 "role": "system",
                 "content": (
-                    "You improve user-entered topic text. "
-                    "If grammar is incorrect or phrasing sounds non-native, rewrite it naturally. "
-                    "If it is already natural and correct, keep the meaning unchanged. "
+                    "You are a grammar and phrasing corrector for topic text. "
+                    "Make minimal edits only. "
+                    "If the text is already grammatical and natural, keep it unchanged. "
                     "Return JSON only."
                 ),
             },
@@ -127,10 +218,12 @@ class LLMService:
                     "Rewrite the topic only when needed.\n"
                     "Return strictly JSON: {\"corrected_prompt\":\"...\"}\n"
                     "Rules:\n"
-                    "1. Preserve original meaning and scope.\n"
-                    "2. Keep numbers, ranges, and sequence terms intact whenever possible.\n"
-                    "3. Do not add examples, teaching content, or extra context.\n"
-                    f"4. Output in {language_name}.\n"
+                    "1. Preserve original meaning and clause order.\n"
+                    "2. Never change factual polarity (do not flip positive/negative claims).\n"
+                    "3. Keep numbers, ranges, and sequence terms intact.\n"
+                    "4. Keep user verb forms when grammatical (e.g., keep \"have got\", \"can\", \"are\").\n"
+                    "5. Do not add examples, teaching content, or extra context.\n"
+                    f"6. Output in {language_name}.\n"
                     f"Topic: {cleaned}"
                 ),
             },
@@ -154,6 +247,12 @@ class LLMService:
                         self._strip_invisible_chars(candidate).strip()
                     )
                     if normalized:
+                        conflicts = self._find_claim_conflicts(cleaned, normalized)
+                        if conflicts:
+                            logger.warning(
+                                f"story_prompt normalization changed claim polarity; keeping original prompt. conflicts={conflicts[:5]}"
+                            )
+                            return cleaned
                         if normalized != cleaned:
                             logger.info(f"story_prompt normalized: '{cleaned}' -> '{normalized}'")
                         return normalized
@@ -441,6 +540,24 @@ class LLMService:
         6. Do not force a teacher or classroom unless the topic explicitly requires it.
             """
         extra_requirements += f"\n        10. Keep vocabulary and sentence complexity suitable for learner age band {age_band}."
+        source_claim_lines = [
+            self._collapse_prompt_whitespace(c)
+            for c in re.split(r"[.!?;,\n]+", request.story_prompt or "")
+            if c and self._collapse_prompt_whitespace(c)
+        ]
+        if source_claim_lines:
+            fixed_claims = "\n".join([f"        - {line}" for line in source_claim_lines[:10]])
+            extra_requirements += (
+                "\n        11. Be logically consistent with the source topic. "
+                "Never reverse positive/negative meaning of any source claim."
+                "\n        12. If you mention a source claim, keep its truth value exactly as provided."
+                f"\n        13. Fixed source claims:\n{fixed_claims}"
+            )
+        if request.language in {Language.ENGLISH_EN, Language.ENGLISH_US, Language.ENGLISH_FIXED}:
+            extra_requirements += (
+                "\n        14. If user verb style is grammatical (e.g., \"have got\"), "
+                "prefer keeping that style in scripts."
+            )
 
         messages = [
             {"role": "system", "content": system_content},
@@ -462,6 +579,41 @@ class LLMService:
         logger.info(f"Generated story: {json.dumps(response, indent=4, ensure_ascii=False)}")
         # 验证响应格式
         self._validate_story_response(response)
+        initial_conflicts = self._find_claim_conflicts(request.story_prompt, self._join_scene_scripts(response))
+        if initial_conflicts:
+            logger.warning(f"Detected logic conflicts in generated scripts: {initial_conflicts[:8]}")
+            retry_messages = messages + [{
+                "role": "user",
+                "content": (
+                    "Your previous output contradicted the source facts. "
+                    "Regenerate the full JSON from scratch and keep source facts logically consistent.\n"
+                    "Do not flip positive/negative claims.\n"
+                    "Claims that must stay true:\n"
+                    + "\n".join([f"- {c}" for c in initial_conflicts[:10]])
+                ),
+            }]
+            try:
+                retry_result = await self._generate_response(
+                    text_llm_provider=request.text_llm_provider or None,
+                    text_llm_model=request.text_llm_model or None,
+                    messages=retry_messages,
+                    response_format="json_object",
+                )
+                retry_list = retry_result.get("list") if isinstance(retry_result, dict) else None
+                if isinstance(retry_list, list):
+                    retry_response = self.normalize_keys(retry_list)
+                    self._validate_story_response(retry_response)
+                    retry_conflicts = self._find_claim_conflicts(
+                        request.story_prompt,
+                        self._join_scene_scripts(retry_response),
+                    )
+                    if len(retry_conflicts) <= len(initial_conflicts):
+                        response = retry_response
+                        initial_conflicts = retry_conflicts
+                if initial_conflicts:
+                    logger.warning(f"Story output still has possible logic conflicts: {initial_conflicts[:8]}")
+            except Exception as e:
+                logger.warning(f"Retry after logic conflict failed, using first response: {e}")
         
         return response
     def normalize_keys(self, data):
