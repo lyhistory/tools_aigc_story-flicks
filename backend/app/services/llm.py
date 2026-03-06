@@ -540,6 +540,10 @@ class LLMService:
         6. Do not force a teacher or classroom unless the topic explicitly requires it.
             """
         extra_requirements += f"\n        10. Keep vocabulary and sentence complexity suitable for learner age band {age_band}."
+        extra_requirements += (
+            "\n        11. Scene alignment rule: each scene_prompt must depict the same main subjects/actions "
+            "as that scene's script, and must not swap entities with other scenes."
+        )
         source_claim_lines = [
             self._collapse_prompt_whitespace(c)
             for c in re.split(r"[.!?;,\n]+", request.story_prompt or "")
@@ -548,14 +552,14 @@ class LLMService:
         if source_claim_lines:
             fixed_claims = "\n".join([f"        - {line}" for line in source_claim_lines[:10]])
             extra_requirements += (
-                "\n        11. Be logically consistent with the source topic. "
+                "\n        12. Be logically consistent with the source topic. "
                 "Never reverse positive/negative meaning of any source claim."
-                "\n        12. If you mention a source claim, keep its truth value exactly as provided."
-                f"\n        13. Fixed source claims:\n{fixed_claims}"
+                "\n        13. If you mention a source claim, keep its truth value exactly as provided."
+                f"\n        14. Fixed source claims:\n{fixed_claims}"
             )
         if request.language in {Language.ENGLISH_EN, Language.ENGLISH_US, Language.ENGLISH_FIXED}:
             extra_requirements += (
-                "\n        14. If user verb style is grammatical (e.g., \"have got\"), "
+                "\n        15. If user verb style is grammatical (e.g., \"have got\"), "
                 "prefer keeping that style in scripts."
             )
 
@@ -1308,7 +1312,9 @@ class LLMService:
                 "Include clear visual examples of plural objects mentioned in the scene text "
                 "or objects list (e.g., two cats, three apples, several books). "
                 "Avoid a single child standing alone; if people appear, show a teacher/adult explaining with the objects visible. "
-                "Keep the background relevant to a learning setting."
+                "Keep the background relevant to a learning setting. "
+                "Only draw objects that are in this scene text or objects list. "
+                "Do not include subjects from other scenes."
             )
             count_hint_text = ""
             if count_hints:
@@ -1377,38 +1383,68 @@ class LLMService:
                 return " ".join(lines)
             return text
 
+        stop_focus_tokens = {
+            "the", "a", "an", "and", "or", "but", "if", "then", "than", "with", "without",
+            "to", "of", "for", "from", "in", "on", "at", "by", "as", "about",
+            "is", "are", "am", "was", "were", "be", "being", "been",
+            "have", "has", "had", "got", "can", "could", "will", "would", "should", "may", "might", "must",
+            "do", "does", "did", "not", "no", "yes", "very", "really", "just",
+            "this", "that", "these", "those", "it", "its", "they", "them", "their", "we", "you", "i",
+            "he", "she", "his", "her", "our", "your",
+            "learn", "learning", "teach", "teaching", "lesson", "topic", "story", "scene", "today", "together",
+        }
+
+        def extract_focus_terms(text: str, limit: int = 8) -> List[str]:
+            if not text:
+                return []
+            cleaned = self._strip_invisible_chars(text).lower().replace("’", "'")
+            tokens = re.findall(r"[a-z][a-z'-]{1,}", cleaned)
+            out: List[str] = []
+            seen = set()
+            for tok in tokens:
+                t = tok.strip("'")
+                if len(t) < 3 or t in stop_focus_tokens:
+                    continue
+                if t in seen:
+                    continue
+                seen.add(t)
+                out.append(t)
+                if len(out) >= limit:
+                    break
+            return out
+
+        def extract_focus_terms_from_objects(objects: list, limit: int = 8) -> List[str]:
+            if not objects:
+                return []
+            joined = " ".join([str(o) for o in objects if str(o).strip()])
+            return extract_focus_terms(joined, limit=limit)
+
         def ensure_unique_objects(scene: dict, idx: int, used_objects: set) -> list:
-            fallback_objects = [
-                "two cats",
-                "three apples",
-                "four books",
-                "five toys",
-                "six pencils",
-                "seven balls",
-                "eight cars",
-                "nine dogs",
-                "ten stars",
-            ]
             objs = scene.get("objects") or []
-            # Normalize to list of strings
-            objs = [str(o).strip() for o in objs if str(o).strip()]
-            # If empty or repeats, assign a new one
+            objs = [
+                self._collapse_prompt_whitespace(str(o))
+                for o in objs
+                if self._collapse_prompt_whitespace(str(o))
+            ]
             if not objs:
-                for item in fallback_objects:
-                    if item not in used_objects:
-                        objs = [item]
-                        break
-            else:
-                # If any object already used, replace with a new one
-                if any(o in used_objects for o in objs):
-                    for item in fallback_objects:
-                        if item not in used_objects:
-                            objs = [item]
-                            break
-            for o in objs:
-                used_objects.add(o)
-            scene["objects"] = objs
-            return objs
+                inferred_terms = extract_focus_terms(scene.get("script", ""), limit=3)
+                if inferred_terms:
+                    if use_exact_counts:
+                        objs = [f"two {term}" for term in inferred_terms[:2]]
+                    else:
+                        objs = inferred_terms[:2]
+            deduped = []
+            seen_local = set()
+            for obj in objs:
+                key = obj.lower()
+                if key in seen_local:
+                    continue
+                seen_local.add(key)
+                deduped.append(obj)
+            for obj in deduped:
+                used_objects.add(obj.lower())
+            scene["objects"] = deduped
+            return deduped
 
         def ensure_objects_in_script(scene: dict, objects: list, use_exact_counts: bool):
             if not objects:
@@ -1423,6 +1459,44 @@ class LLMService:
                 scene["script"] = (script + f" Let's count {objects_phrase} together!").strip()
             else:
                 scene["script"] = script.strip()
+
+        def build_aligned_image_prompt(segment: dict, idx: int, all_scene_focus_terms: List[set], variation_hint: str = "") -> str:
+            base_prompt = self._collapse_prompt_whitespace(segment.get("scene_prompt", "") or "")
+            script_text = self._collapse_prompt_whitespace(segment.get("script", "") or "")
+            script_terms = extract_focus_terms(script_text, limit=8)
+            object_terms = extract_focus_terms_from_objects(segment.get("objects", []), limit=8)
+            current_terms: List[str] = []
+            seen_terms = set()
+            for term in script_terms + object_terms:
+                if term in seen_terms:
+                    continue
+                seen_terms.add(term)
+                current_terms.append(term)
+
+            all_scene_focus_terms[idx - 1] = set(current_terms)
+            avoid_terms: List[str] = []
+            for j, terms in enumerate(all_scene_focus_terms):
+                if j == (idx - 1):
+                    continue
+                for term in sorted(terms):
+                    if term in seen_terms or term in avoid_terms:
+                        continue
+                    avoid_terms.append(term)
+
+            guard_lines = [
+                f"Narration for this exact scene: {script_text}",
+                "Strict visual matching rules:",
+                "- Depict only what belongs to this scene narration and this scene prompt.",
+                "- Do not swap entities between scenes.",
+            ]
+            if current_terms:
+                guard_lines.append(f"- Main subjects/objects to include: {', '.join(current_terms[:8])}.")
+            if avoid_terms:
+                guard_lines.append(f"- Avoid subjects from other scenes: {', '.join(avoid_terms[:8])}.")
+            if variation_hint:
+                guard_lines.append(f"Variation hint for this scene: {variation_hint}")
+
+            return f"{base_prompt}\n\n" + "\n".join(guard_lines)
 
         # Create task dir early (or receive from upper caller)
         if not task_dir:
@@ -1730,6 +1804,18 @@ class LLMService:
                 target_w, target_h = int(w_str.strip()), int(h_str.strip())
             except Exception:
                 target_w, target_h = None, None
+        all_scene_focus_terms: List[set] = []
+        for seg in story_segments:
+            if seg.get("is_cover"):
+                all_scene_focus_terms.append(set())
+                continue
+            seed_terms = extract_focus_terms(seg.get("script", ""), limit=8)
+            for term in extract_focus_terms_from_objects(seg.get("objects", []), limit=8):
+                if term not in seed_terms:
+                    seed_terms.append(term)
+            all_scene_focus_terms.append(set(seed_terms))
+        previous_focus_terms = set()
+
         for idx, segment in enumerate(story_segments, 1):
             if req_topic_type != "sequence":
                 logger.info(f"Wait for 2 mins, free api have concurrency limits")
@@ -1757,13 +1843,30 @@ class LLMService:
                     ensure_objects_in_script(segment, objs, use_exact_counts)
                 else:
                     segment["objects"] = segment.get("objects", [])
+                current_focus_terms = []
+                seen_focus = set()
+                for term in extract_focus_terms(segment.get("script", ""), limit=8) + extract_focus_terms_from_objects(segment.get("objects", []), limit=8):
+                    if term in seen_focus:
+                        continue
+                    seen_focus.add(term)
+                    current_focus_terms.append(term)
+                if idx - 1 < len(all_scene_focus_terms):
+                    all_scene_focus_terms[idx - 1] = set(current_focus_terms)
                 if not is_cover:
                     add_role_hints(segment)
                 variation_hint = ""
                 if idx > 1 and not is_cover:
                     variation_hint = await build_variation_hint(segment.get("script", ""), idx, request)
                 img2img_kwargs = {}
-                if use_inpainting and previous_base64 and not is_cover:
+                allow_img2img = use_inpainting and previous_base64 and not is_cover
+                if allow_img2img and previous_focus_terms and current_focus_terms:
+                    if previous_focus_terms.isdisjoint(set(current_focus_terms)):
+                        allow_img2img = False
+                        logger.info(
+                            f"Scene {idx} img2img disabled due subject change | "
+                            f"prev={sorted(previous_focus_terms)} curr={sorted(set(current_focus_terms))}"
+                        )
+                if allow_img2img:
                     img2img_kwargs = {"init_image_base64": previous_base64}
                 logger.info(
                     f"Scene {idx} image mode | "
@@ -1783,12 +1886,18 @@ class LLMService:
                         segment["scene_prompt"]
                         + "\nKeep the overall look and feel identical; only change motion or add small details. Keep the same characters and background."
                     )
-                
+                image_prompt = build_aligned_image_prompt(
+                    segment,
+                    idx,
+                    all_scene_focus_terms,
+                    variation_hint,
+                )
+                logger.info(
+                    f"Scene {idx} focus terms | include={current_focus_terms[:8]} "
+                    f"| avoid={sorted([t for j, terms in enumerate(all_scene_focus_terms) if j != idx - 1 for t in terms])[:8]}"
+                )
                 image_url = self.generate_image(
-                    prompt=(
-                        segment["scene_prompt"]
-                        + (f"\n\nVariation hint for this scene: {variation_hint}" if variation_hint else "")
-                    ),
+                    prompt=image_prompt,
                     resolution=request.resolution, 
                     image_llm_provider=request.image_llm_provider, 
                     image_llm_model=request.image_llm_model,
@@ -1802,10 +1911,7 @@ class LLMService:
                     )
                     time.sleep(300)
                     image_url = self.generate_image(
-                        prompt=(
-                            segment["scene_prompt"]
-                            + (f"\n\nVariation hint for this scene: {variation_hint}" if variation_hint else "")
-                        ),
+                        prompt=image_prompt,
                         resolution=request.resolution, 
                         image_llm_provider=request.image_llm_provider, 
                         image_llm_model=request.image_llm_model,
@@ -1828,6 +1934,7 @@ class LLMService:
                         logger.warning(f"Scene {idx} output size check failed: {e}")
                 # Orientation recheck removed per request (no retry)
                 if image_url and not is_cover:
+                    previous_focus_terms = set(current_focus_terms)
                     try:
                         if os.path.exists(image_url):
                             with open(image_url, "rb") as f:
