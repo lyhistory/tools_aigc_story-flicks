@@ -252,13 +252,18 @@ async def create_video_with_scenes(
             return []
         return [m.group(0) for m in re.finditer(r"[A-Za-z]+(?:'[A-Za-z]+)?|\d+", text)]
 
-    def load_karaoke_words(words_file: str) -> list[dict]:
+    def load_karaoke_words(words_file: str) -> tuple[list[dict], str]:
         if not os.path.exists(words_file):
-            return []
+            return [], "unknown"
         try:
             with open(words_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
             words = data.get("words", []) if isinstance(data, dict) else []
+            timing_quality = (
+                str(data.get("timing_quality", "unknown")).strip().lower()
+                if isinstance(data, dict)
+                else "unknown"
+            )
             out = []
             for w in words:
                 if not isinstance(w, dict):
@@ -271,10 +276,10 @@ async def create_video_with_scenes(
                 if end <= start:
                     end = start + 0.03
                 out.append({"word": word, "start": start, "end": end})
-            return out
+            return out, timing_quality
         except Exception as e:
             logger.warning(f"Failed to load karaoke words from {words_file}: {e}")
-            return []
+            return [], "unknown"
 
     def find_keyword_in_text(text: str, keywords: list) -> dict:
         if not text or not keywords:
@@ -667,7 +672,16 @@ async def create_video_with_scenes(
                     is_sequence_scene = (getattr(scene, "topic_type", None) == "sequence") and not is_cover_scene
                     sequence_timing_enabled = is_sequence_scene
                     words_file = os.path.join(task_dir, f"{i}.words.json")
-                    karaoke_words_all = load_karaoke_words(words_file) if (karaoke_enabled or sequence_timing_enabled) else []
+                    karaoke_words_all: list[dict] = []
+                    karaoke_timing_quality = "unknown"
+                    if karaoke_enabled or sequence_timing_enabled:
+                        karaoke_words_all, karaoke_timing_quality = load_karaoke_words(words_file)
+                    if karaoke_enabled and not is_sequence_scene and karaoke_timing_quality != "precise":
+                        logger.info(
+                            f"Scene {i}: disabling word-by-word karaoke highlight "
+                            f"because timing quality is '{karaoke_timing_quality}'"
+                        )
+                        karaoke_enabled = False
                     karaoke_word_ptr = 0
                     cover_text = (getattr(scene, "subject", None) or "").strip()
                     if not cover_text and is_cover_scene:

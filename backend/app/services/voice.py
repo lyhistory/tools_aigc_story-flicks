@@ -146,15 +146,27 @@ def karaoke_tokenize(text: str) -> list[str]:
         return []
     return [m.group(0) for m in KARAOKE_WORD_PATTERN.finditer(text)]
 
-def _write_karaoke_words_file(subtitle_file: str, provider: str, words: list[dict]) -> None:
+def _write_karaoke_words_file(
+    subtitle_file: str,
+    provider: str,
+    words: list[dict],
+    *,
+    timing_source: str = "unknown",
+    timing_quality: str = "approx",
+) -> None:
     words_file = os.path.splitext(subtitle_file)[0] + ".words.json"
     payload = {
         "provider": provider,
+        "timing_source": timing_source,
+        "timing_quality": timing_quality,
         "words": words,
     }
     with open(words_file, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
-    logger.info(f"Karaoke words saved: {words_file} ({len(words)} words)")
+    logger.info(
+        f"Karaoke words saved: {words_file} ({len(words)} words) "
+        f"| source={timing_source} quality={timing_quality}"
+    )
 
 def _karaoke_words_from_subtitle(subtitle_file: str) -> list[dict]:
     words: list[dict] = []
@@ -1613,13 +1625,25 @@ async def gtts_voice(
                 )
             build_srt_from_word_timings(words, subtitle_file)
             if karaoke or sequence_mode:
-                _write_karaoke_words_file(subtitle_file, "gtts", words)
+                _write_karaoke_words_file(
+                    subtitle_file,
+                    "gtts",
+                    words,
+                    timing_source="token_synth",
+                    timing_quality="precise",
+                )
             return
 
         build_srt_from_audio(audio, clean_text, subtitle_file)
         if karaoke:
             words = _karaoke_words_from_subtitle(subtitle_file)
-            _write_karaoke_words_file(subtitle_file, "gtts", words)
+            _write_karaoke_words_file(
+                subtitle_file,
+                "gtts",
+                words,
+                timing_source="subtitle_derived",
+                timing_quality="approx",
+            )
     except Exception as e:
         logger.error(f"gTTS failed: {str(e)}")
         raise
@@ -1686,7 +1710,13 @@ async def google_cloud_tts_voice(
         combined.export(voice_file, format="mp3")
         build_srt_from_word_timings(words, subtitle_file)
         if karaoke or sequence_mode:
-            _write_karaoke_words_file(subtitle_file, "google-tts", words)
+            _write_karaoke_words_file(
+                subtitle_file,
+                "google-tts",
+                words,
+                timing_source="token_synth",
+                timing_quality="precise",
+            )
         return
 
     response = None
@@ -1720,6 +1750,8 @@ async def google_cloud_tts_voice(
     if karaoke:
         audio_duration = max(0.0, len(audio) / 1000.0)
         words: list[dict] = []
+        timing_source = "ssml_mark"
+        timing_quality = "precise"
         timepoints = getattr(response, "timepoints", None) or []
         timeline: list[tuple[int, float]] = []
         for tp in timepoints:
@@ -1749,7 +1781,15 @@ async def google_cloud_tts_voice(
                 "Google TTS returned no SSML mark timepoints; falling back to subtitle-derived karaoke timings."
             )
             words = _karaoke_words_from_subtitle(subtitle_file)
-        _write_karaoke_words_file(subtitle_file, "google-tts", words)
+            timing_source = "subtitle_derived"
+            timing_quality = "approx"
+        _write_karaoke_words_file(
+            subtitle_file,
+            "google-tts",
+            words,
+            timing_source=timing_source,
+            timing_quality=timing_quality,
+        )
 
 async def edge_tts_voice_notwork(
     text: str,
@@ -1812,9 +1852,19 @@ async def edge_tts_voice_notwork(
         if sub_maker:
             await generate_subtitle(sub_maker, text, subtitle_file)
             if karaoke:
+                timing_source = "word_boundary"
+                timing_quality = "precise"
                 if not karaoke_words:
                     karaoke_words = _karaoke_words_from_subtitle(subtitle_file)
-                _write_karaoke_words_file(subtitle_file, "edge-tts", karaoke_words)
+                    timing_source = "subtitle_derived"
+                    timing_quality = "approx"
+                _write_karaoke_words_file(
+                    subtitle_file,
+                    "edge-tts",
+                    karaoke_words,
+                    timing_source=timing_source,
+                    timing_quality=timing_quality,
+                )
         else:
             logger.error("Failed to generate sub_maker")
     except Exception as e:
