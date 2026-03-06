@@ -46,9 +46,15 @@ PUNCTUATIONS = [
     "...",
 ]
 
-def split_string_by_punctuations(s):
+def split_string_by_punctuations(s, split_minor_punct: bool = True):
     result = []
     txt = ""
+    if split_minor_punct:
+        active_punctuations = PUNCTUATIONS
+    else:
+        # Subtitle segmentation should prefer sentence-level chunks to reduce
+        # visible lag (avoid splitting on commas/colons/semicolons).
+        active_punctuations = ["?", ".", "!", "…", "？", "。", "！", "..."]
 
     previous_char = ""
     next_char = ""
@@ -69,7 +75,7 @@ def split_string_by_punctuations(s):
             txt += char
             continue
 
-        if char not in PUNCTUATIONS:
+        if char not in active_punctuations:
             txt += char
         else:
             if txt.strip():  # 只有在非空的情况下才添加
@@ -85,6 +91,10 @@ def split_string_by_punctuations(s):
     
     result = list(filter(is_valid_segment, result))
     return result
+
+
+def split_text_for_subtitles(s: str) -> list[str]:
+    return split_string_by_punctuations(s, split_minor_punct=False)
 
 def sanitize_text_for_tts(raw_text: str) -> str:
     if not raw_text:
@@ -194,7 +204,7 @@ def build_srt_from_audio(audio: AudioSegment, clean_text: str, subtitle_file: st
     total_duration_ms = len(audio)
     total_duration_s = total_duration_ms / 1000.0
     nonsilent_chunks = detect_nonsilent(audio, min_silence_len=400, silence_thresh=-40)
-    lines = split_string_by_punctuations(clean_text)
+    lines = split_text_for_subtitles(clean_text)
     num_lines = len(lines)
 
     def normalize_srt_times(time_pairs, total_s, min_gap=0.05, min_dur=0.25):
@@ -1735,6 +1745,9 @@ async def google_cloud_tts_voice(
                 }
             )
         if not words:
+            logger.warning(
+                "Google TTS returned no SSML mark timepoints; falling back to subtitle-derived karaoke timings."
+            )
             words = _karaoke_words_from_subtitle(subtitle_file)
         _write_karaoke_words_file(subtitle_file, "google-tts", words)
 
@@ -1875,7 +1888,7 @@ async def create_subtitle(sub_maker: edge_tts.SubMaker, text: str, subtitle_file
     sub_items = []
     sub_index = 0
 
-    script_lines = split_string_by_punctuations(text)
+    script_lines = split_text_for_subtitles(text)
     logger.debug(f"Split text into {len(script_lines)} lines: {script_lines}")
 
     def match_line(_sub_line: str, _sub_index: int):
