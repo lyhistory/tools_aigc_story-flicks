@@ -158,10 +158,10 @@ async def create_video_with_scenes(
         voice_rate: float, 
         language: str = "en-US",
         voice_provider: str = "gtts",
-        karaoke: bool = False,
+        karaoke: bool = True,
         test_mode: bool = False,
         resolution: str = None,
-        chinese_subtitle_enabled: bool = False) -> str:
+        chinese_subtitle_enabled: bool = True) -> str:
     """创建带有场景的视频
 
     Args:
@@ -1093,8 +1093,8 @@ async def generate_video(request: VideoGenerateRequest):
             voice_rate=request.voice_rate,
             language=request.language,
             voice_provider=getattr(request, "voice_provider", "gtts"),
-            karaoke=getattr(request, "karaoke", False),
-            chinese_subtitle_enabled=getattr(request, "chinese_subtitle_enabled", False),
+            karaoke=getattr(request, "karaoke", True),
+            chinese_subtitle_enabled=getattr(request, "chinese_subtitle_enabled", True),
             test_mode=request.test_mode,
             resolution=request.resolution,
         )

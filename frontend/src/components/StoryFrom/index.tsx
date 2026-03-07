@@ -60,6 +60,8 @@ const App: React.FC = () => {
                     image_llm_model: res.image_llm_model,
                     resolution: res.resolution || '1080*1920', // fallback
                     avoid_exact_counts: true,
+                    karaoke: true,
+                    chinese_subtitle_enabled: true,
                     text_llm_provider: res.text_llm_provider || res.textLLMProviders?.[0],
                     image_llm_provider: res.image_llm_provider || res.imageLLMProviders?.[0],
                     learner_age: '3-5',
@@ -146,7 +148,7 @@ const App: React.FC = () => {
                     labelCol={{ span: 8 }}
                     wrapperCol={{ span: 16 }}
                     style={{ minWidth: 600, justifyContent: 'flex-start' }}
-                    initialValues={{ remember: true }}
+                    initialValues={{ remember: true, karaoke: true, chinese_subtitle_enabled: true }}
                     onFinish={onFinish}
                     onFinishFailed={onFinishFailed}
                     autoComplete="off"
@@ -294,7 +296,7 @@ const App: React.FC = () => {
                         label="Karaoke"
                         name="karaoke"
                         valuePropName="checked"
-                        initialValue={false}
+                        initialValue={true}
                     >
                         <Switch />
                     </Form.Item>
@@ -302,7 +304,7 @@ const App: React.FC = () => {
                         label={t('storyForm.chineseSubtitle')}
                         name="chinese_subtitle_enabled"
                         valuePropName="checked"
-                        initialValue={false}
+                        initialValue={true}
                     >
                         <Switch />
                     </Form.Item>

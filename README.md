@@ -1,5 +1,9 @@
 English | [简体中文](./README-CN.md)
 
+## Free Resources
+[cloudflare image model](https://developers.cloudflare.com/workers-ai/models)
+[nvidia text model](https://build.nvidia.com/meta/llama-3_1-8b-instruct)
+
 ## Project Description
 
 This project allows users to input a story theme and generates a story video using a large language model. The video includes AI-generated images, story content, audio, and subtitles.
