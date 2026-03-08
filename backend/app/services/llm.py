@@ -98,6 +98,68 @@ class LLMService:
         return re.sub(r"\s+", " ", str(text)).strip()
 
     @staticmethod
+    def _extract_color_terms(text: str) -> List[str]:
+        if not text:
+            return []
+        source = str(text).lower().replace("’", "'")
+        # Keep list small and practical for kid-learning prompts.
+        color_terms = [
+            "light blue", "dark blue", "sky blue", "navy blue",
+            "light green", "dark green",
+            "red", "blue", "green", "yellow", "orange", "purple",
+            "pink", "brown", "black", "white", "gray", "grey",
+            "gold", "silver",
+        ]
+        found: List[str] = []
+        for term in color_terms:
+            if re.search(rf"\b{re.escape(term)}\b", source) and term not in found:
+                found.append(term)
+        return found
+
+    @staticmethod
+    def _extract_shape_terms(text: str) -> List[str]:
+        if not text:
+            return []
+        source = str(text).lower().replace("’", "'")
+        shape_terms = [
+            "round", "circular", "square", "rectangular",
+            "triangle", "triangular", "oval",
+            "sphere", "spherical", "cube", "cylindrical",
+            "star-shaped", "heart-shaped",
+        ]
+        found: List[str] = []
+        for term in shape_terms:
+            if re.search(rf"\b{re.escape(term)}\b", source) and term not in found:
+                found.append(term)
+        return found
+
+    @classmethod
+    def _extract_attribute_phrases(cls, text: str, limit: int = 8) -> List[str]:
+        if not text:
+            return []
+        source = cls._collapse_prompt_whitespace(str(text).lower().replace("’", "'"))
+        color_base = [
+            "red", "blue", "green", "yellow", "orange", "purple",
+            "pink", "brown", "black", "white", "gray", "grey", "gold", "silver",
+        ]
+        color_group = "|".join([re.escape(c) for c in color_base])
+        patterns = [
+            rf"\b(?:light|dark|bright|pale)?\s*(?:{color_group})\s+[a-z][a-z-]*\b",
+            r"\b(?:round|circular|square|rectangular|triangle|triangular|oval|spherical|cylindrical)\s+[a-z][a-z-]*\b",
+            r"\b(?:big|small|large|tiny|huge|long|short|wide|narrow|thick|thin)\s+[a-z][a-z-]*\b",
+            r"\b(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+[a-z][a-z-]*\b",
+        ]
+        out: List[str] = []
+        for pattern in patterns:
+            for m in re.finditer(pattern, source, flags=re.I):
+                phrase = cls._collapse_prompt_whitespace(m.group(0))
+                if phrase and phrase not in out:
+                    out.append(phrase)
+                    if len(out) >= limit:
+                        return out
+        return out
+
+    @staticmethod
     def _normalize_claim_part(text: str) -> str:
         if not text:
             return ""
@@ -544,6 +606,10 @@ class LLMService:
             "\n        11. Scene alignment rule: each scene_prompt must depict the same main subjects/actions "
             "as that scene's script, and must not swap entities with other scenes."
         )
+        extra_requirements += (
+            "\n        12. In each scene_prompt, explicitly preserve key object attributes when present "
+            "(color, shape, size, material, and count). Do not change these attributes."
+        )
         source_claim_lines = [
             self._collapse_prompt_whitespace(c)
             for c in re.split(r"[.!?;,\n]+", request.story_prompt or "")
@@ -552,14 +618,14 @@ class LLMService:
         if source_claim_lines:
             fixed_claims = "\n".join([f"        - {line}" for line in source_claim_lines[:10]])
             extra_requirements += (
-                "\n        12. Be logically consistent with the source topic. "
+                "\n        13. Be logically consistent with the source topic. "
                 "Never reverse positive/negative meaning of any source claim."
-                "\n        13. If you mention a source claim, keep its truth value exactly as provided."
-                f"\n        14. Fixed source claims:\n{fixed_claims}"
+                "\n        14. If you mention a source claim, keep its truth value exactly as provided."
+                f"\n        15. Fixed source claims:\n{fixed_claims}"
             )
         if request.language in {Language.ENGLISH_EN, Language.ENGLISH_US, Language.ENGLISH_FIXED}:
             extra_requirements += (
-                "\n        15. If user verb style is grammatical (e.g., \"have got\"), "
+                "\n        16. If user verb style is grammatical (e.g., \"have got\"), "
                 "prefer keeping that style in scripts."
             )
 
@@ -677,10 +743,13 @@ class LLMService:
             style_prefix = (
                 "Bright, simple, friendly children's illustration, clean shapes, pastel colors, "
                 "clear objects for teaching, no realism, no horror. "
+                "Preserve object attributes exactly as requested (color, shape, size, count, material). "
             )
             prompt_lc = prompt.lower()
             role_constraints = ""
             role_neg_terms = []
+            color_terms = self._extract_color_terms(prompt_lc)
+            shape_terms = self._extract_shape_terms(prompt_lc)
             has_father = bool(re.search(r"\b(father|dad|daddy)\b", prompt_lc))
             has_mother = bool(re.search(r"\b(mother|mom|mommy)\b", prompt_lc))
             if has_father and not has_mother:
@@ -692,21 +761,37 @@ class LLMService:
 
             neg_style_base = (
                 "photorealistic, horror, creepy, scary, gore, deformed, mutated, "
-                "animal-human hybrid, extra limbs, distorted anatomy, uncanny, low quality"
+                "animal-human hybrid, extra limbs, distorted anatomy, uncanny, low quality, "
+                "wrong object color, color mismatch, incorrect shape"
             )
             neg_style = neg_style_base + (", " + ", ".join(role_neg_terms) if role_neg_terms else "")
+            attr_constraints = [
+                "Strict attribute fidelity: obey explicitly requested object attributes exactly.",
+                "Keep color, shape, size, count, and material exactly as specified.",
+                "Do not swap to different colors.",
+            ]
+            if color_terms:
+                attr_constraints.append(
+                    f"Required colors: {', '.join(color_terms[:8])}. Do not replace them with other colors."
+                )
+            if shape_terms:
+                attr_constraints.append(
+                    f"Required shapes/forms: {', '.join(shape_terms[:8])}. Keep these shapes."
+                )
+            attr_constraints_text = " ".join(attr_constraints)
             # 添加安全提示词
             safe_prompt = (
                 "Create a safe, family-friendly illustration. "
                 f"{prompt} "
                 f"{role_constraints} "
+                f"{attr_constraints_text} "
                 "The image should be appropriate for all ages, non-violent, and non-controversial."
             )
             safe_prompt = self._collapse_prompt_whitespace(safe_prompt)
             
             if image_llm_provider == "aliyun":
                 rsp = ImageSynthesis.call(model=image_llm_model,
-                              prompt=prompt,
+                              prompt=safe_prompt,
                               size=resolution,)
                 if rsp.status_code == HTTPStatus.OK:
                     # print("aliyun image response", rsp.output)
@@ -1465,6 +1550,11 @@ class LLMService:
             script_text = self._collapse_prompt_whitespace(segment.get("script", "") or "")
             script_terms = extract_focus_terms(script_text, limit=8)
             object_terms = extract_focus_terms_from_objects(segment.get("objects", []), limit=8)
+            raw_objects = [
+                self._collapse_prompt_whitespace(str(o))
+                for o in (segment.get("objects", []) or [])
+                if self._collapse_prompt_whitespace(str(o))
+            ]
             current_terms: List[str] = []
             seen_terms = set()
             for term in script_terms + object_terms:
@@ -1483,14 +1573,27 @@ class LLMService:
                         continue
                     avoid_terms.append(term)
 
+            attr_specs: List[str] = []
+            attr_token_regex = r"\b(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|red|blue|green|yellow|orange|purple|pink|brown|black|white|gray|grey|gold|silver|round|circular|square|rectangular|triangle|triangular|oval|sphere|spherical|cube|cylindrical|big|small|large|tiny|huge|long|short|wide|narrow|thick|thin)\b"
+            for obj in raw_objects:
+                if re.search(attr_token_regex, obj.lower()) and obj not in attr_specs:
+                    attr_specs.append(obj)
+            for phrase in self._extract_attribute_phrases(script_text, limit=8):
+                if phrase not in attr_specs:
+                    attr_specs.append(phrase)
+
             guard_lines = [
                 f"Narration for this exact scene: {script_text}",
                 "Strict visual matching rules:",
                 "- Depict only what belongs to this scene narration and this scene prompt.",
                 "- Do not swap entities between scenes.",
+                "- Preserve all stated attributes exactly: color, shape, size, count, and material.",
+                "- Never substitute specified colors (example: if prompt says blue ball, it must stay blue, not black).",
             ]
             if current_terms:
                 guard_lines.append(f"- Main subjects/objects to include: {', '.join(current_terms[:8])}.")
+            if attr_specs:
+                guard_lines.append(f"- Exact object specs to preserve: {', '.join(attr_specs[:8])}.")
             if avoid_terms:
                 guard_lines.append(f"- Avoid subjects from other scenes: {', '.join(avoid_terms[:8])}.")
             if variation_hint:
