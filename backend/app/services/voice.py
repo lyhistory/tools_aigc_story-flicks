@@ -195,7 +195,66 @@ def _karaoke_words_from_subtitle(subtitle_file: str) -> list[dict]:
         logger.warning(f"Failed to build fallback karaoke timings from subtitle: {e}")
     return words
 
+# ---------------------------------------------------------------------------
+# Whisper forced-alignment helper
+# ---------------------------------------------------------------------------
+_whisper_model_cache: dict = {}  # model_size -> WhisperModel instance
+
+def _get_whisper_model(model_size: str = "tiny"):
+    """Lazy-load and cache a faster-whisper model (CPU, int8)."""
+    if model_size not in _whisper_model_cache:
+        try:
+            from faster_whisper import WhisperModel
+            logger.info(f"Loading faster-whisper model '{model_size}' (first load, may download ~75MB)…")
+            _whisper_model_cache[model_size] = WhisperModel(model_size, device="cpu", compute_type="int8")
+            logger.info(f"faster-whisper model '{model_size}' ready")
+        except Exception as e:
+            logger.warning(f"faster-whisper unavailable: {e}")
+            _whisper_model_cache[model_size] = None
+    return _whisper_model_cache[model_size]
+
+
+def _whisper_align_words(audio_path: str, expected_text: str, model_size: str = "tiny") -> list[dict] | None:
+    """
+    Transcribe *audio_path* with faster-whisper and return word-level timings.
+
+    Returns a list of {"word": str, "start": float, "end": float} dicts that
+    match the tokens in *expected_text*, or None if Whisper is unavailable or
+    the transcription produces no words.
+    """
+    model = _get_whisper_model(model_size)
+    if model is None:
+        return None
+    try:
+        segments, _ = model.transcribe(
+            audio_path,
+            word_timestamps=True,
+            language="en",
+            beam_size=1,         # fastest inference
+            vad_filter=False,    # we trust the audio to be speech
+        )
+        words: list[dict] = []
+        for seg in segments:
+            for w in (seg.words or []):
+                token = (w.word or "").strip()
+                if token:
+                    words.append({
+                        "word": token,
+                        "start": round(float(w.start), 4),
+                        "end": round(float(w.end), 4),
+                    })
+        if not words:
+            logger.warning("faster-whisper returned 0 words for the audio")
+            return None
+        logger.info(f"faster-whisper aligned {len(words)} words from '{audio_path}'")
+        return words
+    except Exception as e:
+        logger.warning(f"faster-whisper alignment failed: {e}")
+        return None
+
+
 def _build_google_ssml_with_marks(text: str) -> tuple[str, list[str]]:
+
     marks: list[str] = []
     parts: list[str] = []
     last = 0
@@ -1768,57 +1827,7 @@ async def google_cloud_tts_voice(
             )
         return
 
-    # --- Per-word synthesis for precise karaoke timing (works for all modes) ---
-    # We synthesize each word individually, stitch with short pauses, and record
-    # exact start/end timestamps — guaranteed 'precise' timing regardless of voice.
-    if karaoke:
-        logger.info("Google TTS: using per-word synthesis for precise karaoke timing")
-        word_tokens = [m.group(0) for m in KARAOKE_WORD_PATTERN.finditer(clean_text or "")]
-        if not word_tokens:
-            word_tokens = split_string_by_punctuations(clean_text)
-        inter_word_pause_ms = 80  # brief natural pause between synthesised segments
-        combined = AudioSegment.empty()
-        cursor_ms = 0
-        words: list[dict] = []
-        for w_idx, token in enumerate(word_tokens):
-            token_clean = sanitize_text_for_tts(token)
-            if not token_clean:
-                continue
-            try:
-                resp = client.synthesize_speech(
-                    input=texttospeech.SynthesisInput(text=token_clean),
-                    voice=voice,
-                    audio_config=audio_config,
-                )
-                seg = AudioSegment.from_file(io.BytesIO(resp.audio_content), format="mp3")
-            except Exception as e:
-                logger.warning(f"Google TTS per-word synthesis failed for '{token}': {e}")
-                # Use minimal silence placeholder so indexes stay aligned
-                seg = AudioSegment.silent(duration=200)
-            seg_start_ms = cursor_ms
-            combined += seg
-            cursor_ms += len(seg)
-            seg_end_ms = cursor_ms
-            words.append({
-                "word": token,
-                "start": round(seg_start_ms / 1000.0, 4),
-                "end": round(max((seg_start_ms + 30) / 1000.0, seg_end_ms / 1000.0), 4),
-            })
-            if w_idx < len(word_tokens) - 1:
-                combined += AudioSegment.silent(duration=inter_word_pause_ms)
-                cursor_ms += inter_word_pause_ms
-        combined.export(voice_file, format="mp3")
-        build_srt_from_lines_and_words(clean_text, words, subtitle_file)
-        _write_karaoke_words_file(
-            subtitle_file,
-            "google-tts",
-            words,
-            timing_source="per_word_synth",
-            timing_quality="precise",
-        )
-        return
-
-    # --- Plain synthesis (no karaoke) ---
+    # --- Single synthesis for natural prosody ---
     synthesis_input = texttospeech.SynthesisInput(text=clean_text)
     response = client.synthesize_speech(
         input=synthesis_input,
@@ -1827,8 +1836,76 @@ async def google_cloud_tts_voice(
     )
     with open(voice_file, "wb") as out:
         out.write(response.audio_content)
-    audio = AudioSegment.from_mp3(voice_file)
-    build_srt_from_audio(audio, clean_text, subtitle_file)
+
+    # --- Non-karaoke: build SRT from audio silence detection and return ---
+    if not karaoke:
+        audio = AudioSegment.from_mp3(voice_file)
+        build_srt_from_audio(audio, clean_text, subtitle_file)
+        return
+
+    # --- Karaoke: try Whisper forced alignment first (best quality) ---
+    logger.info("Google TTS: attempting Whisper forced alignment for karaoke timing")
+    whisper_words = _whisper_align_words(voice_file, clean_text)
+
+    if whisper_words:
+        # Whisper success — build precise SRT and karaoke file
+        build_srt_from_lines_and_words(clean_text, whisper_words, subtitle_file)
+        _write_karaoke_words_file(
+            subtitle_file,
+            "google-tts",
+            whisper_words,
+            timing_source="whisper_align",
+            timing_quality="precise",
+        )
+        logger.info(f"Karaoke timing: whisper_align, {len(whisper_words)} words")
+        return
+
+    # --- Fallback: per-word synthesis (slower but always precise) ---
+    logger.warning("Whisper unavailable, falling back to per-word synthesis for karaoke timing")
+    word_tokens = [m.group(0) for m in KARAOKE_WORD_PATTERN.finditer(clean_text or "")]
+    if not word_tokens:
+        word_tokens = split_string_by_punctuations(clean_text)
+    inter_word_pause_ms = 80
+    combined = AudioSegment.empty()
+    cursor_ms = 0
+    words_fallback: list[dict] = []
+    for w_idx, token in enumerate(word_tokens):
+        token_clean = sanitize_text_for_tts(token)
+        if not token_clean:
+            continue
+        try:
+            resp = client.synthesize_speech(
+                input=texttospeech.SynthesisInput(text=token_clean),
+                voice=voice,
+                audio_config=audio_config,
+            )
+            seg = AudioSegment.from_file(io.BytesIO(resp.audio_content), format="mp3")
+        except Exception as e:
+            logger.warning(f"per-word TTS failed for '{token}': {e}")
+            seg = AudioSegment.silent(duration=200)
+        seg_start_ms = cursor_ms
+        combined += seg
+        cursor_ms += len(seg)
+        seg_end_ms = cursor_ms
+        words_fallback.append({
+            "word": token,
+            "start": round(seg_start_ms / 1000.0, 4),
+            "end": round(max((seg_start_ms + 30) / 1000.0, seg_end_ms / 1000.0), 4),
+        })
+        if w_idx < len(word_tokens) - 1:
+            combined += AudioSegment.silent(duration=inter_word_pause_ms)
+            cursor_ms += inter_word_pause_ms
+    combined.export(voice_file, format="mp3")
+    build_srt_from_lines_and_words(clean_text, words_fallback, subtitle_file)
+    _write_karaoke_words_file(
+        subtitle_file,
+        "google-tts",
+        words_fallback,
+        timing_source="per_word_synth",
+        timing_quality="precise",
+    )
+
+
 
 
 async def edge_tts_voice_notwork(

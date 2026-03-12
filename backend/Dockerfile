@@ -11,8 +11,8 @@ COPY backend/requirements.txt /app/
 RUN pip config set global.index-url https://mirrors.aliyun.com/pypi/simple/ \
     && pip install --no-cache-dir -r requirements.txt
 
-# Install ffmpeg (includes ffprobe)
-RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
+# Install ffmpeg (includes ffprobe) and libsndfile1 (required by faster-whisper / CTranslate2)
+RUN apt-get update && apt-get install -y ffmpeg libsndfile1 && rm -rf /var/lib/apt/lists/*
 
 # 复制整个后端项目到容器
 COPY backend /app/
