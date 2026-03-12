@@ -49,6 +49,7 @@ interface StoryScene {
     objects: string[];
     keywords: { word: string;[key: string]: any }[];
     url?: string;
+    extra_images?: string[];
     is_cover?: boolean;
     subject?: string;
     topic_type?: string;

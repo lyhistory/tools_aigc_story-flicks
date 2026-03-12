@@ -45,7 +45,17 @@ const DEFAULT_FONT_SIZE = 58;
 const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
     taskId, scenes: initialScenes, resolution, chineseSubtitleEnabled, karaoke, onClose
 }) => {
-    const [scenes, setScenes] = useState<StoryScene[]>(initialScenes);
+    const [scenes, setScenes] = useState<StoryScene[]>(() =>
+        initialScenes.map(s => ({ ...s, extra_images: s.extra_images || [] }))
+    );
+    // Snapshot of the ORIGINAL scene images (taken at mount) — used in reuse modal
+    // so swapping scene 1 & 2 still shows scene 1's original image.
+    const [originalImages] = useState<{ idx: number; url: string }[]>(() =>
+        initialScenes
+            .map((s, i) => s.url ? { idx: i, url: s.url } : null)
+            .filter(Boolean) as { idx: number; url: string }[]
+    );
+
     const { setVideoUrl, assembling, setAssembling } = useVideoStore();
     const [regeneratingIndexes, setRegeneratingIndexes] = useState<Record<number, boolean>>({});
 
@@ -58,6 +68,8 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
     // Reuse Image Modal State
     const [reuseModalVisible, setReuseModalVisible] = useState(false);
     const [targetSceneIdx, setTargetSceneIdx] = useState<number | null>(null);
+    // 'replace-primary' = replace scene's main image; 'add-extra' = add to extras list
+    const [reuseMode, setReuseMode] = useState<'replace-primary' | 'add-extra'>('replace-primary');
 
     useEffect(() => {
         getSubtitleFonts().then(res => {
@@ -67,7 +79,6 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
                 if (def) setSelectedFont(def);
             }
         }).catch(() => {
-            // Fallback: use built-in list
             setFontOptions(Object.keys(FONT_STYLE_MAP).map(id => ({
                 id,
                 label: id.replace('NotoSans-', 'Noto Sans ').replace(/-/g, ' '),
@@ -76,20 +87,40 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
         });
     }, []);
 
-    const openReuseModal = (idx: number) => {
+    const openReuseModal = (idx: number, mode: 'replace-primary' | 'add-extra' = 'replace-primary') => {
         setTargetSceneIdx(idx);
+        setReuseMode(mode);
         setReuseModalVisible(true);
     };
 
     const handleReuseSelect = (sourceUrl: string) => {
         if (targetSceneIdx !== null && sourceUrl) {
-            const newScenes = [...scenes];
-            newScenes[targetSceneIdx].url = sourceUrl;
+            const newScenes = scenes.map((s, i) => {
+                if (i !== targetSceneIdx) return s;
+                if (reuseMode === 'add-extra') {
+                    return { ...s, extra_images: [...(s.extra_images || []), sourceUrl] };
+                }
+                return { ...s, url: sourceUrl };
+            });
             setScenes(newScenes);
-            message.success(`Image reused for Scene ${targetSceneIdx + 1}`);
+            message.success(
+                reuseMode === 'add-extra'
+                    ? `Extra image added to Scene ${targetSceneIdx + 1}`
+                    : `Image replaced for Scene ${targetSceneIdx + 1}`
+            );
         }
         setReuseModalVisible(false);
         setTargetSceneIdx(null);
+    };
+
+    const removeExtraImage = (sceneIdx: number, extraIdx: number) => {
+        const newScenes = scenes.map((s, i) => {
+            if (i !== sceneIdx) return s;
+            const extras = [...(s.extra_images || [])];
+            extras.splice(extraIdx, 1);
+            return { ...s, extra_images: extras };
+        });
+        setScenes(newScenes);
     };
 
     const handleDelete = (index: number) => {
@@ -274,26 +305,75 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
                 {scenes.map((scene, idx) => (
                     <Card key={idx} size="small" style={{ width: '100%' }}>
                         <div style={{ display: 'flex', gap: 16 }}>
-                            <div style={{ width: 120, height: 120, flexShrink: 0, background: '#e0e0e0', display: 'flex', justifyContent: 'center', alignItems: 'center', borderRadius: 4, overflow: 'hidden' }}>
-                                <Spin spinning={!!regeneratingIndexes[idx]}>
-                                    {scene.url ? (
-                                        <Image
-                                            src={scene.url}
-                                            alt={`Scene ${idx + 1}`}
-                                            width={120}
-                                            height={120}
-                                            style={{ objectFit: 'cover', display: 'block' }}
-                                            preview={{
-                                                mask: <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 12 }}>🔍 Preview</div>,
-                                            }}
-                                        />
-                                    ) : (
-                                        <div style={{ width: 120, height: 120, display: 'flex', justifyContent: 'center', alignItems: 'center' }}>
-                                            <FileImageOutlined style={{ fontSize: 24, color: '#999' }} />
-                                        </div>
-                                    )}
-                                </Spin>
+                            {/* Primary image */}
+                            <div style={{ flexShrink: 0 }}>
+                                <div style={{ fontSize: 11, color: '#888', marginBottom: 4 }}>Primary</div>
+                                <div style={{ width: 100, height: 100, background: '#e0e0e0', borderRadius: 4, overflow: 'hidden', position: 'relative' }}>
+                                    <Spin spinning={!!regeneratingIndexes[idx]}>
+                                        {scene.url ? (
+                                            <Image
+                                                src={scene.url}
+                                                alt={`Scene ${idx + 1}`}
+                                                width={100}
+                                                height={100}
+                                                style={{ objectFit: 'cover', display: 'block' }}
+                                                preview={{ mask: <div style={{ fontSize: 11, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>🔍</div> }}
+                                            />
+                                        ) : (
+                                            <div style={{ width: 100, height: 100, display: 'flex', justifyContent: 'center', alignItems: 'center' }}>
+                                                <FileImageOutlined style={{ fontSize: 24, color: '#999' }} />
+                                            </div>
+                                        )}
+                                    </Spin>
+                                </div>
                             </div>
+
+                            {/* Extra images strip */}
+                            {(scene.extra_images || []).map((url, exIdx) => (
+                                <div key={exIdx} style={{ flexShrink: 0 }}>
+                                    <div style={{ fontSize: 11, color: '#888', marginBottom: 4 }}>Extra {exIdx + 1}</div>
+                                    <div style={{ width: 100, height: 100, background: '#e0e0e0', borderRadius: 4, overflow: 'hidden', position: 'relative' }}>
+                                        <Image
+                                            src={url}
+                                            alt={`Scene ${idx + 1} extra ${exIdx + 1}`}
+                                            width={100}
+                                            height={100}
+                                            style={{ objectFit: 'cover', display: 'block' }}
+                                            preview={{ mask: <div style={{ fontSize: 11, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>🔍</div> }}
+                                        />
+                                        <Popconfirm title="Remove this extra image?" onConfirm={() => removeExtraImage(idx, exIdx)}>
+                                            <Button
+                                                size="small"
+                                                danger
+                                                type="text"
+                                                icon={<DeleteOutlined />}
+                                                style={{ position: 'absolute', top: 2, right: 2, background: 'rgba(255,255,255,0.8)', padding: '0 2px' }}
+                                            />
+                                        </Popconfirm>
+                                    </div>
+                                </div>
+                            ))}
+
+                            {/* Add extra image button */}
+                            <div style={{ flexShrink: 0, display: 'flex', flexDirection: 'column', justifyContent: 'flex-end' }}>
+                                <div style={{ fontSize: 11, color: 'transparent', marginBottom: 4 }}>-</div>
+                                <div
+                                    onClick={() => openReuseModal(idx, 'add-extra')}
+                                    style={{
+                                        width: 100, height: 100,
+                                        border: '2px dashed #d9d9d9', borderRadius: 4,
+                                        display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
+                                        cursor: 'pointer', color: '#aaa', fontSize: 12,
+                                        transition: 'border-color 0.15s',
+                                    }}
+                                    onMouseEnter={e => (e.currentTarget.style.borderColor = '#1677ff')}
+                                    onMouseLeave={e => (e.currentTarget.style.borderColor = '#d9d9d9')}
+                                >
+                                    <span style={{ fontSize: 20 }}>＋</span>
+                                    <span>Add Image</span>
+                                </div>
+                            </div>
+
                             <div style={{ flex: 1 }}>
                                 <div style={{ display: 'flex', justifyContent: 'space-between' }}>
                                     <Text strong>Scene {idx + 1} {scene.is_cover ? "(Cover)" : ""}</Text>
@@ -305,15 +385,15 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
                                             loading={!!regeneratingIndexes[idx]}
                                             onClick={() => handleRegenerateImage(idx, scene)}
                                         >
-                                            Regen Image
+                                            Regen
                                         </Button>
                                         <Button
                                             type="default"
                                             size="small"
                                             icon={<SwapOutlined />}
-                                            onClick={() => openReuseModal(idx)}
+                                            onClick={() => openReuseModal(idx, 'replace-primary')}
                                         >
-                                            Reuse...
+                                            Replace...
                                         </Button>
                                         <Popconfirm title="Delete this scene?" onConfirm={() => handleDelete(idx)}>
                                             <Button type="text" danger icon={<DeleteOutlined />} size="small" />
@@ -335,26 +415,33 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
             </div>
 
             <Modal
-                title={`Select an Image to Reuse for Scene ${(targetSceneIdx ?? 0) + 1}`}
+                title={
+                    reuseMode === 'add-extra'
+                        ? `Add Extra Image to Scene ${(targetSceneIdx ?? 0) + 1}`
+                        : `Replace Primary Image for Scene ${(targetSceneIdx ?? 0) + 1}`
+                }
                 open={reuseModalVisible}
                 onCancel={() => { setReuseModalVisible(false); setTargetSceneIdx(null); }}
                 footer={null}
-                width={700}
+                width={740}
             >
+                <Text type="secondary" style={{ display: 'block', marginBottom: 12 }}>
+                    {reuseMode === 'add-extra'
+                        ? 'Pick an image to add as an extra. The scene will cycle through images in order.'
+                        : 'Pick an image to replace the primary image for this scene.'}
+                </Text>
                 <div style={{ display: 'flex', flexWrap: 'wrap', gap: 16 }}>
-                    {scenes.map((s, i) => (
-                        s.url ? (
-                            <Card
-                                key={i}
-                                hoverable
-                                size="small"
-                                style={{ width: 150 }}
-                                onClick={() => handleReuseSelect(s.url!)}
-                                cover={<img alt={`Scene ${i + 1}`} src={s.url} style={{ height: 150, objectFit: 'cover' }} />}
-                            >
-                                <Card.Meta title={`Scene ${i + 1}`} />
-                            </Card>
-                        ) : null
+                    {originalImages.map(({ idx: srcIdx, url }) => (
+                        <Card
+                            key={srcIdx}
+                            hoverable
+                            size="small"
+                            style={{ width: 150 }}
+                            onClick={() => handleReuseSelect(url)}
+                            cover={<img alt={`Scene ${srcIdx + 1}`} src={url} style={{ height: 150, objectFit: 'cover' }} />}
+                        >
+                            <Card.Meta title={`Scene ${srcIdx + 1} (original)`} />
+                        </Card>
                     ))}
                 </div>
             </Modal>

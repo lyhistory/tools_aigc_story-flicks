@@ -665,17 +665,45 @@ async def render_final_video(
             if audio_clip.duration and audio_clip.duration > subtitle_duration:
                 subtitle_duration = audio_clip.duration
             # 创建图片剪辑（统一尺寸，避免拉伸/拼贴）
+            # --- Collect all image files for this scene (primary + extras) ---
+            extra_urls = list(getattr(scene, "extra_images", None) or [])
+            all_image_files: list[str] = [image_file]
+            tasks_root = os.path.dirname(task_dir)  # parent of task_dir
+            for ex_idx, ex_url in enumerate(extra_urls):
+                ex_local = None
+                if ex_url:
+                    # Try to resolve URL -> local path (same logic as reuse)
+                    rel = ex_url.split("/tasks/", 1)[-1] if "/tasks/" in ex_url else None
+                    if rel:
+                        candidate = os.path.join(tasks_root, rel.replace("/", os.sep))
+                        if os.path.exists(candidate):
+                            ex_local = candidate
+                if ex_local:
+                    all_image_files.append(ex_local)
+                else:
+                    logger.warning(f"Scene {i} extra_image[{ex_idx}] not found locally: {ex_url}")
+
+            n_images = len(all_image_files)
+            # Per-image duration (total scene time distributed evenly)
+            per_image_dur = subtitle_duration / n_images
+
+            # Build a base ImageClip for each image in the scene
             if target_w is None or target_h is None:
-                base_img = Image.open(image_file)
+                base_img = Image.open(all_image_files[0])
                 target_w, target_h = base_img.size
                 base_img.close()
-            bg_clip, fg_clip, origin_image_w, origin_image_h = build_image_clips(
-                image_file=image_file,
-                target_w=target_w,
-                target_h=target_h,
-                duration=subtitle_duration,
-                image_scale=1.2
-            )
+
+            # Build (bg_clip, fg_clip) pairs for each image
+            image_clips: list[tuple] = []
+            for img_file in all_image_files:
+                _bg, _fg, origin_image_w, origin_image_h = build_image_clips(
+                    image_file=img_file,
+                    target_w=target_w,
+                    target_h=target_h,
+                    duration=per_image_dur,
+                    image_scale=1.2
+                )
+                image_clips.append((_bg, _fg))
             # audio will be attached to the final composite clip
             # Fonts
             font_path = os.path.join(utils.resource_dir(), "fonts", "STHeitiLight.ttc")
@@ -933,24 +961,32 @@ async def render_final_video(
                                 logger.info(
                                     f"Keyword overlay added: {(kw.get('word') or '').strip()} for subtitle '{phrase}'"
                                 )
-                    base_clip = CompositeVideoClip([bg_clip, fg_clip], (origin_image_w, origin_image_h))
+                    # Build base composites for each image
+                    base_clips = [
+                        CompositeVideoClip([bg, fg], (origin_image_w, origin_image_h))
+                        for bg, fg in image_clips
+                    ]
                     if subtitle_items:
-                        logger.info(f"Subtitle items rendered for scene {i}: {len(subtitle_items)}")
+                        logger.info(f"Subtitle items rendered for scene {i}: {len(subtitle_items)} | images: {n_images}")
                         fps = 24
-                        # Bind per-scene objects in default args to avoid late-binding closure bugs
-                        # when clips are rendered later during final write.
-                        def make_frame(t, _base_clip=base_clip, _subtitle_items=subtitle_items):
-                            frame = _base_clip.get_frame(t)
+                        _per_dur = per_image_dur  # capture in closure
+                        _n = n_images
+                        def make_frame(t, _base_clips=base_clips, _subtitle_items=subtitle_items, _per_dur=_per_dur, _n=_n):
+                            # choose which image to show based on elapsed time
+                            img_idx = min(int(t / _per_dur), _n - 1)
+                            # remap t to local clip time (each sub-clip starts at 0)
+                            local_t = t - img_idx * _per_dur
+                            local_t = max(0.0, min(local_t, _per_dur - 1.0 / fps))
+                            frame = _base_clips[img_idx].get_frame(local_t)
                             return overlay_frame_with_subs(frame, t, _subtitle_items)
-                        # Render overlays on-demand to avoid keeping all frames in memory.
-                        # moviepy 2.x uses `frame_function`; some older variants used `make_frame`.
                         try:
                             video_clip = VideoClip(frame_function=make_frame, duration=subtitle_duration).with_fps(fps)
                         except TypeError:
                             video_clip = VideoClip(make_frame=make_frame, duration=subtitle_duration).with_fps(fps)
                     else:
                         logger.warning(f"No subtitle items rendered for scene {i}")
-                        video_clip = base_clip
+                        # concatenate the bare image clips
+                        video_clip = concatenate_videoclips(base_clips, method="compose")
                     clips.append(video_clip.with_audio(audio_clip))
                     logger.info(f"Added subtitles for scene {i}")
                 except Exception as e:

@@ -295,6 +295,7 @@ class StoryScene(BaseModel):
     objects: List[str] = Field(default_factory=list, description="场景中的关键对象")
     keywords: List[Dict[str, str]] = Field(default_factory=list, description="关键词与发音解释")
     url: Optional[str] = Field(default=None, description="生成的图片 URL")
+    extra_images: List[str] = Field(default_factory=list, description="Additional image URLs to cycle through in order during this scene")
     is_cover: Optional[bool] = Field(default=False, description="Whether this scene is a cover/title scene")
     subject: Optional[str] = Field(default=None, description="Optional cover subject")
     topic_type: Optional[TopicType] = Field(default=None, description="Topic type of this scene")
