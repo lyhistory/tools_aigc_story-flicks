@@ -43,13 +43,20 @@ interface VideoGenerateReq {
 // 假设 Language 和 ImageStyle 是其他接口或枚举
 type Language = "zh-CN" | "zh-TW" | "fixed-en-GB" | "en-GB" | "en-US" | "ja-JP" | "ko-KR";
 
+interface ImageSlot {
+    url: string;
+    sub_start?: number | null;  // 0-indexed SRT line, inclusive
+    sub_end?: number | null;    // 0-indexed SRT line, inclusive
+}
+
 interface StoryScene {
     script: string;
     scene_prompt: string;
     objects: string[];
     keywords: { word: string;[key: string]: any }[];
     url?: string;
-    extra_images?: string[];
+    extra_images?: string[];         // deprecated — use image_slots
+    image_slots?: ImageSlot[];
     is_cover?: boolean;
     subject?: string;
     topic_type?: string;

@@ -288,6 +288,13 @@ class BgmUploadResponse(BaseResponse):
 
 from app.models.const import StoryType, ImageStyle, TopicType
 
+class ImageSlot(BaseModel):
+    """One image slot within a scene, optionally bound to a subtitle line range."""
+    url: str = Field(description="Image URL (local task-relative or absolute)")
+    sub_start: Optional[int] = Field(default=None, description="0-indexed SRT line index start (inclusive)")
+    sub_end: Optional[int] = Field(default=None, description="0-indexed SRT line index end (inclusive)")
+
+
 class StoryScene(BaseModel):
     """故事场景"""
     script: str = Field(description="场景讲解脚本")
@@ -295,7 +302,8 @@ class StoryScene(BaseModel):
     objects: List[str] = Field(default_factory=list, description="场景中的关键对象")
     keywords: List[Dict[str, str]] = Field(default_factory=list, description="关键词与发音解释")
     url: Optional[str] = Field(default=None, description="生成的图片 URL")
-    extra_images: List[str] = Field(default_factory=list, description="Additional image URLs to cycle through in order during this scene")
+    extra_images: List[str] = Field(default_factory=list, description="[Deprecated] Use image_slots instead")
+    image_slots: List[ImageSlot] = Field(default_factory=list, description="Ordered image slots with optional subtitle line assignments")
     is_cover: Optional[bool] = Field(default=False, description="Whether this scene is a cover/title scene")
     subject: Optional[str] = Field(default=None, description="Optional cover subject")
     topic_type: Optional[TopicType] = Field(default=None, description="Topic type of this scene")

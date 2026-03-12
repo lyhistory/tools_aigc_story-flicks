@@ -664,46 +664,130 @@ async def render_final_video(
             audio_clip = AudioFileClip(audio_file)
             if audio_clip.duration and audio_clip.duration > subtitle_duration:
                 subtitle_duration = audio_clip.duration
-            # 创建图片剪辑（统一尺寸，避免拉伸/拼贴）
-            # --- Collect all image files for this scene (primary + extras) ---
-            extra_urls = list(getattr(scene, "extra_images", None) or [])
-            all_image_files: list[str] = [image_file]
-            tasks_root = os.path.dirname(task_dir)  # parent of task_dir
-            for ex_idx, ex_url in enumerate(extra_urls):
-                ex_local = None
-                if ex_url:
-                    # Try to resolve URL -> local path (same logic as reuse)
-                    rel = ex_url.split("/tasks/", 1)[-1] if "/tasks/" in ex_url else None
-                    if rel:
-                        candidate = os.path.join(tasks_root, rel.replace("/", os.sep))
-                        if os.path.exists(candidate):
-                            ex_local = candidate
-                if ex_local:
-                    all_image_files.append(ex_local)
-                else:
-                    logger.warning(f"Scene {i} extra_image[{ex_idx}] not found locally: {ex_url}")
+            raw_slots = list(getattr(scene, "image_slots", None) or [])
+            tasks_root = os.path.dirname(task_dir)
 
-            n_images = len(all_image_files)
-            # Per-image duration (total scene time distributed evenly)
-            per_image_dur = subtitle_duration / n_images
+            def _resolve_url_to_local(url: str) -> str | None:
+                """Try to map a frontend URL back to a local filesystem path."""
+                if not url:
+                    return None
+                # Already a local path
+                if os.path.exists(url):
+                    return url
+                # URL pattern: /tasks/<task_id>/<filename>
+                rel = url.split("/tasks/", 1)[-1] if "/tasks/" in url else None
+                if rel:
+                    candidate = os.path.join(tasks_root, rel.replace("/", os.sep))
+                    if os.path.exists(candidate):
+                        return candidate
+                return None
 
-            # Build a base ImageClip for each image in the scene
+            if raw_slots:
+                # Structured slots with optional subtitle assignments
+                resolved_slots: list[dict] = []
+                for slot in raw_slots:
+                    local_path = _resolve_url_to_local(str(slot.url))
+                    if local_path:
+                        resolved_slots.append({
+                            "path": local_path,
+                            "sub_start": slot.sub_start,
+                            "sub_end": slot.sub_end,
+                        })
+                    else:
+                        logger.warning(f"Scene {i}: image_slot URL not found locally: {slot.url}")
+                # Ensure primary image is always first if not already in slots
+                primary_paths = [s["path"] for s in resolved_slots]
+                if image_file not in primary_paths:
+                    resolved_slots.insert(0, {"path": image_file, "sub_start": None, "sub_end": None})
+            else:
+                # Fall back to old extra_images list (even split, no subtitle assignment)
+                extra_urls = list(getattr(scene, "extra_images", None) or [])
+                resolved_slots = [{"path": image_file, "sub_start": None, "sub_end": None}]
+                for ex_idx, ex_url in enumerate(extra_urls):
+                    local = _resolve_url_to_local(str(ex_url))
+                    if local:
+                        resolved_slots.append({"path": local, "sub_start": None, "sub_end": None})
+                    else:
+                        logger.warning(f"Scene {i} extra_image[{ex_idx}] not found: {ex_url}")
+
+            n_images = len(resolved_slots)
+
+            # --- Compute per-image time windows using SRT data ---
+            # subs is already loaded above; build a list of (start_s, end_s) per SRT line
+            srt_times = [(float(ta), float(tb)) for (ta, tb), _ in subs]  # 0-indexed
+
+            def _srt_window(sub_start, sub_end) -> tuple[float, float]:
+                """Return (start_s, end_s) spanning the given SRT line range."""
+                if not srt_times:
+                    return (0.0, subtitle_duration)
+                start_idx = max(0, int(sub_start)) if sub_start is not None else 0
+                end_idx = min(len(srt_times) - 1, int(sub_end)) if sub_end is not None else len(srt_times) - 1
+                return (srt_times[start_idx][0], srt_times[end_idx][1])
+
+            # Determine whether any slot has explicit subtitle assignments
+            has_assignments = any(
+                s["sub_start"] is not None or s["sub_end"] is not None
+                for s in resolved_slots
+            )
+
+            if has_assignments:
+                # Fill in gaps for slots without explicit assignments using remaining time
+                # First pass: assign explicit windows
+                windows: list[tuple[float, float] | None] = []
+                for slot in resolved_slots:
+                    if slot["sub_start"] is not None or slot["sub_end"] is not None:
+                        windows.append(_srt_window(slot["sub_start"], slot["sub_end"]))
+                    else:
+                        windows.append(None)
+
+                # Second pass: distribute unassigned slots among unaccounted time
+                assigned_ranges = [w for w in windows if w is not None]
+                covered = set()
+                for w in assigned_ranges:
+                    for idx, (ts, te) in enumerate(srt_times):
+                        if ts >= w[0] and te <= w[1] + 0.01:
+                            covered.add(idx)
+                unassigned_lines = [i for i in range(len(srt_times)) if i not in covered]
+
+                none_count = windows.count(None)
+                chunk = max(1, len(unassigned_lines) // max(1, none_count))
+                fill_idx = 0
+                for wi, w in enumerate(windows):
+                    if w is None:
+                        start_line = unassigned_lines[fill_idx] if fill_idx < len(unassigned_lines) else len(srt_times) - 1
+                        end_line = unassigned_lines[min(fill_idx + chunk - 1, len(unassigned_lines) - 1)] if fill_idx < len(unassigned_lines) else len(srt_times) - 1
+                        windows[wi] = _srt_window(start_line, end_line)
+                        fill_idx += chunk
+                image_time_windows = [(w or (0.0, subtitle_duration)) for w in windows]
+            else:
+                # No assignments — even split
+                per_dur = subtitle_duration / n_images
+                image_time_windows = [(i * per_dur, (i + 1) * per_dur) for i in range(n_images)]
+                # clamp last window to subtitle_duration
+                if image_time_windows:
+                    image_time_windows[-1] = (image_time_windows[-1][0], subtitle_duration)
+
+            all_image_files = [s["path"] for s in resolved_slots]
+
+            # Build a base ImageClip for each image
             if target_w is None or target_h is None:
                 base_img = Image.open(all_image_files[0])
                 target_w, target_h = base_img.size
                 base_img.close()
 
-            # Build (bg_clip, fg_clip) pairs for each image
+            # Build (bg_clip, fg_clip) pairs; duration is window length for each
             image_clips: list[tuple] = []
-            for img_file in all_image_files:
+            for img_file, (win_start, win_end) in zip(all_image_files, image_time_windows):
+                dur = max(0.1, win_end - win_start)
                 _bg, _fg, origin_image_w, origin_image_h = build_image_clips(
                     image_file=img_file,
                     target_w=target_w,
                     target_h=target_h,
-                    duration=per_image_dur,
+                    duration=dur,
                     image_scale=1.2
                 )
                 image_clips.append((_bg, _fg))
+
             # audio will be attached to the final composite clip
             # Fonts
             font_path = os.path.join(utils.resource_dir(), "fonts", "STHeitiLight.ttc")
@@ -969,14 +1053,23 @@ async def render_final_video(
                     if subtitle_items:
                         logger.info(f"Subtitle items rendered for scene {i}: {len(subtitle_items)} | images: {n_images}")
                         fps = 24
-                        _per_dur = per_image_dur  # capture in closure
-                        _n = n_images
-                        def make_frame(t, _base_clips=base_clips, _subtitle_items=subtitle_items, _per_dur=_per_dur, _n=_n):
-                            # choose which image to show based on elapsed time
-                            img_idx = min(int(t / _per_dur), _n - 1)
-                            # remap t to local clip time (each sub-clip starts at 0)
-                            local_t = t - img_idx * _per_dur
-                            local_t = max(0.0, min(local_t, _per_dur - 1.0 / fps))
+                        _windows = image_time_windows # capture in closure
+                        def make_frame(t, _base_clips=base_clips, _subtitle_items=subtitle_items, _windows=_windows):
+                            # find which window t falls into
+                            img_idx = 0
+                            for idx, (ws, we) in enumerate(_windows):
+                                if ws <= t <= we:
+                                    img_idx = idx
+                                    break
+                            else:
+                                if t > _windows[-1][1]:
+                                    img_idx = len(_windows) - 1
+
+                            # remap t to local clip time
+                            win_start, win_end = _windows[img_idx]
+                            local_t = t - win_start
+                            win_dur = win_end - win_start
+                            local_t = max(0.0, min(local_t, win_dur - 1.0 / fps))
                             frame = _base_clips[img_idx].get_frame(local_t)
                             return overlay_frame_with_subs(frame, t, _subtitle_items)
                         try:

@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
-import { Button, Card, Typography, Space, Popconfirm, message, Modal, Spin, Slider, Image } from 'antd';
-import { DeleteOutlined, FileImageOutlined, ReloadOutlined, SwapOutlined, CheckCircleFilled } from '@ant-design/icons';
+import { Button, Card, Typography, Space, Popconfirm, message, Modal, Slider, Image, Select, Badge } from 'antd';
+import { DeleteOutlined, ReloadOutlined, SwapOutlined, CheckCircleFilled } from '@ant-design/icons';
 import { assembleVideo, regenerateImage, getSubtitleFonts } from '../../services/index';
 import { useVideoStore } from '../../stores/index';
 
@@ -95,32 +95,67 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
 
     const handleReuseSelect = (sourceUrl: string) => {
         if (targetSceneIdx !== null && sourceUrl) {
-            const newScenes = scenes.map((s, i) => {
+            setScenes(prev => prev.map((s, i) => {
                 if (i !== targetSceneIdx) return s;
-                if (reuseMode === 'add-extra') {
-                    return { ...s, extra_images: [...(s.extra_images || []), sourceUrl] };
+                let newSlots = [...(s.image_slots || [])];
+                
+                // Initialize image_slots if empty, including primary
+                if (newSlots.length === 0 && s.url) {
+                    newSlots = [{ url: s.url, sub_start: null, sub_end: null }];
                 }
-                return { ...s, url: sourceUrl };
-            });
-            setScenes(newScenes);
+
+                if (reuseMode === 'add-extra') {
+                    newSlots.push({ url: sourceUrl, sub_start: null, sub_end: null });
+                } else {
+                    // Replace primary (slot 0)
+                    if (newSlots.length > 0) {
+                        newSlots[0] = { ...newSlots[0], url: sourceUrl };
+                    } else {
+                        newSlots = [{ url: sourceUrl, sub_start: null, sub_end: null }];
+                    }
+                }
+                
+                return { ...s, url: newSlots[0].url, image_slots: newSlots };
+            }));
+            
             message.success(
                 reuseMode === 'add-extra'
                     ? `Extra image added to Scene ${targetSceneIdx + 1}`
-                    : `Image replaced for Scene ${targetSceneIdx + 1}`
+                    : `Primary image replaced for Scene ${targetSceneIdx + 1}`
             );
         }
         setReuseModalVisible(false);
         setTargetSceneIdx(null);
     };
 
-    const removeExtraImage = (sceneIdx: number, extraIdx: number) => {
-        const newScenes = scenes.map((s, i) => {
+    const updateSlotRange = (sceneIdx: number, slotIdx: number, start: number | null, end: number | null) => {
+        setScenes(prev => prev.map((s, i) => {
             if (i !== sceneIdx) return s;
-            const extras = [...(s.extra_images || [])];
-            extras.splice(extraIdx, 1);
-            return { ...s, extra_images: extras };
-        });
-        setScenes(newScenes);
+            const newSlots = [...(s.image_slots || [])];
+            if (newSlots[slotIdx]) {
+                newSlots[slotIdx] = { ...newSlots[slotIdx], sub_start: start, sub_end: end };
+            }
+            return { ...s, image_slots: newSlots };
+        }));
+    };
+
+    const removeExtraImage = (sceneIdx: number, slotIdx: number) => {
+        setScenes(prev => prev.map((s, i) => {
+            if (i !== sceneIdx) return s;
+            let newSlots = [...(s.image_slots || [])];
+            newSlots.splice(slotIdx, 1);
+            return { ...s, url: newSlots[0]?.url || s.url, image_slots: newSlots };
+        }));
+    };
+
+    // Helper to count lines in script (by sentence delimiters)
+    const getScriptLines = (script: string) => {
+        if (!script) return [];
+        // Match backend's split_minor_punct=False logic (major punct + newline)
+        // Symbols: ?, ., !, …, ？, 。, ！, ...
+        return script
+            .split(/(?<=[.!?…？。！])\s+|\n/)
+            .filter(l => l.trim().length > 0 && /[\w\u4e00-\u9fa5]/.test(l));
     };
 
     const handleDelete = (index: number) => {
@@ -304,77 +339,96 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
             <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
                 {scenes.map((scene, idx) => (
                     <Card key={idx} size="small" style={{ width: '100%' }}>
-                        <div style={{ display: 'flex', gap: 16 }}>
-                            {/* Primary image */}
-                            <div style={{ flexShrink: 0 }}>
-                                <div style={{ fontSize: 11, color: '#888', marginBottom: 4 }}>Primary</div>
-                                <div style={{ width: 100, height: 100, background: '#e0e0e0', borderRadius: 4, overflow: 'hidden', position: 'relative' }}>
-                                    <Spin spinning={!!regeneratingIndexes[idx]}>
-                                        {scene.url ? (
-                                            <Image
-                                                src={scene.url}
-                                                alt={`Scene ${idx + 1}`}
-                                                width={100}
-                                                height={100}
-                                                style={{ objectFit: 'cover', display: 'block' }}
-                                                preview={{ mask: <div style={{ fontSize: 11, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>🔍</div> }}
-                                            />
-                                        ) : (
-                                            <div style={{ width: 100, height: 100, display: 'flex', justifyContent: 'center', alignItems: 'center' }}>
-                                                <FileImageOutlined style={{ fontSize: 24, color: '#999' }} />
+                        <div style={{ display: 'flex', gap: 16, alignItems: 'flex-start' }}>
+                            {/* Image slots UI - Left Side */}
+                            <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', maxWidth: '60%' }}>
+                                {(scene.image_slots || (scene.url ? [{ url: scene.url, sub_start: null, sub_end: null }] : [])).map((slot, slotIdx) => {
+                                    const lines = getScriptLines(scene.script);
+                                    return (
+                                        <div key={slotIdx} style={{ flexShrink: 0, width: 100 }}>
+                                            <div style={{ fontSize: 11, color: '#888', marginBottom: 4 }}>
+                                                {slotIdx === 0 ? "Primary" : `Slot ${slotIdx + 1}`}
                                             </div>
-                                        )}
-                                    </Spin>
-                                </div>
-                            </div>
+                                            <div style={{ width: 100, height: 100, background: '#e0e0e0', borderRadius: 4, overflow: 'hidden', position: 'relative' }}>
+                                                <Image
+                                                    src={slot.url}
+                                                    alt={`Slot ${slotIdx + 1}`}
+                                                    width={100}
+                                                    height={100}
+                                                    style={{ objectFit: 'cover', display: 'block' }}
+                                                    preview={{ mask: <div style={{ fontSize: 11, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>🔍</div> }}
+                                                />
+                                                {slotIdx > 0 && (
+                                                    <Popconfirm title="Remove this image slot?" onConfirm={() => removeExtraImage(idx, slotIdx)}>
+                                                        <Button
+                                                            size="small"
+                                                            danger
+                                                            type="text"
+                                                            icon={<DeleteOutlined />}
+                                                            style={{ position: 'absolute', top: 2, right: 2, background: 'rgba(255,255,255,0.8)', padding: '0 2px' }}
+                                                        />
+                                                    </Popconfirm>
+                                                )}
+                                            </div>
+                                            {/* Subtitle Range Selection */}
+                                            <div style={{ marginTop: 4 }}>
+                                                <div style={{ fontSize: 10, color: '#999', marginBottom: 2 }}>Subtitles:</div>
+                                                <Space.Compact size="small" style={{ width: '100%' }}>
+                                                    <Select
+                                                        value={slot.sub_start ?? undefined}
+                                                        placeholder="Start"
+                                                        style={{ width: '50%' }}
+                                                        size="small"
+                                                        onChange={(val) => updateSlotRange(idx, slotIdx, val, slot.sub_end ?? null)}
+                                                        bordered={false}
+                                                        allowClear
+                                                    >
+                                                        {lines.map((_, lIdx) => (
+                                                            <Select.Option key={lIdx} value={lIdx}>{lIdx + 1}</Select.Option>
+                                                        ))}
+                                                    </Select>
+                                                    <Select
+                                                        value={slot.sub_end ?? undefined}
+                                                        placeholder="End"
+                                                        style={{ width: '50%' }}
+                                                        size="small"
+                                                        onChange={(val) => updateSlotRange(idx, slotIdx, slot.sub_start ?? null, val)}
+                                                        bordered={false}
+                                                        allowClear
+                                                    >
+                                                        {lines.map((_, lIdx) => (
+                                                            <Select.Option key={lIdx} value={lIdx}>{lIdx + 1}</Select.Option>
+                                                        ))}
+                                                    </Select>
+                                                </Space.Compact>
+                                            </div>
+                                        </div>
+                                    );
+                                })}
 
-                            {/* Extra images strip */}
-                            {(scene.extra_images || []).map((url, exIdx) => (
-                                <div key={exIdx} style={{ flexShrink: 0 }}>
-                                    <div style={{ fontSize: 11, color: '#888', marginBottom: 4 }}>Extra {exIdx + 1}</div>
-                                    <div style={{ width: 100, height: 100, background: '#e0e0e0', borderRadius: 4, overflow: 'hidden', position: 'relative' }}>
-                                        <Image
-                                            src={url}
-                                            alt={`Scene ${idx + 1} extra ${exIdx + 1}`}
-                                            width={100}
-                                            height={100}
-                                            style={{ objectFit: 'cover', display: 'block' }}
-                                            preview={{ mask: <div style={{ fontSize: 11, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>🔍</div> }}
-                                        />
-                                        <Popconfirm title="Remove this extra image?" onConfirm={() => removeExtraImage(idx, exIdx)}>
-                                            <Button
-                                                size="small"
-                                                danger
-                                                type="text"
-                                                icon={<DeleteOutlined />}
-                                                style={{ position: 'absolute', top: 2, right: 2, background: 'rgba(255,255,255,0.8)', padding: '0 2px' }}
-                                            />
-                                        </Popconfirm>
+                                {/* Add extra image button */}
+                                <div style={{ flexShrink: 0, display: 'flex', flexDirection: 'column', width: 100 }}>
+                                    <div style={{ fontSize: 11, color: 'transparent', marginBottom: 4 }}>-</div>
+                                    <div
+                                        onClick={() => openReuseModal(idx, 'add-extra')}
+                                        style={{
+                                            width: 100, height: 100,
+                                            border: '2px dashed #d9d9d9', borderRadius: 4,
+                                            display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
+                                            cursor: 'pointer', color: '#aaa', fontSize: 12,
+                                            transition: 'border-color 0.15s',
+                                        }}
+                                        onMouseEnter={e => (e.currentTarget.style.borderColor = '#1677ff')}
+                                        onMouseLeave={e => (e.currentTarget.style.borderColor = '#d9d9d9')}
+                                    >
+                                        <span style={{ fontSize: 20 }}>＋</span>
+                                        <span>Add Slot</span>
                                     </div>
                                 </div>
-                            ))}
-
-                            {/* Add extra image button */}
-                            <div style={{ flexShrink: 0, display: 'flex', flexDirection: 'column', justifyContent: 'flex-end' }}>
-                                <div style={{ fontSize: 11, color: 'transparent', marginBottom: 4 }}>-</div>
-                                <div
-                                    onClick={() => openReuseModal(idx, 'add-extra')}
-                                    style={{
-                                        width: 100, height: 100,
-                                        border: '2px dashed #d9d9d9', borderRadius: 4,
-                                        display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
-                                        cursor: 'pointer', color: '#aaa', fontSize: 12,
-                                        transition: 'border-color 0.15s',
-                                    }}
-                                    onMouseEnter={e => (e.currentTarget.style.borderColor = '#1677ff')}
-                                    onMouseLeave={e => (e.currentTarget.style.borderColor = '#d9d9d9')}
-                                >
-                                    <span style={{ fontSize: 20 }}>＋</span>
-                                    <span>Add Image</span>
-                                </div>
                             </div>
 
-                            <div style={{ flex: 1 }}>
+                            {/* Script & Details - Right Side */}
+                            <div style={{ flex: 1, borderLeft: '1px solid #f0f0f0', paddingLeft: 16 }}>
                                 <div style={{ display: 'flex', justifyContent: 'space-between' }}>
                                     <Text strong>Scene {idx + 1} {scene.is_cover ? "(Cover)" : ""}</Text>
                                     <Space>
@@ -400,8 +454,19 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
                                         </Popconfirm>
                                     </Space>
                                 </div>
-                                <Paragraph style={{ margin: '8px 0' }}>{scene.script}</Paragraph>
-                                <Text type="secondary" style={{ fontSize: 12 }}>Prompt: {scene.scene_prompt}</Text>
+                                <Paragraph style={{ margin: '8px 0', fontSize: 13, lineHeight: '1.6' }}>
+                                    {getScriptLines(scene.script).map((line, lIdx) => (
+                                        <span key={lIdx} style={{ display: 'inline-block', marginRight: 12, marginBottom: 4 }}>
+                                            <Badge 
+                                                count={lIdx + 1} 
+                                                size="small" 
+                                                style={{ backgroundColor: '#52c41a', marginRight: 6, fontSize: 10, minWidth: 16, height: 16, lineHeight: '16px' }} 
+                                            />
+                                            {line}
+                                        </span>
+                                    ))}
+                                </Paragraph>
+                                <Text type="secondary" style={{ fontSize: 11 }}><b>Prompt:</b> {scene.scene_prompt}</Text>
                             </div>
                         </div>
                     </Card>
