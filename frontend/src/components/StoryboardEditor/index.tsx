@@ -1,10 +1,10 @@
 import React, { useState, useEffect } from 'react';
-import { Button, Card, Typography, Space, Popconfirm, message, Modal, Slider, Image, Select, Badge } from 'antd';
+import { Button, Card, Typography, Space, Popconfirm, message, Modal, Slider, Image, Select, Badge, Spin } from 'antd';
 import { DeleteOutlined, ReloadOutlined, SwapOutlined, CheckCircleFilled } from '@ant-design/icons';
 import { assembleVideo, regenerateImage, getSubtitleFonts } from '../../services/index';
 import { useVideoStore } from '../../stores/index';
 
-const { Text, Paragraph } = Typography;
+const { Text } = Typography;
 
 interface FontOption { id: string; label: string; default: boolean; }
 
@@ -212,6 +212,12 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
             if (res?.data?.image_url) {
                 const newScenes = [...scenes];
                 newScenes[index].url = res.data.image_url;
+                // Important: sync with image_slots as well so the UI updates
+                if (newScenes[index].image_slots && newScenes[index].image_slots.length > 0) {
+                    newScenes[index].image_slots[0].url = res.data.image_url;
+                } else {
+                    newScenes[index].image_slots = [{ url: res.data.image_url, sub_start: null, sub_end: null }];
+                }
                 setScenes(newScenes);
             }
         } catch (err: any) {
@@ -342,22 +348,34 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
                         <div style={{ display: 'flex', gap: 16, alignItems: 'flex-start' }}>
                             {/* Image slots UI - Left Side */}
                             <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', maxWidth: '60%' }}>
-                                {(scene.image_slots || (scene.url ? [{ url: scene.url, sub_start: null, sub_end: null }] : [])).map((slot, slotIdx) => {
+                                {(scene.image_slots && scene.image_slots.length > 0
+                                    ? scene.image_slots
+                                    : (scene.url ? [{ url: scene.url, sub_start: null, sub_end: null }] : [])
+                                ).map((slot, slotIdx) => {
                                     const lines = getScriptLines(scene.script);
+                                    const isRegenerating = slotIdx === 0 && !!regeneratingIndexes[idx];
                                     return (
                                         <div key={slotIdx} style={{ flexShrink: 0, width: 100 }}>
                                             <div style={{ fontSize: 11, color: '#888', marginBottom: 4 }}>
                                                 {slotIdx === 0 ? "Primary" : `Slot ${slotIdx + 1}`}
                                             </div>
                                             <div style={{ width: 100, height: 100, background: '#e0e0e0', borderRadius: 4, overflow: 'hidden', position: 'relative' }}>
-                                                <Image
-                                                    src={slot.url}
-                                                    alt={`Slot ${slotIdx + 1}`}
-                                                    width={100}
-                                                    height={100}
-                                                    style={{ objectFit: 'cover', display: 'block' }}
-                                                    preview={{ mask: <div style={{ fontSize: 11, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>🔍</div> }}
-                                                />
+                                                <Spin spinning={isRegenerating}>
+                                                    {slot.url ? (
+                                                        <Image
+                                                            src={slot.url}
+                                                            alt={`Slot ${slotIdx + 1}`}
+                                                            width={100}
+                                                            height={100}
+                                                            style={{ objectFit: 'cover', display: 'block' }}
+                                                            preview={{ mask: <div style={{ fontSize: 11, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>🔍</div> }}
+                                                        />
+                                                    ) : (
+                                                        <div style={{ width: 100, height: 100, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                                                            <div style={{ fontSize: 24, color: '#999' }}>🖼️</div>
+                                                        </div>
+                                                    )}
+                                                </Spin>
                                                 {slotIdx > 0 && (
                                                     <Popconfirm title="Remove this image slot?" onConfirm={() => removeExtraImage(idx, slotIdx)}>
                                                         <Button
@@ -454,18 +472,18 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
                                         </Popconfirm>
                                     </Space>
                                 </div>
-                                <Paragraph style={{ margin: '8px 0', fontSize: 13, lineHeight: '1.6' }}>
+                                <div style={{ margin: '8px 0', fontSize: 13, lineHeight: '1.8' }}>
                                     {getScriptLines(scene.script).map((line, lIdx) => (
-                                        <span key={lIdx} style={{ display: 'inline-block', marginRight: 12, marginBottom: 4 }}>
+                                        <div key={lIdx} style={{ marginBottom: 6, display: 'flex', alignItems: 'flex-start' }}>
                                             <Badge 
                                                 count={lIdx + 1} 
                                                 size="small" 
-                                                style={{ backgroundColor: '#52c41a', marginRight: 6, fontSize: 10, minWidth: 16, height: 16, lineHeight: '16px' }} 
+                                                style={{ backgroundColor: '#52c41a', marginRight: 10, flexShrink: 0, marginTop: 4 }} 
                                             />
-                                            {line}
-                                        </span>
+                                            <Text>{line}</Text>
+                                        </div>
                                     ))}
-                                </Paragraph>
+                                </div>
                                 <Text type="secondary" style={{ fontSize: 11 }}><b>Prompt:</b> {scene.scene_prompt}</Text>
                             </div>
                         </div>
