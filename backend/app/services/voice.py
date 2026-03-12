@@ -1,4 +1,5 @@
 import os
+import io
 import asyncio
 import time
 import uuid
@@ -113,8 +114,8 @@ def sanitize_text_for_tts(raw_text: str) -> str:
         .replace("\u2060", "")
     )
     cleaned = cleaned.replace("“", '"').replace("”", '"').replace("‘", "'").replace("’", "'")
-    cleaned = re.sub(r"(?<!\\w)['\\\"](?!\\w)", "", cleaned)
-    cleaned = re.sub(r"\\s+", " ", cleaned).strip()
+    cleaned = re.sub(r"(?<!\w)['\"](?!\w)", "", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return cleaned
 
 def expand_contractions(raw_text: str) -> str:
@@ -297,6 +298,54 @@ def _format_srt_ts(seconds: float) -> str:
     ss = int(s % 60)
     ms = int((s - int(s)) * 1000)
     return f"{hh:02d}:{mm:02d}:{ss:02d},{ms:03d}"
+
+def build_srt_from_lines_and_words(clean_text: str, words: list[dict], subtitle_file: str) -> None:
+    lines = split_text_for_subtitles(clean_text)
+    if not lines:
+        with open(subtitle_file, "w", encoding="utf-8") as f:
+            f.write("")
+        return
+        
+    def normalize(t: str) -> str:
+        return re.sub(r"[^a-zA-Z0-9]", "", str(t)).lower()
+        
+    word_idx = 0
+    with open(subtitle_file, "w", encoding="utf-8") as f:
+        for i, line in enumerate(lines, 1):
+            line_words = [normalize(m.group(0)) for m in KARAOKE_WORD_PATTERN.finditer(line)]
+            line_words = [w for w in line_words if w]
+            
+            start_s = None
+            end_s = None
+            
+            for lw in line_words:
+                matched = False
+                for offset in range(3):
+                    idx = word_idx + offset
+                    if idx < len(words) and normalize(words[idx].get("word", "")) == lw:
+                        if start_s is None:
+                            start_s = words[idx].get("start", 0.0)
+                        end_s = words[idx].get("end", 0.0)
+                        word_idx = idx + 1
+                        matched = True
+                        break
+                if not matched and word_idx < len(words):
+                    if start_s is None:
+                        start_s = words[word_idx].get("start", 0.0)
+                    end_s = words[word_idx].get("end", 0.0)
+                    word_idx += 1
+            
+            if start_s is None:
+                start_s = 0.0 if not words else float(words[-1].get("end", 0.0))
+            if end_s is None or end_s <= start_s:
+                end_s = float(start_s) + 2.0
+                
+            start_s = max(0.0, float(start_s))
+            end_s = max(start_s + 0.1, float(end_s))
+            
+            f.write(f"{i}\n")
+            f.write(f"{_format_srt_ts(start_s)} --> {_format_srt_ts(end_s)}\n")
+            f.write(f"{line.strip()}\n\n")
 
 def build_srt_from_word_timings(word_timings: list[dict], subtitle_file: str) -> None:
     with open(subtitle_file, "w", encoding="utf-8") as f:
@@ -1708,7 +1757,7 @@ async def google_cloud_tts_voice(
                 combined += AudioSegment.silent(duration=pause_ms)
                 cursor_ms += pause_ms
         combined.export(voice_file, format="mp3")
-        build_srt_from_word_timings(words, subtitle_file)
+        build_srt_from_lines_and_words(clean_text, words, subtitle_file)
         if karaoke or sequence_mode:
             _write_karaoke_words_file(
                 subtitle_file,
@@ -1719,77 +1768,68 @@ async def google_cloud_tts_voice(
             )
         return
 
-    response = None
-    mark_tokens: list[str] = []
+    # --- Per-word synthesis for precise karaoke timing (works for all modes) ---
+    # We synthesize each word individually, stitch with short pauses, and record
+    # exact start/end timestamps — guaranteed 'precise' timing regardless of voice.
     if karaoke:
-        try:
-            ssml, mark_tokens = _build_google_ssml_with_marks(clean_text)
-            synthesis_input = texttospeech.SynthesisInput(ssml=ssml)
-            response = client.synthesize_speech(
-                input=synthesis_input,
-                voice=voice,
-                audio_config=audio_config,
-                enable_time_pointing=[
-                    texttospeech.SynthesizeSpeechRequest.TimepointType.SSML_MARK
-                ],
-            )
-        except Exception as e:
-            logger.warning(f"Google TTS karaoke timing request failed, fallback to plain synthesis: {e}")
-            response = None
-    if response is None:
-        synthesis_input = texttospeech.SynthesisInput(text=clean_text)
-        response = client.synthesize_speech(
-            input=synthesis_input,
-            voice=voice,
-            audio_config=audio_config,
-        )
-    with open(voice_file, "wb") as out:
-        out.write(response.audio_content)
-    audio = AudioSegment.from_mp3(voice_file)
-    build_srt_from_audio(audio, clean_text, subtitle_file)
-    if karaoke:
-        audio_duration = max(0.0, len(audio) / 1000.0)
+        logger.info("Google TTS: using per-word synthesis for precise karaoke timing")
+        word_tokens = [m.group(0) for m in KARAOKE_WORD_PATTERN.finditer(clean_text or "")]
+        if not word_tokens:
+            word_tokens = split_string_by_punctuations(clean_text)
+        inter_word_pause_ms = 80  # brief natural pause between synthesised segments
+        combined = AudioSegment.empty()
+        cursor_ms = 0
         words: list[dict] = []
-        timing_source = "ssml_mark"
-        timing_quality = "precise"
-        timepoints = getattr(response, "timepoints", None) or []
-        timeline: list[tuple[int, float]] = []
-        for tp in timepoints:
-            mark_name = str(getattr(tp, "mark_name", "") or "")
-            m = re.match(r"^w(\d+)$", mark_name)
-            if not m:
+        for w_idx, token in enumerate(word_tokens):
+            token_clean = sanitize_text_for_tts(token)
+            if not token_clean:
                 continue
-            idx = int(m.group(1))
-            start_s = float(getattr(tp, "time_seconds", 0.0) or 0.0)
-            timeline.append((idx, start_s))
-        timeline.sort(key=lambda x: x[0])
-        for pos, (idx, start_s) in enumerate(timeline):
-            if idx >= len(mark_tokens):
-                continue
-            next_start = audio_duration
-            if pos + 1 < len(timeline):
-                next_start = max(start_s + 0.03, timeline[pos + 1][1])
-            words.append(
-                {
-                    "word": mark_tokens[idx],
-                    "start": round(max(0.0, start_s), 4),
-                    "end": round(min(audio_duration, next_start), 4),
-                }
-            )
-        if not words:
-            logger.warning(
-                "Google TTS returned no SSML mark timepoints; falling back to subtitle-derived karaoke timings."
-            )
-            words = _karaoke_words_from_subtitle(subtitle_file)
-            timing_source = "subtitle_derived"
-            timing_quality = "approx"
+            try:
+                resp = client.synthesize_speech(
+                    input=texttospeech.SynthesisInput(text=token_clean),
+                    voice=voice,
+                    audio_config=audio_config,
+                )
+                seg = AudioSegment.from_file(io.BytesIO(resp.audio_content), format="mp3")
+            except Exception as e:
+                logger.warning(f"Google TTS per-word synthesis failed for '{token}': {e}")
+                # Use minimal silence placeholder so indexes stay aligned
+                seg = AudioSegment.silent(duration=200)
+            seg_start_ms = cursor_ms
+            combined += seg
+            cursor_ms += len(seg)
+            seg_end_ms = cursor_ms
+            words.append({
+                "word": token,
+                "start": round(seg_start_ms / 1000.0, 4),
+                "end": round(max((seg_start_ms + 30) / 1000.0, seg_end_ms / 1000.0), 4),
+            })
+            if w_idx < len(word_tokens) - 1:
+                combined += AudioSegment.silent(duration=inter_word_pause_ms)
+                cursor_ms += inter_word_pause_ms
+        combined.export(voice_file, format="mp3")
+        build_srt_from_lines_and_words(clean_text, words, subtitle_file)
         _write_karaoke_words_file(
             subtitle_file,
             "google-tts",
             words,
-            timing_source=timing_source,
-            timing_quality=timing_quality,
+            timing_source="per_word_synth",
+            timing_quality="precise",
         )
+        return
+
+    # --- Plain synthesis (no karaoke) ---
+    synthesis_input = texttospeech.SynthesisInput(text=clean_text)
+    response = client.synthesize_speech(
+        input=synthesis_input,
+        voice=voice,
+        audio_config=audio_config,
+    )
+    with open(voice_file, "wb") as out:
+        out.write(response.audio_content)
+    audio = AudioSegment.from_mp3(voice_file)
+    build_srt_from_audio(audio, clean_text, subtitle_file)
+
 
 async def edge_tts_voice_notwork(
     text: str,

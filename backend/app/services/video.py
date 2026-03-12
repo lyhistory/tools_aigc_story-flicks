@@ -2,11 +2,12 @@ import os
 import time
 import json
 import math
+import uuid
 from typing import List
 from app.schemas.llm import StoryGenerationRequest
 from loguru import logger
 from app.models.const import StoryType, ImageStyle
-from app.schemas.video import VideoGenerateRequest, StoryScene
+from app.schemas.video import VideoGenerateRequest, StoryScene, StoryboardAssembleRequest, RegenerateImageRequest
 from app.services.llm import llm_service
 from app.services.voice import generate_voice
 from app.utils import utils
@@ -151,25 +152,105 @@ def build_image_clips(image_file: str, target_w: int, target_h: int, duration: f
     fg_clip = fg_clip.with_position(pan_position)
     return bg_clip, fg_clip, origin_image_w, origin_image_h
 
-async def create_video_with_scenes(
-        task_dir: str, 
-        scenes: List[StoryScene], 
-        voice_name: str, 
-        voice_rate: float, 
-        language: str = "en-US",
-        voice_provider: str = "gtts",
-        karaoke: bool = True,
-        test_mode: bool = False,
-        resolution: str = None,
-        chinese_subtitle_enabled: bool = True) -> str:
-    """创建带有场景的视频
+async def generate_scene_assets(
+    task_dir: str,
+    scenes: List[StoryScene],
+    voice_name: str,
+    voice_rate: float,
+    language: str,
+    voice_provider: str,
+    karaoke: bool,
+):
+    """生成每个场景所需的音频和字幕资产 (Step 1)
+    """
+    for i, scene in enumerate(scenes, 1):
+        try:
+            image_file = os.path.join(task_dir, f"{i}.png")
+            audio_file = os.path.join(task_dir, f"{i}.mp3")
+            subtitle_file = os.path.join(task_dir, f"{i}.srt")
 
+            logger.info(f"Generating voice assets for scene {i}")
+            is_cover_scene = bool(getattr(scene, "is_cover", False)) or bool((getattr(scene, "subject", None) or "").strip())
+            is_sequence_scene = (getattr(scene, "topic_type", None) == "sequence") and not is_cover_scene
+            lead_silence_ms = 0
+            trail_silence_ms = 0
+            sentence_pause_ms = None
+            if is_cover_scene and (voice_provider or "gtts") == "gtts":
+                lead_silence_ms = 300
+                trail_silence_ms = 900
+                sentence_pause_ms = 550
+            
+            await generate_voice(
+                scene.script,
+                voice_name,
+                voice_rate,
+                audio_file,
+                subtitle_file,
+                language,
+                voice_provider,
+                lead_silence_ms=lead_silence_ms,
+                trail_silence_ms=trail_silence_ms,
+                sentence_pause_ms=sentence_pause_ms,
+                karaoke=(karaoke or is_sequence_scene),
+                sequence_mode=is_sequence_scene,
+            )
+        except Exception as e:
+            logger.error(f"Failed to process assets for scene {i}: {str(e)}")
+            raise e
+
+
+SUBTITLE_FONT_MAP = {
+    # Noto Sans variants
+    "NotoSans-Regular": ("Noto_Sans", "static", "NotoSans-Regular.ttf"),
+    "NotoSans-Light": ("Noto_Sans", "static", "NotoSans-Light.ttf"),
+    "NotoSans-SemiBold": ("Noto_Sans", "static", "NotoSans-SemiBold.ttf"),
+    "NotoSans-Bold": ("Noto_Sans", "static", "NotoSans-Bold.ttf"),
+    "NotoSans-ExtraBold": ("Noto_Sans", "static", "NotoSans-ExtraBold.ttf"),
+    "NotoSans-Italic": ("Noto_Sans", "static", "NotoSans-Italic.ttf"),
+    "NotoSans-BoldItalic": ("Noto_Sans", "static", "NotoSans-BoldItalic.ttf"),
+    "NotoSans-Condensed-Bold": ("Noto_Sans", "static", "NotoSans_Condensed-Bold.ttf"),
+    "NotoSans-Condensed-SemiBold": ("Noto_Sans", "static", "NotoSans_Condensed-SemiBold.ttf"),
+    "NotoSans-Condensed-Regular": ("Noto_Sans", "static", "NotoSans_Condensed-Regular.ttf"),
+    # Custom / decorative fonts
+    "BabyPlums": ("BabyPlums-rv2gL.ttf",),
+    "QuickCat": ("Quick Cat.ttf",),
+    "SuperAdorable": ("SuperAdorable-MAvyp.ttf",),
+    "SuperJoyful": ("SuperJoyful-lxwPq.ttf",),
+    "SuperMaples": ("SuperMaples-2vR2w.ttf",),
+    "SuperScribble": ("SuperScribble-pg3qr.ttf",),
+    "UbuntuCondensed": ("UbuntuCondensed-Regular.ttf",),
+}
+DEFAULT_SUBTITLE_FONT = "NotoSans-Bold"
+
+
+def resolve_subtitle_font(font_name: str | None) -> str:
+    """Map friendly font name to absolute path."""
+    candidate = (font_name or DEFAULT_SUBTITLE_FONT).strip()
+    parts = SUBTITLE_FONT_MAP.get(candidate)
+    if not parts:
+        parts = SUBTITLE_FONT_MAP[DEFAULT_SUBTITLE_FONT]
+    path = os.path.join(utils.resource_dir(), "fonts", *parts)
+    if not os.path.exists(path):
+        # fallback to hardcoded bold
+        fallback = os.path.join(utils.resource_dir(), "fonts", "Noto_Sans", "static", "NotoSans-Bold.ttf")
+        return fallback
+    return path
+
+
+async def render_final_video(
+        task_dir: str,
+        scenes: List[StoryScene],
+        resolution: str = None,
+        karaoke: bool = True,
+        chinese_subtitle_enabled: bool = True,
+        subtitle_font: str | None = None,
+        subtitle_font_size: int | None = None,
+        subtitle_color: str | None = None) -> str:
+    """组装最终的视频片段 (Step 2)
+    
     Args:
         task_dir (str): 任务目录
         scenes (List[StoryScene]): 场景列表
-        voice_name (str): 语音名称
-        voice_rate (float): 语音速率
-        test_mode (bool): 是否为测试模式，如果是则使用已有的图片、音频、字幕文件
     """
     clips = []
     target_w, target_h = parse_resolution(resolution) if resolution else (None, None)
@@ -403,7 +484,7 @@ async def create_video_with_scenes(
         for line, bbox, w, h in line_sizes:
             x = (width - w) // 2 - bbox[0]
             match = None
-            line_tokens = list(re.finditer(r"[A-Za-z']+|\d+", line))
+            line_tokens = list(re.finditer(r"[A-Za-z]+(?:'[A-Za-z]+)?|\d+", line))
             if highlight_token_index is not None and not token_highlight_done:
                 for m in line_tokens:
                     if token_cursor == highlight_token_index:
@@ -573,38 +654,9 @@ async def create_video_with_scenes(
             audio_file = os.path.join(task_dir, f"{i}.mp3")
             subtitle_file = os.path.join(task_dir, f"{i}.srt")
 
-            # Test mode check
-            if test_mode:
-                if not (os.path.exists(image_file) and os.path.exists(audio_file) and os.path.exists(subtitle_file)):
-                    logger.warning(f"Test mode: Required files not found for scene {i}")
-                    raise FileNotFoundError("Required files not found")
-            else:
-                # 正式模式下生成所需文件
-                logger.info(f"Processing scene {i}")
-                is_cover_scene = bool(getattr(scene, "is_cover", False)) or bool((getattr(scene, "subject", None) or "").strip())
-                is_sequence_scene = (getattr(scene, "topic_type", None) == "sequence") and not is_cover_scene
-                lead_silence_ms = 0
-                trail_silence_ms = 0
-                sentence_pause_ms = None
-                if is_cover_scene and (voice_provider or "gtts") == "gtts":
-                    lead_silence_ms = 300
-                    trail_silence_ms = 900
-                    sentence_pause_ms = 550
-                audio_file, subtitle_file = await generate_voice(
-                    scene.script,
-                    voice_name,
-                    voice_rate,
-                    audio_file,
-                    subtitle_file,
-                    language,
-                    voice_provider,
-                    lead_silence_ms=lead_silence_ms,
-                    trail_silence_ms=trail_silence_ms,
-                    sentence_pause_ms=sentence_pause_ms,
-                    karaoke=(karaoke or is_sequence_scene),
-                    sequence_mode=is_sequence_scene,
-                )
-            
+            if not (os.path.exists(image_file) and os.path.exists(audio_file) and os.path.exists(subtitle_file)):
+                logger.warning(f"Required files not found for scene {i}, skipping scene video render or expecting error.")
+                # We do not raise error immediately, let it break normally if it fails to load files.
             # 获取字幕的总时长
             subs = subtitles.file_to_subtitles(subtitle_file, encoding="utf-8")
             subtitle_duration = max([tb for ((ta, tb), txt) in subs])
@@ -625,42 +677,23 @@ async def create_video_with_scenes(
                 image_scale=1.2
             )
             # audio will be attached to the final composite clip
-            # 使用系统字体
+            # Fonts
             font_path = os.path.join(utils.resource_dir(), "fonts", "STHeitiLight.ttc")
-            keyword_font_path = os.path.join(utils.resource_dir(), "fonts", "MicrosoftYaHeiNormal.ttc")
-            subtitle_font_path = os.path.join(utils.resource_dir(), "fonts", "MicrosoftYaHeiBold.ttc")
-            chinese_subtitle_font_path = os.path.join(utils.resource_dir(), "fonts", "MicrosoftYaHeiNormal.ttc")
-            ipa_font_path = os.path.join(
-                utils.resource_dir(),
-                "fonts",
-                "Noto_Sans",
-                "NotoSans-VariableFont_wdth,wght.ttf",
-            )
             noto_static_dir = os.path.join(utils.resource_dir(), "fonts", "Noto_Sans", "static")
-            noto_bold = os.path.join(noto_static_dir, "NotoSans-Bold.ttf")
-            noto_semibold = os.path.join(noto_static_dir, "NotoSans-SemiBold.ttf")
             noto_regular = os.path.join(noto_static_dir, "NotoSans-Regular.ttf")
+            noto_semibold = os.path.join(noto_static_dir, "NotoSans-SemiBold.ttf")
             noto_light = os.path.join(noto_static_dir, "NotoSans-Light.ttf")
+            chinese_subtitle_font_path = os.path.join(utils.resource_dir(), "fonts", "MicrosoftYaHeiNormal.ttc")
             if not os.path.exists(font_path):
-                logger.warning("Font file not found, using default font")
                 raise FileNotFoundError("Font file not found: " + font_path)
-            else:
-                logger.info(f"Using font: {font_path}")
-            if not os.path.exists(keyword_font_path):
-                keyword_font_path = font_path
-            if not os.path.exists(subtitle_font_path):
-                subtitle_font_path = keyword_font_path
-            if os.path.exists(ipa_font_path):
-                keyword_font_path = ipa_font_path
-                subtitle_font_path = ipa_font_path
-            if os.path.exists(noto_bold):
-                subtitle_font_path = noto_bold
-            if os.path.exists(noto_semibold):
-                keyword_font_path = noto_semibold
+            # Use the user-selected subtitle font, fall back to NotoSans-Bold
+            subtitle_font_path = resolve_subtitle_font(subtitle_font)
+            keyword_font_path = noto_semibold if os.path.exists(noto_semibold) else subtitle_font_path
             if not os.path.exists(chinese_subtitle_font_path):
                 chinese_subtitle_font_path = subtitle_font_path
             keyword_pron_font_path = noto_regular if os.path.exists(noto_regular) else keyword_font_path
             keyword_expl_font_path = noto_light if os.path.exists(noto_light) else keyword_font_path
+            logger.info(f"Subtitle font: {subtitle_font_path}")
             # 添加字幕 (PIL render directly onto frames)
             if os.path.exists(subtitle_file):
                 logger.info(f"Loading subtitle file: {subtitle_file}")
@@ -770,8 +803,8 @@ async def create_video_with_scenes(
                             sub_img_en = render_text_rgba(
                                 phrase,
                                 subtitle_font_path,
-                                (148 if is_sequence_scene else 58),
-                                ("#1F2937" if is_sequence_scene else "#F472B6"),
+                                (148 if is_sequence_scene else (subtitle_font_size or 58)),
+                                ("#1F2937" if is_sequence_scene else (subtitle_color or "#F472B6")),
                                 max_width=int(origin_image_w * 0.9),
                                 bg_rgba=(0, 0, 0, 0),
                                 highlight_word=highlight_word,
@@ -840,8 +873,8 @@ async def create_video_with_scenes(
                                     kara_img_en = render_text_rgba(
                                         phrase,
                                         subtitle_font_path,
-                                        58,
-                                        "#F472B6",
+                                        (subtitle_font_size or 58),
+                                        (subtitle_color or "#F472B6"),
                                         max_width=int(origin_image_w * 0.9),
                                         bg_rgba=(0, 0, 0, 0),
                                         highlight_token_index=token_idx,
@@ -1085,8 +1118,107 @@ async def generate_video(request: VideoGenerateRequest):
             with open(story_file, "w", encoding="utf-8") as f:
                 json.dump(story_data, f, ensure_ascii=False, indent=2)
         # return ""
+        # If test_mode is False, we generate voice for everything sequentially
+        if not request.test_mode:
+            await generate_scene_assets(
+                task_dir=task_dir,
+                scenes=scenes,
+                voice_name=request.voice_name,
+                voice_rate=request.voice_rate,
+                language=request.language,
+                voice_provider=getattr(request, "voice_provider", "gtts"),
+                karaoke=getattr(request, "karaoke", True),
+            )
+
         # 生成视频
-        return await create_video_with_scenes(
+        return await render_final_video(
+            task_dir=task_dir,
+            scenes=scenes,
+            karaoke=getattr(request, "karaoke", True),
+            chinese_subtitle_enabled=getattr(request, "chinese_subtitle_enabled", True),
+            resolution=request.resolution,
+        )
+    except Exception as e:
+        logger.error(f"Failed to generate video: {e}")
+        raise e
+
+
+async def generate_storyboard_impl(request: VideoGenerateRequest) -> dict:
+    """Storyboard Step 1: LLM text, image generation, voice and subtitles, then return data"""
+    try:
+        task_id = request.task_id or str(int(time.time()))
+        task_dir = utils.task_dir(task_id)
+        os.makedirs(task_dir, exist_ok=True)
+        
+        req = StoryGenerationRequest(
+            resolution=request.resolution,
+            story_prompt=request.story_prompt,
+            language=request.language,
+            segments=request.segments,
+            text_llm_provider=request.text_llm_provider,
+            text_llm_model=request.text_llm_model,
+            image_llm_provider=request.image_llm_provider,
+            image_llm_model=request.image_llm_model,
+            use_inpainting=request.use_inpainting,
+            avoid_exact_counts=request.avoid_exact_counts,
+            topic_type=request.topic_type,
+            subject=request.subject,
+            learner_age=request.learner_age,
+        )
+        logger.info(f"generate_storyboard_impl StoryGenerationRequest: {req}")
+        story_list = await llm_service.generate_story_with_images(
+            request=req,
+            task_id=task_id,
+            task_dir=task_dir)
+        
+        scenes = [
+            StoryScene(
+                script=scene.get("script", scene.get("text", "")),
+                scene_prompt=scene.get("scene_prompt", scene.get("image_prompt", "")),
+                objects=scene.get("objects", []),
+                keywords=scene.get("keywords", []),
+                url=scene.get("url"),
+                is_cover=scene.get("is_cover", False),
+                subject=scene.get("subject"),
+                topic_type=scene.get("topic_type"),
+            )
+            for scene in story_list
+        ]
+
+        story_data = request.model_dump()
+        story_data["task_id"] = task_id
+        story_data["scenes"] = [scene.model_dump() for scene in scenes]
+        
+        story_file = os.path.join(task_dir, "story.json")
+        for i, scene in enumerate(story_list, 1):
+            if scene.get("url"):
+                image_path = os.path.join(task_dir, f"{i}.png")
+                # Handle URLs or local paths just like regular mode
+                if scene["url"].startswith('/') or scene["url"].startswith('\\') or os.path.isabs(scene["url"]):
+                    if os.path.exists(scene["url"]):
+                        if scene["url"] != image_path:
+                            try:
+                                shutil.copy2(scene["url"], image_path)
+                            except Exception as copy_err:
+                                logger.error(f"Copy failed: {copy_err}")
+                else:
+                    try:
+                        response = requests.get(scene["url"])
+                        if response.status_code == 200:
+                            with open(image_path, "wb") as f:
+                                f.write(response.content)
+                    except Exception as e:
+                        logger.error(f"Failed to download image {i}: {e}")
+        
+        with open(story_file, "w", encoding="utf-8") as f:
+            json.dump(story_data, f, ensure_ascii=False, indent=2)
+
+        # Map local image paths to accessible URLs for frontend
+        for i, scene in enumerate(scenes, 1):
+            scene.url = f"http://127.0.0.1:8888/tasks/{task_id}/{i}.png"
+
+        # Generate audio assets
+        await generate_scene_assets(
             task_dir=task_dir,
             scenes=scenes,
             voice_name=request.voice_name,
@@ -1094,10 +1226,100 @@ async def generate_video(request: VideoGenerateRequest):
             language=request.language,
             voice_provider=getattr(request, "voice_provider", "gtts"),
             karaoke=getattr(request, "karaoke", True),
-            chinese_subtitle_enabled=getattr(request, "chinese_subtitle_enabled", True),
-            test_mode=request.test_mode,
+        )
+
+        return {"task_id": task_id, "scenes": [scene.model_dump() for scene in scenes]}
+    except Exception as e:
+        logger.error(f"Failed to generate storyboard: {e}")
+        raise e
+
+
+async def assemble_video_impl(request: "StoryboardAssembleRequest") -> str:
+    """Storyboard Step 2: Assemble Video from edited scenes list"""
+    try:
+        task_id = request.task_id
+        task_dir = utils.task_dir(task_id)
+        if not os.path.exists(task_dir):
+            raise ValueError(f"Task directory not found: {task_dir}. Assets must be generated first.")
+            
+        story_file = os.path.join(task_dir, "story.json")
+        if os.path.exists(story_file):
+            with open(story_file, "r", encoding="utf-8") as f:
+                story_data = json.load(f)
+            story_data["scenes"] = [scene.model_dump() for scene in request.scenes]
+            with open(story_file, "w", encoding="utf-8") as f:
+                json.dump(story_data, f, ensure_ascii=False, indent=2)
+
+        # Pre-process edited scenes: if URL points to a different image, copy it over
+        for i, scene in enumerate(request.scenes, 1):
+            if scene.url:
+                url_path = scene.url.split("?")[0]
+                if "/tasks/" in url_path:
+                    rel_path = url_path.split("/tasks/")[-1]
+                    tasks_root = os.path.dirname(task_dir)
+                    source_img = os.path.join(tasks_root, rel_path.replace("/", os.sep))
+                    target_img = os.path.join(task_dir, f"{i}.png")
+                    if os.path.exists(source_img) and source_img != target_img:
+                        import shutil
+                        shutil.copy2(source_img, target_img)
+                        logger.info(f"Reused image: copied {source_img} to {target_img}")
+
+
+        return await render_final_video(
+            task_dir=task_dir,
+            scenes=request.scenes,
+            karaoke=request.karaoke,
+            chinese_subtitle_enabled=request.chinese_subtitle_enabled,
             resolution=request.resolution,
+            subtitle_font=request.subtitle_font,
+            subtitle_font_size=request.subtitle_font_size,
+            subtitle_color=request.subtitle_color,
         )
     except Exception as e:
-        logger.error(f"Failed to generate video: {e}")
+        logger.error(f"Failed to assemble video: {e}")
+        raise e
+
+async def regenerate_image_impl(request: RegenerateImageRequest) -> str:
+    """Regenerate a specific scene image and overwrite it in the task dir."""
+    try:
+        task_id = request.task_id
+        task_dir = utils.task_dir(task_id)
+        if not os.path.exists(task_dir):
+            raise ValueError(f"Task directory not found: {task_dir}.")
+        
+        logger.info(f"Regenerating image for scene {request.scene_index} in task {task_id}")
+        # Call LLM Provider to generate new image
+        import asyncio
+        from app.services.llm import llm_service
+        image_url = await asyncio.to_thread(
+            llm_service.generate_image,
+            prompt=request.scene_prompt,
+            image_llm_provider=request.image_llm_provider,
+            image_llm_model=request.image_llm_model,
+            resolution=request.resolution,
+            task_dir=task_dir,
+            segment_index=request.scene_index
+        )
+        if not image_url:
+            raise ValueError(f"No image returned from LLM provider for prompt: {request.scene_prompt}")
+
+        # Download and overwrite
+        image_path = os.path.join(task_dir, f"{request.scene_index}.png")
+        if image_url.startswith('/') or image_url.startswith('\\') or os.path.isabs(image_url):
+            if os.path.exists(image_url):
+                if image_url != image_path:
+                    shutil.copy2(image_url, image_path)
+        else:
+            response = requests.get(image_url, timeout=30)
+            if response.status_code == 200:
+                with open(image_path, "wb") as f:
+                    f.write(response.content)
+            else:
+                raise ValueError(f"Failed to download image: {response.status_code}")
+        
+        # Return accessible URL for the newly generated image, bypassing browser cache
+        import time
+        return f"http://127.0.0.1:8888/tasks/{task_id}/{request.scene_index}.png?t={int(time.time())}"
+    except Exception as e:
+        logger.error(f"Failed to regenerate image: {e}")
         raise e

@@ -323,6 +323,27 @@ class VideoGenerateRequest(BaseModel):
     use_inpainting: Optional[bool] = Field(default=False, description="是否使用图生图/修复模式")
     avoid_exact_counts: Optional[bool] = Field(default=None, description="是否避免精确数量")
 
+class RegenerateImageRequest(BaseModel):
+    """单场景重新生成图片请求"""
+    task_id: str = Field(description="任务ID")
+    scene_index: int = Field(description="场景索引（1-based，例如第1个场景传1）")
+    scene_prompt: str = Field(description="场景的提示词")
+    image_llm_provider: Optional[str] = None
+    image_llm_model: Optional[str] = None
+    resolution: Optional[str] = "1024*1024"
+
+
+class StoryboardAssembleRequest(BaseModel):
+    """第二阶段：视频拼装请求"""
+    task_id: str = Field(description="任务ID（Step 1 返回的）")
+    scenes: List[StoryScene] = Field(description="用户确认或修改后的场景列表")
+    resolution: Optional[str] = Field(default="1024*1024", description="分辨率")
+    chinese_subtitle_enabled: bool = Field(default=True, description="是否启用中文字幕")
+    karaoke: bool = Field(default=True, description="是否启用卡拉OK高亮")
+    subtitle_font: Optional[str] = Field(default=None, description="English subtitle font variant (e.g. 'NotoSans-Bold')")
+    subtitle_font_size: Optional[int] = Field(default=None, description="English subtitle font size (px); default depends on resolution")
+    subtitle_color: Optional[str] = Field(default=None, description="English subtitle text color hex, e.g. '#F472B6'")
+
 
 class VideoGenerateResponse(BaseModel):
     """视频生成响应"""

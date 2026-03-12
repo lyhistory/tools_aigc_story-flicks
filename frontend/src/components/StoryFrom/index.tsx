@@ -1,11 +1,13 @@
 import React, { useState, useEffect } from 'react';
 import type { FormProps } from 'antd';
-import { Button, Form, Input, InputNumber, Select, message, Switch, Tooltip } from 'antd';
+import { Button, Form, Input, InputNumber, Select, message, Switch, Tooltip, Radio } from 'antd';
 import { useTranslation } from 'react-i18next'
-import { getVoiceList, getLLMProviders, generateVideo, getVoiceOptions } from '../../services/index';
+import { getVoiceList, getLLMProviders, generateVideo, generateStoryboard, getVoiceOptions } from '../../services/index';
 import { VOICE_LANGUAGES, VOICE_LANGUAGES_LABELS, VOICE_PROVIDERS, LEARNER_AGE_OPTIONS } from '../../constants';
 import styles from './index.module.css'
 import { useVideoStore } from "../../stores/index";
+import StoryboardEditor from '../StoryboardEditor';
+import VideoResult from '../VideoResult';
 
 type FieldType = {
     text_llm_provider?: string; // Text LLM provider
@@ -33,45 +35,50 @@ type FieldType = {
 
 
 const App: React.FC = () => {
-    const { setVideoUrl }  = useVideoStore();
+    const { setVideoUrl, setAssembling } = useVideoStore();
     const { t } = useTranslation();
     const [form] = Form.useForm();
     const [voiceOptions, setVoiceOptions] = useState<{ providers: string[]; languages: Record<string, string[]> }>({ providers: [], languages: {} });
     const [voiceLanguages, setVoiceLanguages] = useState<string[]>(VOICE_LANGUAGES);
     const [nowVoiceList, setNowVoiceList] = useState<string[]>([]);
-    const [llmProviders, setLLMProviders] = useState<{ 
-		textLLMProviders: string[], 
-		imageLLMProviders: string[],
-		defaults?: { 
+
+    const [mode, setMode] = useState<'simple' | 'storyboard'>('simple');
+    const [storyboardData, setStoryboardData] = useState<{ task_id: string, scenes: any[] } | null>(null);
+    const [generating, setGenerating] = useState(false);
+
+    const [llmProviders, setLLMProviders] = useState<{
+        textLLMProviders: string[],
+        imageLLMProviders: string[],
+        defaults?: {
             text_llm_model?: string;
             image_llm_model?: string;
             resolution?: string;
         }
-	}>({ textLLMProviders: [], imageLLMProviders: [] });
+    }>({ textLLMProviders: [], imageLLMProviders: [] });
 
     useEffect(() => {
         console.log('useEffect');
         getLLMProviders().then(res => {
             console.log('llmProviders', res);
             setLLMProviders(res);
-			// Set default model & resolution values from backend
+            // Set default model & resolution values from backend
             form.setFieldsValue({
-                    text_llm_model: res.text_llm_model,
-                    image_llm_model: res.image_llm_model,
-                    resolution: res.resolution || '1080*1920', // fallback
-                    avoid_exact_counts: true,
-                    karaoke: true,
-                    chinese_subtitle_enabled: true,
-                    text_llm_provider: res.text_llm_provider || res.textLLMProviders?.[0],
-                    image_llm_provider: res.image_llm_provider || res.imageLLMProviders?.[0],
-                    learner_age: '3-5',
-                });
+                text_llm_model: res.text_llm_model,
+                image_llm_model: res.image_llm_model,
+                resolution: res.resolution || '1080*1920', // fallback
+                avoid_exact_counts: true,
+                karaoke: true,
+                chinese_subtitle_enabled: true,
+                text_llm_provider: res.text_llm_provider || res.textLLMProviders?.[0],
+                image_llm_provider: res.image_llm_provider || res.imageLLMProviders?.[0],
+                learner_age: '3-5',
+            });
         }).catch(err => {
             console.log(err);
         })
         getVoiceOptions().then(res => {
             setVoiceOptions(res);
-            const provider = res.providers?.[0] || 'gtts';
+            const provider = res.providers?.includes('google-tts') ? 'google-tts' : (res.providers?.[0] || 'gtts');
             form.setFieldsValue({ voice_provider: provider });
             const langs = res.languages?.[provider] || VOICE_LANGUAGES;
             setVoiceLanguages(langs);
@@ -91,29 +98,49 @@ const App: React.FC = () => {
             console.log(err);
         });
     }, []);
-    const onFinish: FormProps<FieldType>['onFinish'] = (values) => {
+    const onFinish: FormProps<FieldType>['onFinish'] = async (values) => {
         console.log('Success:', values);
-        message.loading('Generating Video, please wait...', 0);
         const payload = {
             ...values,
             segments: values.topic_type === 'sequence' ? 1 : values.segments,
         };
-        generateVideo(payload).then(res => {
-            message.destroy();
-            if (res?.success === false) {
-                throw new Error(res?.message || 'Generate Video Failed');
+        setGenerating(true);
+        if (mode === 'simple') {
+            setAssembling(true);
+            message.loading({ content: 'Generating Video, please wait...', key: 'gen' });
+            try {
+                const res = await generateVideo(payload);
+                if (res?.success === false) throw new Error(res?.message || 'Generate Video Failed');
+                message.success({ content: 'Generate Video Success', key: 'gen' });
+                if (res?.data?.video_url) setVideoUrl(res.data.video_url + '?t=' + Date.now());
+            } catch (err: any) {
+                message.error({ content: 'Generate Video Failed: ' + (err?.message || JSON.stringify(err)), key: 'gen' }, 10);
+                console.log('generateVideo err', err);
+            } finally {
+                setGenerating(false);
+                setAssembling(false);
             }
-            console.log('generateVideo res', res);
-            message.success('Generate Video Success');
-            if (res?.data?.video_url) {
-                setVideoUrl(res?.data?.video_url);
+        } else {
+            message.loading({ content: 'Step 1: Generating Storyboard assets...', key: 'gen' });
+            try {
+                const res = await generateStoryboard(payload);
+                if (res?.success === false) throw new Error(res?.message || 'Generate Storyboard Failed');
+                message.success({ content: 'Storyboard generated! Please edit below.', key: 'gen' });
+                if (res?.data) {
+                    setStoryboardData({
+                        task_id: res.data.task_id,
+                        scenes: res.data.scenes
+                    });
+                }
+            } catch (err: any) {
+                message.error({ content: 'Generate Storyboard Failed: ' + (err?.message || JSON.stringify(err)), key: 'gen' }, 10);
+                console.log('generateStoryboard err', err);
+            } finally {
+                setGenerating(false);
             }
-        }).catch(err => {
-            message.error('Generate Video Failed: ' + err?.message || JSON.stringify(err), 10);
-            console.log('generateVideo err', err);
-        })
+        }
     };
-    
+
     const onFinishFailed: FormProps<FieldType>['onFinishFailed'] = (errorInfo) => {
         console.log('Failed:', errorInfo);
     };
@@ -140,8 +167,15 @@ const App: React.FC = () => {
         });
     };
     // defaults are set from backend in the initial load effect
-        return (
-            <div className={styles.formDiv}>
+    return (
+        <div className={styles.formDiv}>
+            <div style={{ marginBottom: 24, textAlign: 'center' }}>
+                <Radio.Group value={mode} onChange={e => setMode(e.target.value)} buttonStyle="solid">
+                    <Radio.Button value="simple">Simple Mode</Radio.Button>
+                    <Radio.Button value="storyboard">Storyboard Mode</Radio.Button>
+                </Radio.Group>
+            </div>
+            {!storyboardData ? (
                 <Form
                     form={form}
                     name="basic"
@@ -369,13 +403,24 @@ const App: React.FC = () => {
                         }}
                     </Form.Item>
                     <Form.Item label={null}>
-                        <Button type="primary" htmlType="submit">
-                            {t('storyForm.submit')}
+                        <Button type="primary" htmlType="submit" loading={generating}>
+                            {mode === 'simple' ? t('storyForm.submit') : 'Step 1: Generate Storyboard'}
                         </Button>
                     </Form.Item>
                 </Form>
-            </div>
-        )
+            ) : (
+                <StoryboardEditor
+                    taskId={storyboardData.task_id}
+                    scenes={storyboardData.scenes}
+                    resolution={form.getFieldValue('resolution') || '1080*1920'}
+                    chineseSubtitleEnabled={form.getFieldValue('chinese_subtitle_enabled')}
+                    karaoke={form.getFieldValue('karaoke')}
+                    onClose={() => setStoryboardData(null)}
+                />
+            )}
+            <VideoResult />
+        </div>
+    )
 }
 
 export default App;

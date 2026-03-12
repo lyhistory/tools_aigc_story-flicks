@@ -40,14 +40,54 @@ interface VideoGenerateReq {
     karaoke?: boolean; // Karaoke word-level highlight
     chinese_subtitle_enabled?: boolean; // Optional Chinese translation under English subtitle
 }
-
 // 假设 Language 和 ImageStyle 是其他接口或枚举
 type Language = "zh-CN" | "zh-TW" | "fixed-en-GB" | "en-GB" | "en-US" | "ja-JP" | "ko-KR";
+
+interface StoryScene {
+    script: string;
+    scene_prompt: string;
+    objects: string[];
+    keywords: { word: string;[key: string]: any }[];
+    url?: string;
+    is_cover?: boolean;
+    subject?: string;
+    topic_type?: string;
+}
+
+interface StoryboardAssembleReq {
+    task_id: string;
+    scenes: StoryScene[];
+    resolution?: string;
+    chinese_subtitle_enabled?: boolean;
+    karaoke?: boolean;
+    subtitle_font?: string;
+    subtitle_font_size?: number;
+    subtitle_color?: string;
+}
+
+interface StoryboardRes {
+    success: boolean;
+    data?: {
+        task_id: string;
+        scenes: StoryScene[];
+    };
+    message: string | null;
+}
+
+interface RegenerateImageReq {
+    task_id: string;
+    scene_index: number;
+    scene_prompt: string;
+    image_llm_provider?: string;
+    image_llm_model?: string;
+    resolution?: string;
+}
 
 interface VideoGenerateRes {
     success: boolean;
     data?: {
-        video_url: string; // 视频 URL
+        video_url?: string; // 视频 URL
+        image_url?: string;
     };
     message: string | null;
 }

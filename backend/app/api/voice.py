@@ -10,7 +10,7 @@ from app.services.voice import (
     get_voice_options,
 )
 from app.models.const import Language
-from app.services.video import create_video_with_scenes
+from app.services.video import render_final_video
 import os
 import json
 from typing import List, Optional
@@ -54,12 +54,12 @@ async def test_subtitle_endpoint(task_id: str = Query(..., description="任务ID
             await generate_voice(scene.text, voice_name, voice_rate, audio_file, subtitle_file)
         
         # 创建视频
-        video_file = await create_video_with_scenes(
+        video_file = await render_final_video(
             task_dir=task_dir,
             scenes=scenes,
-            voice_name=voice_name,
-            voice_rate=voice_rate,
-            voice_provider="gtts",
+            resolution="1080*1920",
+            karaoke=True,
+            chinese_subtitle_enabled=False
         )
         
         video_url = "/" + video_file.split("/tasks/")[-1]
