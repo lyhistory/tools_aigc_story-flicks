@@ -1431,8 +1431,12 @@ async def regenerate_image_impl(request: RegenerateImageRequest) -> str:
         if not image_url:
             raise ValueError(f"No image returned from LLM provider for prompt: {request.scene_prompt}")
 
-        # Download and overwrite
-        image_path = os.path.join(task_dir, f"{request.scene_index}.png")
+        # Download and save as a new file (avoid overwriting the original)
+        import time
+        timestamp = int(time.time())
+        filename = f"{request.scene_index}_{timestamp}.png"
+        image_path = os.path.join(task_dir, filename)
+        
         if image_url.startswith('/') or image_url.startswith('\\') or os.path.isabs(image_url):
             if os.path.exists(image_url):
                 if image_url != image_path:
@@ -1446,8 +1450,7 @@ async def regenerate_image_impl(request: RegenerateImageRequest) -> str:
                 raise ValueError(f"Failed to download image: {response.status_code}")
         
         # Return accessible URL for the newly generated image, bypassing browser cache
-        import time
-        return f"http://127.0.0.1:8888/tasks/{task_id}/{request.scene_index}.png?t={int(time.time())}"
+        return f"http://127.0.0.1:8888/tasks/{task_id}/{filename}?t={timestamp}"
     except Exception as e:
         logger.error(f"Failed to regenerate image: {e}")
         raise e

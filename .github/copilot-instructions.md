@@ -9,7 +9,7 @@
 ## Architecture & Key Components
 
 ### Backend (FastAPI, Python 3.10+)
-- **Entry point**: `backend/main.py` - FastAPI app with CORS for localhost:5173 (dev frontend)
+- **Entry point**: `backend/main.py` - FastAPI app with CORS for localhost:8081 (dev frontend)
 - **Config**: `app/config.py` - Pydantic Settings with `.env` support. Supports multi-provider LLMs (OpenAI, Aliyun, DeepSeek, Ollama, SiliconFlow, NVIDIA, Cloudflare)
 - **API Router**: `app/api/router.py` - Exposes `/api/llm`, `/api/voice`, `/api/video` endpoints
 - **Services** (business logic):
@@ -27,7 +27,7 @@
 - Communicates with backend via `axios` to localhost:8000 in dev mode
 
 ### Docker Compose
-- Two services: backend (port 8000) + frontend (port 5173) on shared `app-network`
+- Two services: backend (port 8000) + frontend (port 8081) on shared `app-network`
 - Frontend volumes exclude `node_modules` to prevent override
 - Backend uses `.env` from `backend/` for configuration
 
@@ -74,7 +74,7 @@ uvicorn main:app --reload
 # Frontend (separate terminal)
 cd frontend
 npm install
-npm run dev  # Runs on http://localhost:5173
+npm run dev  # Runs on http://localhost:8081
 ```
 
 ### Docker
@@ -124,5 +124,5 @@ POST /api/video/generate
 1. **Provider Mismatch**: Ensure `text_provider` env var matches an initialized client (e.g., if using `siliconflow`, verify `siliconflow_api_key` is set)
 2. **Image Resolution Format**: Use `"WxH"` string format (e.g., `1080*1920`), not integers
 3. **Subtitle Timing**: SRT timing must be precise; MoviePy SubtitlesClip is strict with format
-4. **CORS Localhost Only**: Default CORS allows only `localhost:5173` and `127.0.0.1:5173`; update `main.py` for production
+4. **CORS Localhost Only**: Default CORS allows only `localhost:8081` and `127.0.0.1:8081`; update `main.py` for production
 5. **Task Directory Permissions**: Ensure `backend/tasks/` exists and is writable; auto-created in main.py if missing

@@ -51,29 +51,35 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
     const [allGeneratedImages, setAllGeneratedImages] = useState<{ label: string; url: string }[]>([]);
 
     useEffect(() => {
-        // Build a unique pool of all generated images based on initialScenes and current scenes.
-        const poolMap = new Map<string, { label: string; url: string }>();
-        
-        // 1. Add originals
-        initialScenes.forEach((s, i) => {
-            if (s.url) poolMap.set(s.url, { label: `Scene ${i + 1} Original`, url: s.url });
-        });
+        setAllGeneratedImages(prev => {
+            const poolMap = new Map<string, { label: string; url: string }>();
+            
+            // Keep everything we've already discovered
+            prev.forEach(img => poolMap.set(img.url, img));
+            
+            // 1. Add originals that might not be in prev yet
+            initialScenes.forEach((s, i) => {
+                if (s.url && !poolMap.has(s.url)) poolMap.set(s.url, { label: `Scene ${i + 1} Original`, url: s.url });
+            });
 
-        // 2. Add any active URLs in current scenes (including regenerations/slots)
-        scenes.forEach((s, i) => {
-            if (s.url && !poolMap.has(s.url)) {
-                poolMap.set(s.url, { label: `Scene ${i + 1} Regen/Active`, url: s.url });
-            }
-            if (s.image_slots) {
-                s.image_slots.forEach((slot, sIdx) => {
-                    if (slot.url && !poolMap.has(slot.url)) {
-                         poolMap.set(slot.url, { label: `Scene ${i + 1} Slot ${sIdx + 1}`, url: slot.url });
-                    }
-                });
-            }
+            // 2. Add newly discovered active URLs
+            scenes.forEach((s, i) => {
+                if (s.url && !poolMap.has(s.url)) {
+                    poolMap.set(s.url, { label: `Scene ${i + 1} Regen`, url: s.url });
+                }
+                if (s.image_slots) {
+                    s.image_slots.forEach((slot, sIdx) => {
+                        if (slot.url && !poolMap.has(slot.url)) {
+                            poolMap.set(slot.url, { label: `Scene ${i + 1} Slot ${sIdx + 1}`, url: slot.url });
+                        }
+                    });
+                }
+            });
+            
+            // Only trigger re-render if something actually changed length
+            if (poolMap.size === prev.length) return prev;
+            return Array.from(poolMap.values());
         });
-        
-        setAllGeneratedImages(Array.from(poolMap.values()));
     }, [initialScenes, scenes]);
 
     const { setVideoUrl, assembling, setAssembling } = useVideoStore();

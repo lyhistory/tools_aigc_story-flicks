@@ -111,7 +111,7 @@ cd frontend
 npm install
 npm run dev
 
-# After successful startup, open: http://localhost:5173/
+# After successful startup, open: http://localhost:8081/
 ```
 
 When successfully started, the following output will appear:
@@ -119,7 +119,7 @@ When successfully started, the following output will appear:
 ```
   VITE v6.0.7  ready in 199 ms
 
-  ➜  Local:   http://localhost:5173/
+  ➜  Local:   http://localhost:8081/
   ➜  Network: use --host to expose
   ➜  press h + enter to show help
 ```
@@ -132,7 +132,7 @@ In the project root directory, run:
 docker-compose up --build
 ```
 
-Once successful, open the frontend project at: http://localhost:5173/
+Once successful, open the frontend project at: http://localhost:8081/
 
 ### 4. Get started
 
