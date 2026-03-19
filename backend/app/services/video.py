@@ -731,34 +731,33 @@ async def render_final_video(
             )
 
             if has_assignments:
-                # Fill in gaps for slots without explicit assignments using remaining time
-                # First pass: assign explicit windows
-                windows: list[tuple[float, float] | None] = []
-                for slot in resolved_slots:
-                    if slot["sub_start"] is not None or slot["sub_end"] is not None:
-                        windows.append(_srt_window(slot["sub_start"], slot["sub_end"]))
+                # 1. Resolve start times for each slot based on sub_start
+                # If a slot lacks sub_start, it defaults to the end time of the previous slot (or 0.0)
+                windows: list[tuple[float, float]] = []
+                current_start = 0.0
+                
+                start_times = []
+                for idx, slot in enumerate(resolved_slots):
+                    st = slot["sub_start"]
+                    if st is not None and srt_times:
+                        srt_idx = max(0, min(len(srt_times) - 1, int(st)))
+                        t_val = srt_times[srt_idx][0]
+                        
+                        # Ensure monotonic increasing time (can't go backwards)
+                        t_val = max(current_start, t_val)
+                        start_times.append(t_val)
+                        current_start = t_val
                     else:
-                        windows.append(None)
-
-                # Second pass: distribute unassigned slots among unaccounted time
-                assigned_ranges = [w for w in windows if w is not None]
-                covered = set()
-                for w in assigned_ranges:
-                    for idx, (ts, te) in enumerate(srt_times):
-                        if ts >= w[0] and te <= w[1] + 0.01:
-                            covered.add(idx)
-                unassigned_lines = [i for i in range(len(srt_times)) if i not in covered]
-
-                none_count = windows.count(None)
-                chunk = max(1, len(unassigned_lines) // max(1, none_count))
-                fill_idx = 0
-                for wi, w in enumerate(windows):
-                    if w is None:
-                        start_line = unassigned_lines[fill_idx] if fill_idx < len(unassigned_lines) else len(srt_times) - 1
-                        end_line = unassigned_lines[min(fill_idx + chunk - 1, len(unassigned_lines) - 1)] if fill_idx < len(unassigned_lines) else len(srt_times) - 1
-                        windows[wi] = _srt_window(start_line, end_line)
-                        fill_idx += chunk
-                image_time_windows = [(w or (0.0, subtitle_duration)) for w in windows]
+                        start_times.append(current_start)
+                        
+                # 2. Build the windows. Each image holds until the next image's start time, 
+                # or until the end of the scene.
+                for i in range(len(start_times)):
+                    w_start = start_times[i]
+                    w_end = start_times[i+1] if i + 1 < len(start_times) else subtitle_duration
+                    windows.append((w_start, w_end))
+                    
+                image_time_windows = windows
             else:
                 # No assignments — even split
                 per_dur = subtitle_duration / n_images

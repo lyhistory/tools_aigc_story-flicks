@@ -48,13 +48,33 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
     const [scenes, setScenes] = useState<StoryScene[]>(() =>
         initialScenes.map(s => ({ ...s, extra_images: s.extra_images || [] }))
     );
-    // Snapshot of the ORIGINAL scene images (taken at mount) — used in reuse modal
-    // so swapping scene 1 & 2 still shows scene 1's original image.
-    const [originalImages] = useState<{ idx: number; url: string }[]>(() =>
-        initialScenes
-            .map((s, i) => s.url ? { idx: i, url: s.url } : null)
-            .filter(Boolean) as { idx: number; url: string }[]
-    );
+    const [allGeneratedImages, setAllGeneratedImages] = useState<{ label: string; url: string }[]>([]);
+
+    useEffect(() => {
+        // Build a unique pool of all generated images based on initialScenes and current scenes.
+        const poolMap = new Map<string, { label: string; url: string }>();
+        
+        // 1. Add originals
+        initialScenes.forEach((s, i) => {
+            if (s.url) poolMap.set(s.url, { label: `Scene ${i + 1} Original`, url: s.url });
+        });
+
+        // 2. Add any active URLs in current scenes (including regenerations/slots)
+        scenes.forEach((s, i) => {
+            if (s.url && !poolMap.has(s.url)) {
+                poolMap.set(s.url, { label: `Scene ${i + 1} Regen/Active`, url: s.url });
+            }
+            if (s.image_slots) {
+                s.image_slots.forEach((slot, sIdx) => {
+                    if (slot.url && !poolMap.has(slot.url)) {
+                         poolMap.set(slot.url, { label: `Scene ${i + 1} Slot ${sIdx + 1}`, url: slot.url });
+                    }
+                });
+            }
+        });
+        
+        setAllGeneratedImages(Array.from(poolMap.values()));
+    }, [initialScenes, scenes]);
 
     const { setVideoUrl, assembling, setAssembling } = useVideoStore();
     const [regeneratingIndexes, setRegeneratingIndexes] = useState<Record<number, boolean>>({});
@@ -149,13 +169,40 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
     };
 
     // Helper to count lines in script (by sentence delimiters)
+    // Matches backend's split_string_by_punctuations(s, split_minor_punct=False)
     const getScriptLines = (script: string) => {
         if (!script) return [];
-        // Match backend's split_minor_punct=False logic (major punct + newline)
-        // Symbols: ?, ., !, …, ？, 。, ！, ...
-        return script
-            .split(/(?<=[.!?…？。！])\s+|\n/)
-            .filter(l => l.trim().length > 0 && /[\w\u4e00-\u9fa5]/.test(l));
+        const activePunctuations = ["?", ".", "!", "…", "？", "。", "！", "..."];
+        let result: string[] = [];
+        let txt = "";
+        
+        for (let i = 0; i < script.length; i++) {
+            const char = script[i];
+            if (char === "\n") {
+                if (txt.trim()) result.push(txt.trim());
+                txt = "";
+                continue;
+            }
+            
+            // Handle numeric decimals like in backend (1.5 should not split)
+            const prev = i > 0 ? script[i-1] : "";
+            const next = i < script.length - 1 ? script[i+1] : "";
+            if (char === "." && /\d/.test(prev) && /\d/.test(next)) {
+                txt += char;
+                continue;
+            }
+
+            if (!activePunctuations.includes(char)) {
+                txt += char;
+            } else {
+                if (txt.trim()) result.push(txt.trim());
+                txt = "";
+            }
+        }
+        if (txt.trim()) result.push(txt.trim());
+
+        // Basic validation: must contain at least one word/character
+        return result.filter(seg => /[\w\u4e00-\u9fa5]/.test(seg));
     };
 
     const handleDelete = (index: number) => {
@@ -209,17 +256,18 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
             });
             if (res?.success === false) throw new Error(res?.message || 'Regeneration Failed');
             message.success({ content: `Scene ${index + 1} image regenerated!`, key: 'regen_img' });
-            if (res?.data?.image_url) {
-                const newScenes = [...scenes];
-                newScenes[index].url = res.data.image_url;
-                // Important: sync with image_slots as well so the UI updates
-                if (newScenes[index].image_slots && newScenes[index].image_slots.length > 0) {
-                    newScenes[index].image_slots[0].url = res.data.image_url;
-                } else {
-                    newScenes[index].image_slots = [{ url: res.data.image_url, sub_start: null, sub_end: null }];
+                if (res?.data?.image_url) {
+                    const newUrl = res.data.image_url;
+                    const newScenes = [...scenes];
+                    newScenes[index].url = newUrl;
+                    // Important: sync with image_slots as well so the UI updates
+                    if (newScenes[index].image_slots && newScenes[index].image_slots.length > 0) {
+                        newScenes[index].image_slots[0].url = newUrl;
+                    } else {
+                        newScenes[index].image_slots = [{ url: newUrl, sub_start: null, sub_end: null }];
+                    }
+                    setScenes(newScenes);
                 }
-                setScenes(newScenes);
-            }
         } catch (err: any) {
             message.error({ content: 'Image Regeneration Failed: ' + err?.message, key: 'regen_img' });
         } finally {
@@ -514,16 +562,16 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
                         : 'Pick an image to replace the primary image for this scene.'}
                 </Text>
                 <div style={{ display: 'flex', flexWrap: 'wrap', gap: 16 }}>
-                    {originalImages.map(({ idx: srcIdx, url }) => (
+                    {allGeneratedImages.map((img, poolIdx) => (
                         <Card
-                            key={srcIdx}
+                            key={poolIdx}
                             hoverable
                             size="small"
-                            style={{ width: 150 }}
-                            onClick={() => handleReuseSelect(url)}
-                            cover={<img alt={`Scene ${srcIdx + 1}`} src={url} style={{ height: 150, objectFit: 'cover' }} />}
+                            style={{ width: 140 }}
+                            onClick={() => handleReuseSelect(img.url)}
+                            cover={<img alt={img.label} src={img.url} style={{ height: 140, objectFit: 'cover' }} />}
                         >
-                            <Card.Meta title={`Scene ${srcIdx + 1} (original)`} />
+                            <Card.Meta title={img.label} />
                         </Card>
                     ))}
                 </div>
