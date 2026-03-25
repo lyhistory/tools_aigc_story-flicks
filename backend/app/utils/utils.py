@@ -128,31 +128,40 @@ def split_string_by_punctuations(s):
     result = []
     txt = ""
 
-    previous_char = ""
-    next_char = ""
-    for i in range(len(s)):
+    i = 0
+    while i < len(s):
         char = s[i]
+        
         if char == "\n":
-            result.append(txt.strip())
+            if txt.strip():
+                result.append(txt.strip())
             txt = ""
+            i += 1
             continue
 
-        if i > 0:
-            previous_char = s[i - 1]
-        if i < len(s) - 1:
-            next_char = s[i + 1]
+        previous_char = s[i - 1] if i > 0 else ""
+        next_char = s[i + 1] if i < len(s) - 1 else ""
 
         if char == "." and previous_char.isdigit() and next_char.isdigit():
-            # # In the case of "withdraw 10,000, charged at 2.5% fee", the dot in "2.5" should not be treated as a line break marker
+            # In the case of "withdraw 10,000, charged at 2.5% fee", the dot in "2.5" should not be treated as a line break marker
             txt += char
+            i += 1
             continue
 
-        if char not in const.PUNCTUATIONS:
-            txt += char
-        else:
-            result.append(txt.strip())
+        txt += char
+        if char in const.PUNCTUATIONS:
+            while i + 1 < len(s) and s[i+1] in ['\'', '"', '”', '’', ')', ']']:
+                txt += s[i+1]
+                i += 1
+            if txt.strip():
+                result.append(txt.strip())
             txt = ""
-    result.append(txt.strip())
+            
+        i += 1
+        
+    if txt.strip():
+        result.append(txt.strip())
+        
     # filter empty string
     result = list(filter(None, result))
     return result
@@ -163,32 +172,35 @@ def split_string_by_punctuations_new(text: str) -> List[str]:
     result = []
     txt = ""
 
-    previous_char = ""
-    next_char = ""
-    for i in range(len(text)):
+    i = 0
+    while i < len(text):
         char = text[i]
+        
         if char == "\n":
             if txt.strip():
                 result.append(txt.strip())
             txt = ""
+            i += 1
             continue
 
-        if i > 0:
-            previous_char = text[i - 1]
-        if i < len(text) - 1:
-            next_char = text[i + 1]
+        previous_char = text[i - 1] if i > 0 else ""
+        next_char = text[i + 1] if i < len(text) - 1 else ""
 
         if char == "." and previous_char.isdigit() and next_char.isdigit():
             txt += char
+            i += 1
             continue
 
-        if char not in [".", "。", "！", "？", "...", "…"]:
-            txt += char
-        else:
-            txt += char
+        txt += char
+        if char in [".", "。", "！", "？", "...", "…"]:
+            while i + 1 < len(text) and text[i+1] in ['\'', '"', '”', '’', ')', ']']:
+                txt += text[i+1]
+                i += 1
             if txt.strip():
                 result.append(txt.strip())
             txt = ""
+            
+        i += 1
 
     if txt.strip():
         result.append(txt.strip())

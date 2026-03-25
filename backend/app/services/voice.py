@@ -57,31 +57,36 @@ def split_string_by_punctuations(s, split_minor_punct: bool = True):
         # visible lag (avoid splitting on commas/colons/semicolons).
         active_punctuations = ["?", ".", "!", "…", "？", "。", "！", "..."]
 
-    previous_char = ""
-    next_char = ""
-    for i in range(len(s)):
+    i = 0
+    while i < len(s):
         char = s[i]
+        
         if char == "\n":
             if txt.strip():  # 只有在非空的情况下才添加
                 result.append(txt.strip())
             txt = ""
+            i += 1
             continue
 
-        if i > 0:
-            previous_char = s[i - 1]
-        if i < len(s) - 1:
-            next_char = s[i + 1]
+        previous_char = s[i - 1] if i > 0 else ""
+        next_char = s[i + 1] if i < len(s) - 1 else ""
 
         if char == "." and previous_char.isdigit() and next_char.isdigit():
             txt += char
+            i += 1
             continue
 
-        if char not in active_punctuations:
-            txt += char
-        else:
+        txt += char
+        if char in active_punctuations:
+            while i + 1 < len(s) and s[i+1] in ['\'', '"', '”', '’', ')', ']']:
+                txt += s[i+1]
+                i += 1
             if txt.strip():  # 只有在非空的情况下才添加
                 result.append(txt.strip())
             txt = ""
+            
+        i += 1
+        
     if txt.strip():  # 最后一段如果非空也要添加
         result.append(txt.strip())
     

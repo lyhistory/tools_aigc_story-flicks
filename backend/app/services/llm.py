@@ -1442,7 +1442,16 @@ class LLMService:
                 return s
 
             # Fallback for raw quote-only dialogue
-            quotes = re.findall(r"[\"“”']([^\"“”']{2,180})[\"“”']", text)
+            # Safely capture matched asymmetric/symmetric quotes bounded by non-words
+            
+            # If there is significant unquoted narration, do not attempt to override the whole string
+            clean_quotes_only = re.sub(r"(?<!\w)(?:\"[^\"]{2,180}\"|'[^']{2,180}'|“[^”]{2,180}”|‘[^’]{2,180}’)(?!\w)", "", text)
+            if len(clean_quotes_only.strip()) > 15:
+                # The text is already mostly narration, leave it alone.
+                return text
+
+            matches = re.findall(r"(?<!\w)(?:\"([^\"]{2,180})\"|'([^']{2,180})'|“([^”]{2,180})”|‘([^’]{2,180})’)(?!\w)", text)
+            quotes = [next((g for g in m if g), "") for m in matches]
             quotes = [with_end_punct(q) for q in quotes if q and q.strip()]
             if len(quotes) >= 2:
                 return f'The child says, "{quotes[0]}" Daddy says, "{quotes[1]}"'

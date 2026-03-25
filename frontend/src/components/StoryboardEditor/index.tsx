@@ -184,6 +184,7 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
         
         for (let i = 0; i < script.length; i++) {
             const char = script[i];
+            
             if (char === "\n") {
                 if (txt.trim()) result.push(txt.trim());
                 txt = "";
@@ -198,9 +199,12 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
                 continue;
             }
 
-            if (!activePunctuations.includes(char)) {
-                txt += char;
-            } else {
+            txt += char;
+            if (activePunctuations.includes(char)) {
+                while (i + 1 < script.length && ['\'', '"', '”', '’', ')', ']'].includes(script[i+1])) {
+                    txt += script[i+1];
+                    i++;
+                }
                 if (txt.trim()) result.push(txt.trim());
                 txt = "";
             }
