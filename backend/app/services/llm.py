@@ -719,6 +719,7 @@ class LLMService:
                        resolution: str = "1024x1024",
                        task_dir: str = None,
                        segment_index: int = 1,
+                       image_filename: str = None,
                        **img2img_kwargs  # ← add this to catch init_image_base64, strength, mask, etc.
                        ) -> str:
         # return "https://dashscope-result-bj.oss-cn-beijing.aliyuncs.com/1d/56/20250118/3c4cc727/4fc622b5-54a6-484c-bf1f-f1cfb66ace2d-1.png?Expires=1737290655&OSSAccessKeyId=LTAI5tQZd8AEcZX6KZV4G8qL&Signature=W8D4CN3uonQ2pL1e9xGMWufz33E%3D"
@@ -1220,8 +1221,8 @@ class LLMService:
                                 
                                 task_path = Path(task_dir)
                                 task_path.mkdir(parents=True, exist_ok=True)
-                                image_filename = f"{segment_index}.png"
-                                image_path = task_path / image_filename
+                                final_filename = image_filename if image_filename else f"{segment_index}.png"
+                                image_path = task_path / final_filename
                                 image_path.write_bytes(img_bytes)
                                 
                                 if is_wrong_orientation(image_path):
@@ -1254,8 +1255,8 @@ class LLMService:
                                         
                                         task_path = Path(task_dir)
                                         task_path.mkdir(parents=True, exist_ok=True)
-                                        image_filename = f"scene_{segment_index}.png"
-                                        image_path = task_path / image_filename
+                                        final_filename = image_filename if image_filename else f"scene_{segment_index}.png"
+                                        image_path = task_path / final_filename
                                         image_path.write_bytes(img_bytes)
                                         
                                         if is_wrong_orientation(image_path):

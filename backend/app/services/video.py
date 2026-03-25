@@ -671,11 +671,15 @@ async def render_final_video(
                 """Try to map a frontend URL back to a local filesystem path."""
                 if not url:
                     return None
+                
+                # Strip query params like ?t=...
+                clean_url = url.split("?")[0]
+                
                 # Already a local path
-                if os.path.exists(url):
-                    return url
+                if os.path.exists(clean_url):
+                    return clean_url
                 # URL pattern: /tasks/<task_id>/<filename>
-                rel = url.split("/tasks/", 1)[-1] if "/tasks/" in url else None
+                rel = clean_url.split("/tasks/", 1)[-1] if "/tasks/" in clean_url else None
                 if rel:
                     candidate = os.path.join(tasks_root, rel.replace("/", os.sep))
                     if os.path.exists(candidate):
@@ -695,10 +699,9 @@ async def render_final_video(
                         })
                     else:
                         logger.warning(f"Scene {i}: image_slot URL not found locally: {slot.url}")
-                # Ensure primary image is always first if not already in slots
-                primary_paths = [s["path"] for s in resolved_slots]
-                if image_file not in primary_paths:
-                    resolved_slots.insert(0, {"path": image_file, "sub_start": None, "sub_end": None})
+                if not resolved_slots:
+                    # Fallback if slot URLs were all bad
+                    resolved_slots = [{"path": image_file, "sub_start": None, "sub_end": None}]
             else:
                 # Fall back to old extra_images list (even split, no subtitle assignment)
                 extra_urls = list(getattr(scene, "extra_images", None) or [])
@@ -740,7 +743,11 @@ async def render_final_video(
                 for idx, slot in enumerate(resolved_slots):
                     st = slot["sub_start"]
                     if st is not None and srt_times:
-                        srt_idx = max(0, min(len(srt_times) - 1, int(st)))
+                        st_idx = int(st)
+                        # Frontend sends 1-indexed values (Start=1 means first subtitle)
+                        if st_idx > 0:
+                            st_idx -= 1
+                        srt_idx = max(0, min(len(srt_times) - 1, st_idx))
                         t_val = srt_times[srt_idx][0]
                         
                         # Ensure monotonic increasing time (can't go backwards)
@@ -767,6 +774,8 @@ async def render_final_video(
                     image_time_windows[-1] = (image_time_windows[-1][0], subtitle_duration)
 
             all_image_files = [s["path"] for s in resolved_slots]
+            logger.info(f"Scene {i} resolved image files: {all_image_files}")
+            logger.info(f"Scene {i} time windows: {image_time_windows}")
 
             # Build a base ImageClip for each image
             if target_w is None or target_h is None:
@@ -1416,9 +1425,12 @@ async def regenerate_image_impl(request: RegenerateImageRequest) -> str:
             raise ValueError(f"Task directory not found: {task_dir}.")
         
         logger.info(f"Regenerating image for scene {request.scene_index} in task {task_id}")
-        # Call LLM Provider to generate new image
-        import asyncio
-        from app.services.llm import llm_service
+        # Generate the destination filename first
+        import time
+        timestamp = int(time.time())
+        filename = f"{request.scene_index}_{timestamp}.png"
+        image_path = os.path.join(task_dir, filename)
+
         image_url = await asyncio.to_thread(
             llm_service.generate_image,
             prompt=request.scene_prompt,
@@ -1426,16 +1438,14 @@ async def regenerate_image_impl(request: RegenerateImageRequest) -> str:
             image_llm_model=request.image_llm_model,
             resolution=request.resolution,
             task_dir=task_dir,
-            segment_index=request.scene_index
+            segment_index=request.scene_index,
+            image_filename=filename
         )
         if not image_url:
             raise ValueError(f"No image returned from LLM provider for prompt: {request.scene_prompt}")
 
         # Download and save as a new file (avoid overwriting the original)
-        import time
-        timestamp = int(time.time())
-        filename = f"{request.scene_index}_{timestamp}.png"
-        image_path = os.path.join(task_dir, filename)
+
         
         if image_url.startswith('/') or image_url.startswith('\\') or os.path.isabs(image_url):
             if os.path.exists(image_url):

@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Button, Card, Typography, Space, Popconfirm, message, Modal, Slider, Image, Select, Badge, Spin } from 'antd';
+import { Button, Card, Typography, Space, Popconfirm, message, Modal, Slider, Image, Select, Badge, Spin, Input } from 'antd';
 import { DeleteOutlined, ReloadOutlined, SwapOutlined, CheckCircleFilled } from '@ant-design/icons';
 import { assembleVideo, regenerateImage, getSubtitleFonts } from '../../services/index';
 import { useVideoStore } from '../../stores/index';
@@ -96,6 +96,11 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
     const [targetSceneIdx, setTargetSceneIdx] = useState<number | null>(null);
     // 'replace-primary' = replace scene's main image; 'add-extra' = add to extras list
     const [reuseMode, setReuseMode] = useState<'replace-primary' | 'add-extra'>('replace-primary');
+
+    // Prompt Regen Modal State
+    const [regenModalVisible, setRegenModalVisible] = useState(false);
+    const [regenSceneIdx, setRegenSceneIdx] = useState<number | null>(null);
+    const [regenPromptText, setRegenPromptText] = useState("");
 
     useEffect(() => {
         getSubtitleFonts().then(res => {
@@ -253,14 +258,25 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
         }
     };
 
-    const handleRegenerateImage = async (index: number, scene: StoryScene) => {
+    const openRegenModal = (index: number, scene: StoryScene) => {
+        setRegenSceneIdx(index);
+        setRegenPromptText(scene.scene_prompt || "");
+        setRegenModalVisible(true);
+    };
+
+    const handleConfirmRegen = async () => {
+        if (regenSceneIdx === null) return;
+        const index = regenSceneIdx;
+        const editedPrompt = regenPromptText.trim();
+        
+        setRegenModalVisible(false);
         setRegeneratingIndexes(prev => ({ ...prev, [index]: true }));
         message.loading({ content: `Regenerating image for scene ${index + 1}...`, key: 'regen_img' });
         try {
             const res = await regenerateImage({
                 task_id: taskId,
                 scene_index: index + 1,
-                scene_prompt: scene.scene_prompt,
+                scene_prompt: editedPrompt,
                 // Inherit global resolution setting, llm providers etc can be pushed as well but keeping simple
                 resolution: resolution
             });
@@ -282,6 +298,8 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
             message.error({ content: 'Image Regeneration Failed: ' + err?.message, key: 'regen_img' });
         } finally {
             setRegeneratingIndexes(prev => ({ ...prev, [index]: false }));
+            setRegenSceneIdx(null);
+            setRegenPromptText("");
         }
     };
 
@@ -513,7 +531,7 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
                                             size="small"
                                             icon={<ReloadOutlined />}
                                             loading={!!regeneratingIndexes[idx]}
-                                            onClick={() => handleRegenerateImage(idx, scene)}
+                                            onClick={() => openRegenModal(idx, scene)}
                                         >
                                             Regen
                                         </Button>
@@ -584,6 +602,30 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
                             <Card.Meta title={img.label} />
                         </Card>
                     ))}
+                </div>
+            </Modal>
+
+            <Modal
+                title={`Regenerate Scene ${(regenSceneIdx ?? 0) + 1} Image`}
+                open={regenModalVisible}
+                onOk={handleConfirmRegen}
+                onCancel={() => {
+                    setRegenModalVisible(false);
+                    setRegenSceneIdx(null);
+                    setRegenPromptText("");
+                }}
+                okText="Generate"
+                cancelText="Cancel"
+            >
+                <div style={{ marginBottom: 16 }}>
+                    <Text type="secondary" style={{ display: 'block', marginBottom: 8 }}>
+                        Edit the prompt for the new image. This will not change your story text, only the visual representation.
+                    </Text>
+                    <Input.TextArea
+                        rows={6}
+                        value={regenPromptText}
+                        onChange={e => setRegenPromptText(e.target.value)}
+                    />
                 </div>
             </Modal>
         </div>
