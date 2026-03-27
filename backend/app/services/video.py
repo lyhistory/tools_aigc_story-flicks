@@ -647,7 +647,8 @@ async def render_final_video(
             return ImageClip(file_path)
 
     shown_keyword_words = set()
-    for i, scene in enumerate(scenes, 1):
+    for __i, scene in enumerate(scenes, 1):
+        i = getattr(scene, "original_index", None) or __i
         try:
             # 获取文件路径
             image_file = os.path.join(task_dir, f"{i}.png")
@@ -699,19 +700,21 @@ async def render_final_video(
                         })
                     else:
                         logger.warning(f"Scene {i}: image_slot URL not found locally: {slot.url}")
-                if not resolved_slots:
-                    # Fallback if slot URLs were all bad
-                    resolved_slots = [{"path": image_file, "sub_start": None, "sub_end": None}]
             else:
                 # Fall back to old extra_images list (even split, no subtitle assignment)
                 extra_urls = list(getattr(scene, "extra_images", None) or [])
-                resolved_slots = [{"path": image_file, "sub_start": None, "sub_end": None}]
-                for ex_idx, ex_url in enumerate(extra_urls):
-                    local = _resolve_url_to_local(str(ex_url))
-                    if local:
-                        resolved_slots.append({"path": local, "sub_start": None, "sub_end": None})
-                    else:
-                        logger.warning(f"Scene {i} extra_image[{ex_idx}] not found: {ex_url}")
+                resolved_slots = []
+                # Only fallback to original image_file if scene.url was actually populated.
+                # If scene.url is strictly deleted/empty, user removed all slots manually.
+                if getattr(scene, "url", None):
+                    scene_url = _resolve_url_to_local(str(scene.url))
+                    resolved_slots.append({"path": scene_url or image_file, "sub_start": None, "sub_end": None})
+                    for ex_idx, ex_url in enumerate(extra_urls):
+                        local = _resolve_url_to_local(str(ex_url))
+                        if local:
+                            resolved_slots.append({"path": local, "sub_start": None, "sub_end": None})
+                        else:
+                            logger.warning(f"Scene {i} extra_image[{ex_idx}] not found: {ex_url}")
 
             n_images = len(resolved_slots)
 
@@ -767,11 +770,15 @@ async def render_final_video(
                 image_time_windows = windows
             else:
                 # No assignments — even split
-                per_dur = subtitle_duration / n_images
-                image_time_windows = [(i * per_dur, (i + 1) * per_dur) for i in range(n_images)]
-                # clamp last window to subtitle_duration
-                if image_time_windows:
-                    image_time_windows[-1] = (image_time_windows[-1][0], subtitle_duration)
+                if n_images > 0:
+                    per_dur = subtitle_duration / n_images
+                    image_time_windows = [(idx * per_dur, (idx + 1) * per_dur) for idx in range(n_images)]
+                    # clamp last window to subtitle_duration
+                    if image_time_windows:
+                        image_time_windows[-1] = (image_time_windows[-1][0], subtitle_duration)
+                else:
+                    # No images at all (user deleted all slots)
+                    image_time_windows = [(0.0, subtitle_duration)]
 
             all_image_files = [s["path"] for s in resolved_slots]
             logger.info(f"Scene {i} resolved image files: {all_image_files}")
@@ -779,22 +786,36 @@ async def render_final_video(
 
             # Build a base ImageClip for each image
             if target_w is None or target_h is None:
-                base_img = Image.open(all_image_files[0])
-                target_w, target_h = base_img.size
-                base_img.close()
+                # fallback dims
+                target_w, target_h = (1080, 1920)
+                if all_image_files:
+                    try:
+                        base_img = Image.open(all_image_files[0])
+                        target_w, target_h = base_img.size
+                        base_img.close()
+                    except Exception:
+                        pass
 
             # Build (bg_clip, fg_clip) pairs; duration is window length for each
             image_clips: list[tuple] = []
-            for img_file, (win_start, win_end) in zip(all_image_files, image_time_windows):
-                dur = max(0.1, win_end - win_start)
-                _bg, _fg, origin_image_w, origin_image_h = build_image_clips(
-                    image_file=img_file,
-                    target_w=target_w,
-                    target_h=target_h,
-                    duration=dur,
-                    image_scale=1.2
-                )
-                image_clips.append((_bg, _fg))
+            
+            if not all_image_files:
+                # Empty slot case: push a black clip so video doesn't crash assembling
+                dur = max(0.1, subtitle_duration)
+                black_clip = ImageClip(np.zeros((target_h, target_w, 3), dtype=np.uint8)).with_duration(dur)
+                image_clips.append((black_clip, black_clip))
+                origin_image_w, origin_image_h = target_w, target_h
+            else:
+                for img_file, (win_start, win_end) in zip(all_image_files, image_time_windows):
+                    dur = max(0.1, win_end - win_start)
+                    _bg, _fg, origin_image_w, origin_image_h = build_image_clips(
+                        image_file=img_file,
+                        target_w=target_w,
+                        target_h=target_h,
+                        duration=dur,
+                        image_scale=1.2
+                    )
+                    image_clips.append((_bg, _fg))
 
             # audio will be attached to the final composite clip
             # Fonts
@@ -1214,8 +1235,9 @@ async def generate_video(request: VideoGenerateRequest):
                     is_cover=scene.get("is_cover", False),
                     subject=scene.get("subject"),
                     topic_type=scene.get("topic_type"),
+                    original_index=idx,
                 )
-                for scene in story_list
+                for idx, scene in enumerate(story_list, 1)
             ]
             
             # 保存 story.json
@@ -1318,8 +1340,9 @@ async def generate_storyboard_impl(request: VideoGenerateRequest) -> dict:
                 is_cover=scene.get("is_cover", False),
                 subject=scene.get("subject"),
                 topic_type=scene.get("topic_type"),
+                original_index=idx,
             )
-            for scene in story_list
+            for idx, scene in enumerate(story_list, 1)
         ]
 
         story_data = request.model_dump()

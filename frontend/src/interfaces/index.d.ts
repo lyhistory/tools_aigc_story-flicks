@@ -60,6 +60,7 @@ interface StoryScene {
     is_cover?: boolean;
     subject?: string;
     topic_type?: string;
+    original_index?: number;
 }
 
 interface StoryboardAssembleReq {

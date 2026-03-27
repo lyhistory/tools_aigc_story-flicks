@@ -46,7 +46,11 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
     taskId, scenes: initialScenes, resolution, chineseSubtitleEnabled, karaoke, onClose
 }) => {
     const [scenes, setScenes] = useState<StoryScene[]>(() =>
-        initialScenes.map(s => ({ ...s, extra_images: s.extra_images || [] }))
+        initialScenes.map((s, idx) => ({ 
+            ...s, 
+            extra_images: s.extra_images || [],
+            original_index: s.original_index || idx + 1
+        }))
     );
     const [allGeneratedImages, setAllGeneratedImages] = useState<{ label: string; url: string }[]>([]);
 
@@ -174,8 +178,18 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
         setScenes(prev => prev.map((s, i) => {
             if (i !== sceneIdx) return s;
             let newSlots = [...(s.image_slots || [])];
+            
+            // If they are deleting before slots even initialized properly, fallback construct it
+            if (newSlots.length === 0 && s.url) {
+                newSlots = [{ url: s.url, sub_start: null, sub_end: null }];
+            }
+            
             newSlots.splice(slotIdx, 1);
-            return { ...s, url: newSlots[0]?.url || s.url, image_slots: newSlots };
+            
+            // If we deleted the primary slot or all slots, we MUST clear s.url so the video assembler gets the empty array
+            const newUrl = newSlots.length > 0 ? newSlots[0].url : "";
+            
+            return { ...s, url: newUrl, image_slots: newSlots };
         }));
     };
 
@@ -452,17 +466,16 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
                                                         </div>
                                                     )}
                                                 </Spin>
-                                                {slotIdx > 0 && (
-                                                    <Popconfirm title="Remove this image slot?" onConfirm={() => removeExtraImage(idx, slotIdx)}>
-                                                        <Button
-                                                            size="small"
-                                                            danger
-                                                            type="text"
-                                                            icon={<DeleteOutlined />}
-                                                            style={{ position: 'absolute', top: 2, right: 2, background: 'rgba(255,255,255,0.8)', padding: '0 2px' }}
-                                                        />
-                                                    </Popconfirm>
-                                                )}
+                                                
+                                                <Popconfirm title="Remove this image slot?" onConfirm={() => removeExtraImage(idx, slotIdx)}>
+                                                    <Button
+                                                        size="small"
+                                                        danger
+                                                        type="text"
+                                                        icon={<DeleteOutlined />}
+                                                        style={{ position: 'absolute', top: 2, right: 2, background: 'rgba(255,255,255,0.8)', padding: '0 2px' }}
+                                                    />
+                                                </Popconfirm>
                                             </div>
                                             {/* Subtitle Range Selection */}
                                             <div style={{ marginTop: 4 }}>

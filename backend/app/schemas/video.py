@@ -307,6 +307,7 @@ class StoryScene(BaseModel):
     is_cover: Optional[bool] = Field(default=False, description="Whether this scene is a cover/title scene")
     subject: Optional[str] = Field(default=None, description="Optional cover subject")
     topic_type: Optional[TopicType] = Field(default=None, description="Topic type of this scene")
+    original_index: Optional[int] = Field(default=None, description="Preserves file-binding to .mp3/.srt when scenes are deleted/shifted in UI")
 
 class VideoGenerateRequest(BaseModel):
     """视频生成请求"""
