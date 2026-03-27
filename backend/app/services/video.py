@@ -1425,8 +1425,10 @@ async def regenerate_image_impl(request: RegenerateImageRequest) -> str:
             raise ValueError(f"Task directory not found: {task_dir}.")
         
         logger.info(f"Regenerating image for scene {request.scene_index} in task {task_id}")
-        # Generate the destination filename first
         import time
+        import asyncio
+        from app.services.llm import llm_service
+        
         timestamp = int(time.time())
         filename = f"{request.scene_index}_{timestamp}.png"
         image_path = os.path.join(task_dir, filename)
