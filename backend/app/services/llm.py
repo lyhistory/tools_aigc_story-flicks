@@ -2200,23 +2200,83 @@ class LLMService:
         
         
         try:
+            extra_body = {}
+            if "moonshot" in text_llm_model.lower() or text_llm_provider == "nvidia":
+                extra_body = {"chat_template_kwargs": {"thinking": True}}
+                
             response = text_client.chat.completions.create(
                 model= text_llm_model,
-                response_format={"type": response_format},
+                response_format={"type": response_format} if response_format else None,
                 messages=messages,
                 temperature=0.7,
                 max_tokens=2048,
-                timeout=180
+                timeout=180,
+                extra_body=extra_body if extra_body else None
             )
-            logger.info(f"Raw API response received: {response}")
+            logger.info(f"Raw API response received")
             content = response.choices[0].message.content
             result = json.loads(content)
             logger.info(f"LLM full response: {result}")
             return result
         except Exception as e:
-            logger.error(f"LLM call failed | provider={text_llm_provider} | model={text_llm_model}", exc_info=True)
-            logger.error(f"Failed to parse response: {e}")
-            raise e
+            logger.warning(f"Standard API call failed (Code 1) errored: {e}. Trying fallback with requests (Code 2)...")
+            try:
+                import requests
+                
+                invoke_url = "https://integrate.api.nvidia.com/v1/chat/completions"
+                base_url = settings.nvidia_base_url if text_llm_provider == "nvidia" else (settings.openai_base_url if text_llm_provider == "openai" else None)
+                if base_url:
+                    invoke_url = f"{base_url.rstrip('/')}/chat/completions"
+                
+                api_key = settings.nvidia_api_key if text_llm_provider == "nvidia" else settings.openai_api_key
+                
+                headers = {
+                  "Authorization": f"Bearer {api_key}",
+                  "Accept": "text/event-stream"
+                }
+
+                payload = {
+                  "model": text_llm_model,
+                  "messages": messages,
+                  "max_tokens": 16384 if "moonshot" in text_llm_model.lower() else 4096,
+                  "temperature": 1.0,
+                  "stream": True,
+                }
+                
+                if "moonshot" in text_llm_model.lower():
+                    payload["chat_template_kwargs"] = {"thinking": True}
+                if response_format:
+                    payload["response_format"] = {"type": response_format}
+
+                resp = requests.post(invoke_url, headers=headers, json=payload, stream=True, timeout=180)
+                resp.raise_for_status()
+                
+                content_chunks = []
+                for line in resp.iter_lines():
+                    if line:
+                        decoded_line = line.decode('utf-8')
+                        if decoded_line.startswith("data:"):
+                            data_str = decoded_line[5:].strip()
+                            if data_str == "[DONE]":
+                                break
+                            try:
+                                chunk_data = json.loads(data_str)
+                                if chunk_data.get("choices"):
+                                    delta = chunk_data["choices"][0].get("delta", {})
+                                    if "content" in delta and delta["content"] is not None:
+                                        content_chunks.append(delta["content"])
+                            except Exception as parse_e:
+                                logger.warning(f"Failed to parse streaming chunk: {data_str} - {parse_e}")
+                
+                content = "".join(content_chunks)
+                logger.info(f"Fallback streaming finished. Content length: {len(content)}")
+                result = json.loads(content)
+                logger.info(f"Fallback LLM full response: {result}")
+                return result
+            except Exception as e2:
+                logger.error(f"Fallback LLM call failed | provider={text_llm_provider} | model={text_llm_model}", exc_info=True)
+                logger.error(f"Failed to parse response: {e2}")
+                raise RuntimeError(f"LLM Provider error: {str(e)} -> Fallback error: {str(e2)}") from e2
 
     async def _get_story_prompt(self, story_prompt: str = None, language: Language = Language.CHINESE_CN, segments: int = 3, base_start: str = "讲一个故事，主题是：", text_lang_note: str = "written in Chinese (简体中文)", extra_requirements: str = "") -> str:
         """生成故事提示词
