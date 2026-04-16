@@ -415,6 +415,8 @@ const App: React.FC = () => {
                     resolution={form.getFieldValue('resolution') || '1080*1920'}
                     chineseSubtitleEnabled={form.getFieldValue('chinese_subtitle_enabled')}
                     karaoke={form.getFieldValue('karaoke')}
+                    subject={form.getFieldValue('subject')}
+                    topicType={form.getFieldValue('topic_type')}
                     onClose={() => setStoryboardData(null)}
                 />
             )}

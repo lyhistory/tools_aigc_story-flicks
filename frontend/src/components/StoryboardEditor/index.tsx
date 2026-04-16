@@ -14,6 +14,8 @@ interface StoryboardEditorProps {
     resolution: string;
     chineseSubtitleEnabled: boolean;
     karaoke: boolean;
+    subject?: string;
+    topicType?: string;
     onClose: () => void;
 }
 
@@ -43,7 +45,7 @@ const DEFAULT_FONT = 'NotoSans-Bold';
 const DEFAULT_FONT_SIZE = 58;
 
 const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
-    taskId, scenes: initialScenes, resolution, chineseSubtitleEnabled, karaoke, onClose
+    taskId, scenes: initialScenes, resolution, chineseSubtitleEnabled, karaoke, subject, topicType, onClose
 }) => {
     const [scenes, setScenes] = useState<StoryScene[]>(() =>
         initialScenes.map((s, idx) => ({ 
@@ -321,9 +323,25 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
 
     return (
         <div style={{ marginTop: 24, padding: 24, background: '#f5f5f5', borderRadius: 8 }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
-                <h2>Storyboard Timeline</h2>
-                <Button onClick={onClose}>Close Editor</Button>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 16 }}>
+                <div>
+                    <h2 style={{ margin: 0, marginBottom: 8 }}>Storyboard Timeline</h2>
+                    <Space>
+                        {topicType && <Badge count={`Topic: ${topicType}`} style={{ backgroundColor: '#108ee9' }} />}
+                        {subject && <Badge count={`Subject: ${subject}`} style={{ backgroundColor: '#87d068' }} />}
+                    </Space>
+                </div>
+                <Space>
+                    <Button onClick={() => {
+                        setScenes(initialScenes.map((s, idx) => ({ 
+                            ...s, 
+                            extra_images: s.extra_images || [],
+                            original_index: s.original_index || idx + 1
+                        })));
+                        message.success("Storyboard restored to initial state.");
+                    }}>Restore Initial State</Button>
+                    <Button onClick={onClose}>Close Editor</Button>
+                </Space>
             </div>
 
             {/* Font Picker Section */}

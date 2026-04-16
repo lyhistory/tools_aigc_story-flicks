@@ -163,7 +163,8 @@ async def generate_scene_assets(
 ):
     """生成每个场景所需的音频和字幕资产 (Step 1)
     """
-    for i, scene in enumerate(scenes, 1):
+    for __i, scene in enumerate(scenes, 1):
+        i = getattr(scene, "original_index", None) or __i
         try:
             image_file = os.path.join(task_dir, f"{i}.png")
             audio_file = os.path.join(task_dir, f"{i}.mp3")
@@ -1412,13 +1413,14 @@ async def assemble_video_impl(request: "StoryboardAssembleRequest") -> str:
 
         # Pre-process edited scenes: if URL points to a different image, copy it over
         for i, scene in enumerate(request.scenes, 1):
+            original_index = getattr(scene, "original_index", None) or i
             if scene.url:
                 url_path = scene.url.split("?")[0]
                 if "/tasks/" in url_path:
                     rel_path = url_path.split("/tasks/")[-1]
                     tasks_root = os.path.dirname(task_dir)
                     source_img = os.path.join(tasks_root, rel_path.replace("/", os.sep))
-                    target_img = os.path.join(task_dir, f"{i}.png")
+                    target_img = os.path.join(task_dir, f"{original_index}.png")
                     if os.path.exists(source_img) and source_img != target_img:
                         import shutil
                         shutil.copy2(source_img, target_img)
