@@ -61,6 +61,13 @@ interface StoryScene {
     subject?: string;
     topic_type?: string;
     original_index?: number;
+    chinese_translation?: string;
+}
+
+interface RetranslateScriptReq {
+    script: string;
+    text_llm_provider?: string;
+    text_llm_model?: string;
 }
 
 interface StoryboardAssembleReq {

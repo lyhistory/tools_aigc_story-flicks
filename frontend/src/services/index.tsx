@@ -60,3 +60,11 @@ export async function getSubtitleFonts(): Promise<{ success: boolean; data: { fo
         method: "get",
     });
 }
+
+export async function retranslateScript(data: RetranslateScriptReq): Promise<{ success: boolean; data?: { translation: string }; message?: string | null }> {
+    return request({
+        url: "/api/video/retranslate_script",
+        method: "post",
+        data,
+    });
+}

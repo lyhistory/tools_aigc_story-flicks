@@ -1,0 +1,7 @@
+- `[x]` Phase 1: Translation UI and LLM Retranslation Workflow
+    - `[x]` Update `StoryScene` schema in backend and frontend to include `chinese_translation` string.
+    - `[x]` Update `generate_storyboard_impl` in `video.py` to populate `chinese_translation` using Google Translate if enabled.
+    - `[x]` Add `/retranslate_script` endpoint in `video.py` router to call LLM for kid-friendly translation block.
+    - `[x]` Update `render_final_video` in `video.py` to use `scene.chinese_translation` (splitting into chunk-lines or matching script pieces) instead of calling `translate_to_zh` mechanically.
+    - `[x]` Update `StoryboardEditor` in frontend to display `chinese_translation` textarea in each scene.
+    - `[x]` Add "Retranslate using LLM" button mapping to the new endpoint.

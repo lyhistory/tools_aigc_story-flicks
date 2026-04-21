@@ -848,6 +848,9 @@ async def render_final_video(
                     sequence_timing_enabled = is_sequence_scene
                     words_file = os.path.join(task_dir, f"{i}.words.json")
                     karaoke_words_all: list[dict] = []
+                    zh_translations = []
+                    if getattr(scene, "chinese_translation", None):
+                        zh_translations = [t.strip() for t in scene.chinese_translation.split("\n")]
                     karaoke_timing_quality = "unknown"
                     if karaoke_enabled or sequence_timing_enabled:
                         karaoke_words_all, karaoke_timing_quality = load_karaoke_words(words_file)
@@ -961,7 +964,7 @@ async def render_final_video(
                                 and not is_sequence_scene
                                 and should_translate_to_zh(phrase)
                             ):
-                                zh_phrase = translate_to_zh(phrase)
+                                zh_phrase = zh_translations[item_idx - 1] if (item_idx - 1) < len(zh_translations) and zh_translations[item_idx - 1] else translate_to_zh(phrase)
                                 if zh_phrase:
                                     zh_sub_img = render_text_rgba(
                                         zh_phrase,
@@ -1389,11 +1392,70 @@ async def generate_storyboard_impl(request: VideoGenerateRequest) -> dict:
             karaoke=getattr(request, "karaoke", True),
         )
 
+        def _clean_sub(text: str) -> str:
+            return str(text).replace("\\u200b", "").replace("\u200b", "").replace("\ufeff", "").strip()
+
+        if getattr(request, "chinese_subtitle_enabled", True):
+            from moviepy.video.tools import subtitles
+            for i, scene in enumerate(scenes, 1):
+                subtitle_file = os.path.join(task_dir, f"{i}.srt")
+                if os.path.exists(subtitle_file):
+                    try:
+                        subs = subtitles.file_to_subtitles(subtitle_file, encoding="utf-8")
+                        translated_lines = []
+                        for item in subs:
+                            phrase = _clean_sub(item[1])
+                            if bool(re.search(r"[A-Za-z]", phrase)):
+                                try:
+                                    resp = requests.get(
+                                        "https://translate.googleapis.com/translate_a/single",
+                                        params={"client": "gtx", "sl": "auto", "tl": "zh-CN", "dt": "t", "q": phrase},
+                                        timeout=8
+                                    )
+                                    payload = resp.json()
+                                    translated = "".join(str(part[0]) for part in payload[0] if isinstance(part, list) and part and part[0] is not None)
+                                    translated_lines.append(translated)
+                                except Exception as err:
+                                    logger.warning(f"Google translate failed for '{phrase}': {err}")
+                                    translated_lines.append("")
+                            else:
+                                translated_lines.append("")
+                        scene.chinese_translation = "\n".join(translated_lines)
+                    except Exception as err:
+                        logger.error(f"Failed to parse or translate SRT for scene {i}: {err}")
+
         return {"task_id": task_id, "scenes": [scene.model_dump() for scene in scenes]}
     except Exception as e:
         logger.error(f"Failed to generate storyboard: {e}")
         raise e
 
+async def retranslate_script_impl(request: "RetranslateScriptRequest") -> str:
+    from app.services.llm import LLMService
+    llm_service = LLMService()
+    prompt = f"""You are an expert proofreader for children's educational content. 
+I have a machine-translated Chinese script, provided line-by-line.
+Rewrite it to be kid-friendly, natural, and simple Chinese (Simplified). 
+For example, change inappropriate literal translations like '喝酒' (drink alcohol) to '喝水/喝饮料' (drink water/juice) when the context is for kids.
+
+IMPORTANT RULES:
+1. Return EXACTLY the same number of lines as the input.
+2. Rewrite line-by-line. DO NOT merge or split lines.
+3. If an input line is empty, return an empty line.
+
+Original Machine-Translated Chinese Script:
+{request.script}
+"""
+    try:
+        response = await llm_service.generate_text(
+            prompt=prompt,
+            text_llm_provider=request.text_llm_provider,
+            text_llm_model=request.text_llm_model,
+            system_prompt="You are a helpful assistant that accurately translates texts while strictly preserving the line structure."
+        )
+        return response.strip()
+    except Exception as e:
+        logger.error(f"LLM translation failed: {e}")
+        raise e
 
 async def assemble_video_impl(request: "StoryboardAssembleRequest") -> str:
     """Storyboard Step 2: Assemble Video from edited scenes list"""

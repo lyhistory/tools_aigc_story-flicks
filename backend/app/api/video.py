@@ -81,6 +81,25 @@ async def regenerate_image_endpoint(request: RegenerateImageRequest):
             message=str(e)
         )
 
+from app.schemas.video import RetranslateScriptRequest
+from app.services.video import retranslate_script_impl
+
+@router.post("/retranslate_script")
+async def retranslate_script_endpoint(request: RetranslateScriptRequest):
+    """第二阶段新增：使用LLM重新生成友好的中文翻译"""
+    try:
+        translated_text = await retranslate_script_impl(request)
+        return VideoGenerateResponse(
+            success=True,
+            data={"translation": translated_text}
+        )
+    except Exception as e:
+        logger.error(f"Failed to retranslate script: {str(e)}")
+        return VideoGenerateResponse(
+            success=False,
+            message=str(e)
+        )
+
 @router.get("/fonts")
 async def get_subtitle_fonts():
     """Return available subtitle font options."""

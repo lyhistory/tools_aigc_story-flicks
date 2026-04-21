@@ -647,6 +647,7 @@ class LLMService:
         response = self.normalize_keys(response)
 
         logger.info(f"Generated story: {json.dumps(response, indent=4, ensure_ascii=False)}")
+
         # 验证响应格式
         self._validate_story_response(response)
         initial_conflicts = self._find_claim_conflicts(request.story_prompt, self._join_scene_scripts(response))
@@ -2151,7 +2152,7 @@ class LLMService:
         """
         logger.info(f"Sending chat completion request | provider={text_llm_provider} | model={text_llm_model}")
         if text_llm_provider == None:
-            text_llm_provider = settings.text_llm_provider
+            text_llm_provider = settings.text_provider
         if text_llm_provider == "aliyun":
             text_client = self.aliyun_text_client
         elif text_llm_provider == "openai":
@@ -2336,7 +2337,18 @@ class LLMService:
         - Output **only** the valid JSON object.
         """
 
-    
+    async def generate_text(self, prompt: str, text_llm_provider: str = None, text_llm_model: str = None, system_prompt: str = "You are a helpful assistant.") -> str:
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt}
+        ]
+        response = await self._generate_response(
+            text_llm_provider=text_llm_provider,
+            text_llm_model=text_llm_model,
+            messages=messages,
+            response_format="text"
+        )
+        return response if isinstance(response, str) else str(response)
 
 # 创建服务实例
 llm_service = LLMService()

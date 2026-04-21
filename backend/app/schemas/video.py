@@ -308,6 +308,7 @@ class StoryScene(BaseModel):
     subject: Optional[str] = Field(default=None, description="Optional cover subject")
     topic_type: Optional[TopicType] = Field(default=None, description="Topic type of this scene")
     original_index: Optional[int] = Field(default=None, description="Preserves file-binding to .mp3/.srt when scenes are deleted/shifted in UI")
+    chinese_translation: Optional[str] = Field(default=None, description="Pre-translated Chinese text for the scene script")
 
 class VideoGenerateRequest(BaseModel):
     """视频生成请求"""
@@ -341,6 +342,13 @@ class RegenerateImageRequest(BaseModel):
     image_llm_provider: Optional[str] = None
     image_llm_model: Optional[str] = None
     resolution: Optional[str] = "1024*1024"
+
+
+class RetranslateScriptRequest(BaseModel):
+    """重新生成中文本翻译的请求"""
+    script: str = Field(description="The English (or original language) script of the scene")
+    text_llm_provider: Optional[str] = Field(default=None, description="Text LLM provider to use")
+    text_llm_model: Optional[str] = Field(default=None, description="Text LLM model to use")
 
 
 class StoryboardAssembleRequest(BaseModel):

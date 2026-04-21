@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Button, Card, Typography, Space, Popconfirm, message, Modal, Slider, Image, Select, Badge, Spin, Input } from 'antd';
 import { DeleteOutlined, ReloadOutlined, SwapOutlined, CheckCircleFilled } from '@ant-design/icons';
-import { assembleVideo, regenerateImage, getSubtitleFonts } from '../../services/index';
+import { assembleVideo, regenerateImage, getSubtitleFonts, retranslateScript } from '../../services/index';
 import { useVideoStore } from '../../stores/index';
 
 const { Text } = Typography;
@@ -240,6 +240,28 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
         const newScenes = [...scenes];
         newScenes.splice(index, 1);
         setScenes(newScenes);
+    };
+
+    const [retranslatingIndexes, setRetranslatingIndexes] = useState<{ [key: number]: boolean }>({});
+
+    const handleRetranslation = async (index: number, scene: StoryScene) => {
+        if (!scene.chinese_translation) return;
+        setRetranslatingIndexes(prev => ({ ...prev, [index]: true }));
+        try {
+            const res = await retranslateScript({
+                script: scene.chinese_translation, 
+            });
+            if (res.success && res.data?.translation) {
+                setScenes(prev => prev.map((s, i) => i === index ? { ...s, chinese_translation: res.data!.translation } : s));
+                message.success(`Scene ${index + 1} translation improved by LLM!`);
+            } else {
+                message.error(res.message || 'Failed to retranslate');
+            }
+        } catch (e: any) {
+            message.error(e.message || 'Failed to retranslate');
+        } finally {
+            setRetranslatingIndexes(prev => ({ ...prev, [index]: false }));
+        }
     };
 
     const handleAssemble = async () => {
@@ -592,6 +614,29 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
                                     ))}
                                 </div>
                                 <Text type="secondary" style={{ fontSize: 11 }}><b>Prompt:</b> {scene.scene_prompt}</Text>
+                                
+                                {chineseSubtitleEnabled && scene.chinese_translation !== undefined && (
+                                    <div style={{ marginTop: 12 }}>
+                                        <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
+                                            <Text type="secondary" strong>Chinese Subtitle Translation</Text>
+                                            <Button 
+                                                size="small" 
+                                                type="dashed" 
+                                                loading={!!retranslatingIndexes[idx]}
+                                                onClick={() => handleRetranslation(idx, scene)}
+                                            >
+                                                Improve using LLM
+                                            </Button>
+                                        </div>
+                                        <Input.TextArea
+                                            value={scene.chinese_translation}
+                                            onChange={(e) => setScenes(prev => prev.map((s, i) => i === idx ? { ...s, chinese_translation: e.target.value } : s))}
+                                            autoSize={{ minRows: 2, maxRows: 6 }}
+                                            style={{ fontSize: 13 }}
+                                        />
+                                        <Text type="secondary" style={{ fontSize: 11 }}>Note: Keep line count the same as English script segments.</Text>
+                                    </div>
+                                )}
                             </div>
                         </div>
                     </Card>
