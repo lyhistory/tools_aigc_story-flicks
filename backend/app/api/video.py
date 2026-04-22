@@ -100,6 +100,38 @@ async def retranslate_script_endpoint(request: RetranslateScriptRequest):
             message=str(e)
         )
 
+from fastapi import File, UploadFile, Form
+import shutil
+import uuid
+
+@router.post("/upload_image")
+async def upload_image_endpoint(
+    file: UploadFile = File(...),
+    task_id: str = Form(...)
+):
+    """第二阶段新增：上传本地图片"""
+    try:
+        from app.utils.utils import task_dir
+        t_dir = task_dir(task_id)
+        os.makedirs(t_dir, exist_ok=True)
+        filename = f"uploaded_{uuid.uuid4().hex[:8]}.png"
+        filepath = os.path.join(t_dir, filename)
+        
+        with open(filepath, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+            
+        file_url = f"http://127.0.0.1:8888/tasks/{task_id}/{filename}"
+        return VideoGenerateResponse(
+            success=True,
+            data={"image_url": file_url}
+        )
+    except Exception as e:
+        logger.error(f"Failed to upload image: {str(e)}")
+        return VideoGenerateResponse(
+            success=False,
+            message=str(e)
+        )
+
 @router.get("/fonts")
 async def get_subtitle_fonts():
     """Return available subtitle font options."""

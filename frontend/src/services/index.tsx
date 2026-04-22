@@ -54,6 +54,20 @@ export async function regenerateImage(data: RegenerateImageReq): Promise<VideoGe
     });
 }
 
+export async function uploadImage(file: File, taskId: string): Promise<{ success: boolean; data?: { image_url: string }; message?: string }> {
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('task_id', taskId);
+    return request({
+        url: "/api/video/upload_image",
+        method: "post",
+        headers: {
+            'Content-Type': 'multipart/form-data',
+        },
+        data: formData,
+    });
+}
+
 export async function getSubtitleFonts(): Promise<{ success: boolean; data: { fonts: { id: string; label: string; default: boolean }[]; default: string } }> {
     return request({
         url: "/api/video/fonts",

@@ -1473,20 +1473,32 @@ async def assemble_video_impl(request: "StoryboardAssembleRequest") -> str:
             with open(story_file, "w", encoding="utf-8") as f:
                 json.dump(story_data, f, ensure_ascii=False, indent=2)
 
-        # Pre-process edited scenes: if URL points to a different image, copy it over
+        # Pre-process edited scenes: if URL points to a different image, copy it over or download it
         for i, scene in enumerate(request.scenes, 1):
             original_index = getattr(scene, "original_index", None) or i
             if scene.url:
                 url_path = scene.url.split("?")[0]
+                target_img = os.path.join(task_dir, f"{original_index}.png")
                 if "/tasks/" in url_path:
                     rel_path = url_path.split("/tasks/")[-1]
                     tasks_root = os.path.dirname(task_dir)
                     source_img = os.path.join(tasks_root, rel_path.replace("/", os.sep))
-                    target_img = os.path.join(task_dir, f"{original_index}.png")
                     if os.path.exists(source_img) and source_img != target_img:
                         import shutil
                         shutil.copy2(source_img, target_img)
                         logger.info(f"Reused image: copied {source_img} to {target_img}")
+                elif url_path.startswith("http"):
+                    try:
+                        import requests
+                        response = requests.get(url_path, timeout=10)
+                        if response.status_code == 200:
+                            with open(target_img, "wb") as f:
+                                f.write(response.content)
+                            logger.info(f"Reused image: downloaded external {url_path} to {target_img}")
+                        else:
+                            logger.error(f"Failed to download {url_path}, status: {response.status_code}")
+                    except Exception as e:
+                        logger.error(f"Failed to download external image {url_path}: {e}")
 
 
         return await render_final_video(

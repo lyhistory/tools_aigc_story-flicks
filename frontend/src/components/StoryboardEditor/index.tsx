@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
-import { Button, Card, Typography, Space, Popconfirm, message, Modal, Slider, Image, Select, Badge, Spin, Input } from 'antd';
-import { DeleteOutlined, ReloadOutlined, SwapOutlined, CheckCircleFilled } from '@ant-design/icons';
-import { assembleVideo, regenerateImage, getSubtitleFonts, retranslateScript } from '../../services/index';
+import { Button, Card, Typography, Space, Popconfirm, message, Modal, Slider, Image, Select, Badge, Spin, Input, Upload, Divider } from 'antd';
+import { DeleteOutlined, ReloadOutlined, SwapOutlined, CheckCircleFilled, UploadOutlined, LinkOutlined } from '@ant-design/icons';
+import { assembleVideo, regenerateImage, getSubtitleFonts, retranslateScript, uploadImage } from '../../services/index';
 import { useVideoStore } from '../../stores/index';
 
 const { Text } = Typography;
@@ -243,6 +243,37 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
     };
 
     const [retranslatingIndexes, setRetranslatingIndexes] = useState<{ [key: number]: boolean }>({});
+
+    const [externalUrl, setExternalUrl] = useState('');
+    const [uploading, setUploading] = useState(false);
+
+    const handleUploadImg = async (file: File) => {
+        setUploading(true);
+        try {
+            const res = await uploadImage(file, taskId);
+            if (res.success && res.data?.image_url) {
+                message.success('Upload successful');
+                handleReuseSelect(res.data.image_url);
+            } else {
+                message.error('Upload failed: ' + (res.message || 'unknown error'));
+            }
+        } catch (e: any) {
+            message.error('Upload failed: ' + String(e));
+        } finally {
+            setUploading(false);
+        }
+        return false; // prevent default upload action
+    };
+
+    const handleAddExternalUrl = () => {
+        if (!externalUrl) return;
+        if (!externalUrl.startsWith('http')) {
+            message.error('Must be a valid HTTP/HTTPS URL');
+            return;
+        }
+        handleReuseSelect(externalUrl);
+        setExternalUrl('');
+    };
 
     const handleRetranslation = async (index: number, scene: StoryScene) => {
         if (!scene.chinese_translation) return;
@@ -665,6 +696,27 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
                         ? 'Pick an image to add as an extra. The scene will cycle through images in order.'
                         : 'Pick an image to replace the primary image for this scene.'}
                 </Text>
+                
+                <Space style={{ marginBottom: 20 }}>
+                    <Upload 
+                        beforeUpload={handleUploadImg} 
+                        showUploadList={false} 
+                        accept="image/*"
+                    >
+                        <Button icon={<UploadOutlined />} loading={uploading}>Upload Local Image</Button>
+                    </Upload>
+                    <Input 
+                        placeholder="Paste image URL (https://...)" 
+                        value={externalUrl} 
+                        onChange={e => setExternalUrl(e.target.value)}
+                        style={{ width: 250 }}
+                        onPressEnter={handleAddExternalUrl}
+                    />
+                    <Button onClick={handleAddExternalUrl} icon={<LinkOutlined />}>Use Link</Button>
+                </Space>
+                
+                <Divider style={{ margin: '12px 0' }} orientation="left" plain>Or Select from Generated Images</Divider>
+
                 <div style={{ display: 'flex', flexWrap: 'wrap', gap: 16 }}>
                     {allGeneratedImages.map((img, poolIdx) => (
                         <Card
