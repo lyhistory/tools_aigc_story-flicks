@@ -246,7 +246,8 @@ async def render_final_video(
         chinese_subtitle_enabled: bool = True,
         subtitle_font: str | None = None,
         subtitle_font_size: int | None = None,
-        subtitle_color: str | None = None) -> str:
+        subtitle_color: str | None = None,
+        karaoke_highlight_color: str | None = None) -> str:
     """组装最终的视频片段 (Step 2)
     
     Args:
@@ -257,6 +258,16 @@ async def render_final_video(
     target_w, target_h = parse_resolution(resolution) if resolution else (None, None)
     overlay_dir = os.path.join(task_dir, "overlays")
     os.makedirs(overlay_dir, exist_ok=True)
+    
+    parsed_highlight_bg_rgba = (255, 241, 153, 180) # default yellow
+    if karaoke_highlight_color and karaoke_highlight_color.startswith("#"):
+        try:
+            hex_color = karaoke_highlight_color.lstrip('#')
+            if len(hex_color) == 6:
+                parsed_highlight_bg_rgba = (*tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4)), 180)
+        except Exception as e:
+            logger.warning(f"Failed to parse karaoke_highlight_color {karaoke_highlight_color}: {e}")
+            
     zh_subtitle_cache: dict[str, str] = {}
     def sanitize_pronunciation(text: str) -> str:
         if not text:
@@ -387,8 +398,9 @@ async def render_final_video(
         file_path: str,
         bg_rgba=(0, 0, 0, 0),
         highlight_word: str | None = None,
-        highlight_bg_rgba=(255, 241, 153, 180),
+        highlight_bg_rgba=None,
     ) -> tuple[int, int]:
+        highlight_bg_rgba = highlight_bg_rgba or parsed_highlight_bg_rgba
         if not text:
             return 0, 0
         wrapped_txt, _ = wrap_text(text, max_width=max_width, font=font_path, fontsize=font_size)
@@ -453,12 +465,13 @@ async def render_final_video(
         max_width: int,
         bg_rgba=(0, 0, 0, 0),
         highlight_word: str | None = None,
-        highlight_bg_rgba=(255, 241, 153, 180),
+        highlight_bg_rgba=None,
         highlight_text_color: str | None = None,
         highlight_token_index: int | None = None,
         stroke_width: int = 0,
         stroke_fill: str | None = None,
     ) -> Image.Image | None:
+        highlight_bg_rgba = highlight_bg_rgba or parsed_highlight_bg_rgba
         if not text:
             return None
         wrapped_txt, _ = wrap_text(text, max_width=max_width, font=font_path, fontsize=font_size)
@@ -1012,9 +1025,9 @@ async def render_final_video(
                                     token_idx = int(word_info["token_index"])
                                     token_norm = normalize_token(word_info.get("word", ""))
                                     is_keyword_token = bool(highlight_norm and token_norm == highlight_norm)
-                                    kara_bg = (147, 197, 253, 210)
+                                    kara_bg = parsed_highlight_bg_rgba
                                     if is_keyword_token:
-                                        kara_bg = (254, 240, 138, 230)
+                                        kara_bg = parsed_highlight_bg_rgba
                                     kara_img_en = render_text_rgba(
                                         phrase,
                                         subtitle_font_path,
@@ -1379,7 +1392,7 @@ async def generate_storyboard_impl(request: VideoGenerateRequest) -> dict:
 
         # Map local image paths to accessible URLs for frontend
         for i, scene in enumerate(scenes, 1):
-            scene.url = f"http://127.0.0.1:8888/tasks/{task_id}/{i}.png"
+            scene.url = f"http://127.0.0.1:8889/tasks/{task_id}/{i}.png"
 
         # Generate audio assets
         await generate_scene_assets(
@@ -1510,6 +1523,7 @@ async def assemble_video_impl(request: "StoryboardAssembleRequest") -> str:
             subtitle_font=request.subtitle_font,
             subtitle_font_size=request.subtitle_font_size,
             subtitle_color=request.subtitle_color,
+            karaoke_highlight_color=request.karaoke_highlight_color,
         )
     except Exception as e:
         logger.error(f"Failed to assemble video: {e}")
@@ -1561,7 +1575,7 @@ async def regenerate_image_impl(request: RegenerateImageRequest) -> str:
                 raise ValueError(f"Failed to download image: {response.status_code}")
         
         # Return accessible URL for the newly generated image, bypassing browser cache
-        return f"http://127.0.0.1:8888/tasks/{task_id}/{filename}?t={timestamp}"
+        return f"http://127.0.0.1:8889/tasks/{task_id}/{filename}?t={timestamp}"
     except Exception as e:
         logger.error(f"Failed to regenerate image: {e}")
         raise e

@@ -21,3 +21,4 @@ gtts==2.5.3
 google-cloud-texttospeech==2.16.0
 pydub==0.25.1
 faster-whisper==1.1.1    # CTranslate2-based Whisper for fast CPU word alignment
+playwright==1.40.0

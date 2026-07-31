@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Button, Card, Typography, Space, Popconfirm, message, Modal, Slider, Image, Select, Badge, Spin, Input, Upload, Divider } from 'antd';
+import { Button, Card, Typography, Space, Popconfirm, message, Modal, Slider, Image, Select, Badge, Spin, Input, Upload, Divider, ColorPicker } from 'antd';
 import { DeleteOutlined, ReloadOutlined, SwapOutlined, CheckCircleFilled, UploadOutlined, LinkOutlined } from '@ant-design/icons';
 import { assembleVideo, regenerateImage, getSubtitleFonts, retranslateScript, uploadImage } from '../../services/index';
 import { useVideoStore } from '../../stores/index';
@@ -14,6 +14,7 @@ interface StoryboardEditorProps {
     resolution: string;
     chineseSubtitleEnabled: boolean;
     karaoke: boolean;
+    karaokeHighlightColor?: string;
     subject?: string;
     topicType?: string;
     onClose: () => void;
@@ -96,6 +97,21 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
     const [selectedFont, setSelectedFont] = useState<string>(DEFAULT_FONT);
     const [fontSize, setFontSize] = useState<number>(DEFAULT_FONT_SIZE);
     const [subtitleColor, setSubtitleColor] = useState<string>('#F472B6');
+    const [karaokeHighlightColor, setKaraokeHighlightColor] = useState<string>('#FFFF00');
+
+    const getRecommendedHighlightColors = (fontColorHex: string) => {
+        const hex = fontColorHex.replace('#', '');
+        const r = parseInt(hex.substr(0, 2), 16) || 0;
+        const g = parseInt(hex.substr(2, 2), 16) || 0;
+        const b = parseInt(hex.substr(4, 2), 16) || 0;
+        const luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        
+        if (luma < 128) {
+            return ['#FFFF00', '#00FFFF', '#39FF14', '#FFFFFF', '#FFB6C1', '#FFE4B5'];
+        } else {
+            return ['#000000', '#0000FF', '#FF0000', '#800080', '#008000', '#FF1493'];
+        }
+    };
 
     // Reuse Image Modal State
     const [reuseModalVisible, setReuseModalVisible] = useState(false);
@@ -309,6 +325,7 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
                 resolution,
                 chinese_subtitle_enabled: chineseSubtitleEnabled,
                 karaoke: karaoke,
+                karaoke_highlight_color: karaokeHighlightColor,
                 subtitle_font: selectedFont,
                 subtitle_font_size: fontSize,
                 subtitle_color: subtitleColor,
@@ -501,6 +518,27 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
                         {previewText}
                     </div>
                 </div>
+
+                {karaoke && (
+                    <div style={{ marginTop: 16 }}>
+                        <Text style={{ display: 'block', marginBottom: 8 }}>Karaoke Highlight Color</Text>
+                        <ColorPicker
+                            showText
+                            value={karaokeHighlightColor}
+                            onChange={(color) => setKaraokeHighlightColor(color.toHexString())}
+                            presets={[
+                                {
+                                    label: 'Recommended for Contrast',
+                                    colors: getRecommendedHighlightColors(subtitleColor),
+                                },
+                                {
+                                    label: 'Standard',
+                                    colors: ['#FFFF00', '#00FFFF', '#FF00FF', '#39FF14', '#FF3131', '#FFFFFF', '#000000'],
+                                }
+                            ]}
+                        />
+                    </div>
+                )}
             </Card>
 
             <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>

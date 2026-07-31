@@ -17,7 +17,7 @@ async def generate_video_endpoint(
         video_file = await generate_video(request)
         task_id = extract_id(video_file)
         # 转换为相对路径
-        video_url = "http://127.0.0.1:8888/tasks/" + task_id + "/video.mp4"
+        video_url = "http://127.0.0.1:8889/tasks/" + task_id + "/video.mp4"
         return VideoGenerateResponse(
             success=True,
             data={"video_url": video_url}
@@ -53,7 +53,7 @@ async def assemble_video_endpoint(request: StoryboardAssembleRequest):
     try:
         video_file = await assemble_video_impl(request)
         task_id = extract_id(video_file)
-        video_url = "http://127.0.0.1:8888/tasks/" + task_id + "/video.mp4"
+        video_url = "http://127.0.0.1:8889/tasks/" + task_id + "/video.mp4"
         return VideoGenerateResponse(
             success=True,
             data={"video_url": video_url}
@@ -120,7 +120,7 @@ async def upload_image_endpoint(
         with open(filepath, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
             
-        file_url = f"http://127.0.0.1:8888/tasks/{task_id}/{filename}"
+        file_url = f"http://127.0.0.1:8889/tasks/{task_id}/{filename}"
         return VideoGenerateResponse(
             success=True,
             data={"image_url": file_url}

@@ -79,6 +79,7 @@ interface StoryboardAssembleReq {
     subtitle_font?: string;
     subtitle_font_size?: number;
     subtitle_color?: string;
+    karaoke_highlight_color?: string;
 }
 
 interface StoryboardRes {

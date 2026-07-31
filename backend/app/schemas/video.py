@@ -333,6 +333,7 @@ class VideoGenerateRequest(BaseModel):
     resolution: Optional[str] = Field(default="1024*1024", description="分辨率")
     use_inpainting: Optional[bool] = Field(default=False, description="是否使用图生图/修复模式")
     avoid_exact_counts: Optional[bool] = Field(default=None, description="是否避免精确数量")
+    karaoke_highlight_color: Optional[str] = Field(default=None, description="Hex color string for karaoke highlight background")
 
 class RegenerateImageRequest(BaseModel):
     """单场景重新生成图片请求"""
@@ -361,6 +362,7 @@ class StoryboardAssembleRequest(BaseModel):
     subtitle_font: Optional[str] = Field(default=None, description="English subtitle font variant (e.g. 'NotoSans-Bold')")
     subtitle_font_size: Optional[int] = Field(default=None, description="English subtitle font size (px); default depends on resolution")
     subtitle_color: Optional[str] = Field(default=None, description="English subtitle text color hex, e.g. '#F472B6'")
+    karaoke_highlight_color: Optional[str] = Field(default=None, description="Hex color string for karaoke highlight background")
 
 
 class VideoGenerateResponse(BaseModel):

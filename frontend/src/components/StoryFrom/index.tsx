@@ -31,6 +31,7 @@ type FieldType = {
     voice_rate: number; // 语音速率，默认写1
     karaoke?: boolean; // Karaoke word-level highlight
     chinese_subtitle_enabled?: boolean; // Chinese subtitle translation under English subtitle
+    karaoke_highlight_color?: string; // Hex color for karaoke background
 };
 
 
@@ -42,7 +43,7 @@ const App: React.FC = () => {
     const [voiceLanguages, setVoiceLanguages] = useState<string[]>(VOICE_LANGUAGES);
     const [nowVoiceList, setNowVoiceList] = useState<string[]>([]);
 
-    const [mode, setMode] = useState<'simple' | 'storyboard'>('simple');
+    const [mode, setMode] = useState<'simple' | 'storyboard'>('storyboard');
     const [storyboardData, setStoryboardData] = useState<{ task_id: string, scenes: any[] } | null>(null);
     const [generating, setGenerating] = useState(false);
 
@@ -72,6 +73,7 @@ const App: React.FC = () => {
                 text_llm_provider: res.text_llm_provider || res.textLLMProviders?.[0],
                 image_llm_provider: res.image_llm_provider || res.imageLLMProviders?.[0],
                 learner_age: '3-5',
+                karaoke_highlight_color: '#FFFF00',
             });
         }).catch(err => {
             console.log(err);
@@ -103,6 +105,7 @@ const App: React.FC = () => {
         const payload = {
             ...values,
             segments: values.topic_type === 'sequence' ? 1 : values.segments,
+            karaoke_highlight_color: typeof values.karaoke_highlight_color === 'string' ? values.karaoke_highlight_color : (values.karaoke_highlight_color as any)?.toHexString?.() || '#FFFF00',
         };
         setGenerating(true);
         if (mode === 'simple') {
@@ -334,6 +337,7 @@ const App: React.FC = () => {
                     >
                         <Switch />
                     </Form.Item>
+
                     <Form.Item<FieldType>
                         label={t('storyForm.chineseSubtitle')}
                         name="chinese_subtitle_enabled"
