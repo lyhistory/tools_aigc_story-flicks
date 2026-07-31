@@ -151,7 +151,7 @@ const SocialPublisher: React.FC = () => {
                                                 // Optionally re-check once more after brief delay
                                                 setTimeout(async () => {
                                                     const recheck = await getSocialStatus();
-                                                    if (recheck?.success?.data?.[platform]) {
+                                                    if (recheck?.success && recheck.data?.[platform as keyof typeof recheck.data]) {
                                                         message.success(`${platform} finally confirmed!`);
                                                         const current = form.getFieldValue('platforms') || [];
                                                         if (!current.includes(platform)) {
@@ -436,7 +436,7 @@ const SocialPublisher: React.FC = () => {
                                                                 src={getScreenshotSrc(publishResults[p.id].screenshot_url)!}
                                                                 alt={`${p.name} publish screenshot`}
                                                                 width="100%"
-                                                                style={{ borderRadius: 6, border: '1px solid #f0f0f0', maxHeight: 140, objectFit: 'cover' }}
+                                                                style={{ borderRadius: 6, border: '1px solid #f0f0f0', maxHeight: 520, objectFit: 'contain', background: '#fff' }}
                                                             />
                                                         </div>
                                                     )}

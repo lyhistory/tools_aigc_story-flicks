@@ -392,6 +392,74 @@ class BaseSocialPlatform:
             await page.wait_for_timeout(300)
         return False
 
+    async def _fill_field_near_label(self, page: Page, label_text: str, value: str, timeout_ms: int = 8000) -> bool:
+        deadline = asyncio.get_running_loop().time() + (timeout_ms / 1000)
+        script = """
+            ({ labelText, value }) => {
+                const visible = el => {
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+                };
+                const setValue = el => {
+                    if (!el) return false;
+                    el.focus && el.focus();
+                    const tag = (el.tagName || '').toLowerCase();
+                    if (tag === 'input' || tag === 'textarea') {
+                        el.value = value;
+                    } else if (el.isContentEditable || el.getAttribute('contenteditable') === 'true') {
+                        el.textContent = value;
+                    } else {
+                        return false;
+                    }
+                    el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                    return true;
+                };
+                const labels = Array.from(document.querySelectorAll('body *')).filter(el => {
+                    if (!visible(el)) return false;
+                    const text = (el.innerText || el.textContent || '').trim();
+                    return text === labelText || text.startsWith(labelText);
+                });
+                for (const label of labels) {
+                    let scope = label;
+                    for (let depth = 0; depth < 6 && scope; depth += 1) {
+                        const candidates = Array.from(scope.querySelectorAll('input, textarea, [contenteditable="true"]')).filter(visible);
+                        for (const candidate of candidates) {
+                            const rect = candidate.getBoundingClientRect();
+                            const labelRect = label.getBoundingClientRect();
+                            if (rect.left >= labelRect.left - 20 && rect.top >= labelRect.top - 20 && setValue(candidate)) {
+                                return true;
+                            }
+                        }
+                        scope = scope.parentElement;
+                    }
+                    const labelRect = label.getBoundingClientRect();
+                    const allCandidates = Array.from(document.querySelectorAll('input, textarea, [contenteditable="true"]')).filter(visible);
+                    allCandidates.sort((a, b) => {
+                        const ar = a.getBoundingClientRect();
+                        const br = b.getBoundingClientRect();
+                        const ad = Math.abs(ar.top - labelRect.top) + Math.max(0, ar.left - labelRect.right);
+                        const bd = Math.abs(br.top - labelRect.top) + Math.max(0, br.left - labelRect.right);
+                        return ad - bd;
+                    });
+                    for (const candidate of allCandidates.slice(0, 8)) {
+                        if (setValue(candidate)) return true;
+                    }
+                }
+                return false;
+            }
+        """
+        while asyncio.get_running_loop().time() < deadline:
+            try:
+                if await page.evaluate(script, {"labelText": label_text, "value": value}):
+                    return True
+            except Exception:
+                pass
+            await page.wait_for_timeout(300)
+        return False
+
     async def _fill_date_time_input(self, page: Page, selectors: list[str], value: str, timeout_ms: int = 5000) -> bool:
         deadline = asyncio.get_running_loop().time() + (timeout_ms / 1000)
         while asyncio.get_running_loop().time() < deadline:
@@ -493,6 +561,10 @@ class BaseSocialPlatform:
                 # Check if we have any active upload markers (including percentages)
                 has_upload_active = any(marker in body_text for marker in upload_markers) or any(f"{i}%" in body_text for i in range(1, 100))
                 has_ready = any(marker in body_text for marker in ready_markers) if ready_markers else True
+
+                if platform_label == "Douyin" and has_ready:
+                    logger.info("Douyin ready marker found; proceeding despite lingering upload text.")
+                    return
                 
                 if not has_upload_active and has_ready:
                     logger.info(f"{platform_label} upload is ready (ready markers found: {has_ready})")
@@ -810,6 +882,92 @@ class DouyinPublisher(BaseSocialPlatform):
             logger.info("Clicked Douyin 高清发布 entry.")
             await page.wait_for_timeout(2000)
 
+    async def _fill_douyin_description_fields(self, page: Page, title: str, description: str) -> None:
+        """Fill Douyin's 作品描述 block: first field is 标题, second field is 简介."""
+        script = """
+            ({ title, description }) => {
+                const visible = el => {
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+                };
+                const setValue = (el, value) => {
+                    el.scrollIntoView({ block: 'center', inline: 'nearest' });
+                    el.focus && el.focus();
+                    const tag = (el.tagName || '').toLowerCase();
+                    if (tag === 'input' || tag === 'textarea') {
+                        el.value = value;
+                    } else if (el.isContentEditable || el.getAttribute('contenteditable') === 'true') {
+                        el.textContent = value;
+                    } else {
+                        return false;
+                    }
+                    el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                    return true;
+                };
+                const controls = Array.from(document.querySelectorAll('input, textarea, [contenteditable="true"]')).filter(visible);
+                const titleControls = controls.filter(el => {
+                    const placeholder = (el.getAttribute('placeholder') || el.getAttribute('data-placeholder') || '').trim();
+                    return placeholder.includes('标题');
+                });
+                const descControls = controls.filter(el => {
+                    const placeholder = (el.getAttribute('placeholder') || el.getAttribute('data-placeholder') || '').trim();
+                    return placeholder.includes('简介') || placeholder.includes('描述');
+                });
+                if (titleControls[0] && descControls[0]) {
+                    return setValue(titleControls[0], title) && setValue(descControls[0], description);
+                }
+
+                const labels = Array.from(document.querySelectorAll('body *')).filter(el => {
+                    if (!visible(el)) return false;
+                    const text = (el.innerText || el.textContent || '').trim();
+                    return text === '作品描述' || text.startsWith('作品描述');
+                });
+                for (const label of labels) {
+                    const labelRect = label.getBoundingClientRect();
+                    const nearby = controls.filter(el => {
+                        const rect = el.getBoundingClientRect();
+                        return rect.top >= labelRect.top - 30 && rect.top <= labelRect.top + 360 && rect.left >= labelRect.left - 20;
+                    }).sort((a, b) => {
+                        const ar = a.getBoundingClientRect();
+                        const br = b.getBoundingClientRect();
+                        if (Math.abs(ar.top - br.top) > 8) return ar.top - br.top;
+                        return ar.left - br.left;
+                    });
+                    if (nearby.length >= 2) {
+                        return setValue(nearby[0], title) && setValue(nearby[1], description);
+                    }
+                }
+                return false;
+            }
+        """
+        try:
+            if await page.evaluate(script, {"title": title, "description": description}):
+                logger.info("Filled Douyin 作品描述 title and intro fields.")
+                return
+        except Exception as e:
+            logger.warning(f"Douyin label-based field fill failed: {e}")
+
+        title_filled = await self._fill_text_entry(page, [
+            'input[placeholder*="作品作品标题"]',
+            'input[placeholder*="作品标题"]',
+            'input[placeholder*="标题"]',
+            'textarea[placeholder*="作品标题"]',
+            '[contenteditable="true"][data-placeholder*="标题"]',
+        ], title, timeout_ms=10000)
+        desc_filled = await self._fill_text_entry(page, [
+            'textarea[placeholder*="作品简介"]',
+            'textarea[placeholder*="简介"]',
+            'textarea[placeholder*="描述"]',
+            '[contenteditable="true"][data-placeholder*="简介"]',
+            '[contenteditable="true"][data-placeholder*="描述"]',
+            '[contenteditable="true"]',
+        ], description, timeout_ms=10000)
+        if not title_filled or not desc_filled:
+            raise Exception("Could not fill Douyin 作品描述 title/intro fields after upload.")
+
     async def start_login_session(self) -> str:
         async def _wait_for_login(browser: Browser, context: BrowserContext, page: Page):
             try:
@@ -1004,26 +1162,7 @@ class DouyinPublisher(BaseSocialPlatform):
                 )
                 await self._click_first_visible(page, ['button:has-text("我知道了")', 'text="我知道了"'], timeout_ms=3000)
 
-                title_filled = await self._fill_text_entry(page, [
-                    'input[placeholder*="作品作品标题"]',
-                    'input[placeholder*="作品标题"]',
-                    'input[placeholder*="标题"]',
-                    'textarea[placeholder*="作品标题"]',
-                    '[contenteditable="true"][data-placeholder*="标题"]',
-                ], title, timeout_ms=10000)
-                if not title_filled:
-                    raise Exception("Could not find visible Douyin title field after upload.")
-
-                desc_filled = await self._fill_text_entry(page, [
-                    'textarea[placeholder*="作品简介"]',
-                    'textarea[placeholder*="简介"]',
-                    'textarea[placeholder*="描述"]',
-                    '[contenteditable="true"][data-placeholder*="简介"]',
-                    '[contenteditable="true"][data-placeholder*="描述"]',
-                    '[contenteditable="true"]',
-                ], description, timeout_ms=10000)
-                if not desc_filled:
-                    raise Exception("Could not find visible Douyin description field after upload.")
+                await self._fill_douyin_description_fields(page, title, description)
 
                 await self._enable_platform_schedule(page, scheduled_for)
                 
@@ -1101,17 +1240,7 @@ class DouyinPublisher(BaseSocialPlatform):
                 await self._wait_until_upload_ready(page, "Douyin", ready_markers=["重新上传", "预览视频", "设置封面", "选择封面"])
                 await self._click_first_visible(page, ['button:has-text("我知道了")', 'text="我知道了"'], timeout_ms=3000)
 
-                await self._fill_text_entry(page, [
-                    'input[placeholder*="作品作品标题"]', 'input[placeholder*="作品标题"]',
-                    'input[placeholder*="标题"]', 'textarea[placeholder*="作品标题"]',
-                    '[contenteditable="true"][data-placeholder*="标题"]',
-                ], title, timeout_ms=10000)
-
-                await self._fill_text_entry(page, [
-                    'textarea[placeholder*="作品简介"]', 'textarea[placeholder*="简介"]',
-                    'textarea[placeholder*="描述"]', '[contenteditable="true"][data-placeholder*="简介"]',
-                    '[contenteditable="true"][data-placeholder*="描述"]', '[contenteditable="true"]',
-                ], description, timeout_ms=10000)
+                await self._fill_douyin_description_fields(page, title, description)
 
                 await self._enable_platform_schedule(page, scheduled_for)
 
@@ -1581,6 +1710,160 @@ class WechatChannelsPublisher(BaseSocialPlatform):
         await page.wait_for_timeout(3000)
         return await self._is_logged_in_page(page)
 
+    async def _upload_wechat_video(self, page: Page, video_path: str) -> None:
+        """Upload through the visible left-side upload box so the page state updates."""
+        clicked_selectors = [
+            'text="点击上传"',
+            'text="上传视频"',
+            'text="上传"',
+            '[class*="upload"]',
+            '[class*="Upload"]',
+        ]
+        for selector in clicked_selectors:
+            try:
+                async with page.expect_file_chooser(timeout=5000) as fc_info:
+                    locator = page.locator(selector).filter(visible=True).first
+                    if await locator.count() == 0:
+                        raise Exception("upload selector not visible")
+                    await locator.click(timeout=3000)
+                file_chooser = await fc_info.value
+                await file_chooser.set_files(video_path)
+                await page.wait_for_timeout(5000)
+                logger.info(f"WeChat Channels video selected via visible upload control: {selector}")
+                return
+            except Exception:
+                continue
+
+        try:
+            async with page.expect_file_chooser(timeout=8000) as fc_info:
+                clicked = await page.evaluate("""
+                    () => {
+                        const visible = el => {
+                            if (!el) return false;
+                            const style = window.getComputedStyle(el);
+                            const rect = el.getBoundingClientRect();
+                            return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 120 && rect.height > 80;
+                        };
+                        const candidates = Array.from(document.querySelectorAll('body *')).filter(el => {
+                            if (!visible(el)) return false;
+                            const style = window.getComputedStyle(el);
+                            const rect = el.getBoundingClientRect();
+                            const text = (el.innerText || el.textContent || '').trim();
+                            const dashed = style.borderStyle.includes('dashed') || style.borderStyle.includes('dotted');
+                            const uploadText = text.includes('上传') || text.includes('选择视频');
+                            return rect.left < window.innerWidth * 0.55 && (dashed || uploadText);
+                        }).sort((a, b) => {
+                            const ar = a.getBoundingClientRect();
+                            const br = b.getBoundingClientRect();
+                            const areaDiff = (br.width * br.height) - (ar.width * ar.height);
+                            if (Math.abs(areaDiff) > 1000) return areaDiff;
+                            return ar.left - br.left;
+                        });
+                        const target = candidates[0];
+                        if (!target) return false;
+                        const rect = target.getBoundingClientRect();
+                        const point = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2) || target;
+                        point.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+                        point.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+                        point.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+                        point.click();
+                        return true;
+                    }
+                """)
+                if not clicked:
+                    raise Exception("dotted upload area not found")
+            file_chooser = await fc_info.value
+            await file_chooser.set_files(video_path)
+            await page.wait_for_timeout(5000)
+            logger.info("WeChat Channels video selected via dotted upload area.")
+            return
+        except Exception:
+            pass
+
+        file_input = page.locator('input[type="file"]').first
+        if await file_input.count() > 0:
+            await file_input.set_input_files(video_path, timeout=30000)
+            await page.wait_for_timeout(5000)
+            logger.info("WeChat Channels video selected via fallback file input.")
+            return
+        raise Exception("Could not find WeChat Channels upload control.")
+
+    async def _fill_wechat_fields(self, page: Page, title: str, description: str) -> None:
+        """User-requested mapping: title -> 视频描述, content -> 短标题."""
+        title_ok = await self._fill_field_near_label(page, "视频描述", title, timeout_ms=10000)
+        short_title_ok = await self._fill_field_near_label(page, "短标题", description, timeout_ms=10000)
+        if title_ok and short_title_ok:
+            logger.info("Filled WeChat Channels 视频描述 and 短标题 fields.")
+            return
+
+        fallback = page.locator('.input-editor, .desc-area, [contenteditable="true"], textarea, input').filter(visible=True)
+        count = await fallback.count()
+        if count >= 2:
+            await fallback.nth(0).fill(title)
+            await fallback.nth(1).fill(description)
+            logger.info("Filled WeChat Channels fields via fallback visible controls.")
+            return
+        raise Exception("Could not fill WeChat Channels 视频描述/短标题 fields.")
+
+    async def _enable_wechat_schedule(self, page: Page, scheduled_for: Optional[datetime]) -> None:
+        if not scheduled_for:
+            return
+        local_time = self._format_local_schedule(scheduled_for)
+        date_part = local_time.strftime("%Y-%m-%d")
+        minute_part = local_time.strftime("%Y-%m-%d %H:%M")
+        clicked = False
+        try:
+            labels = page.get_by_text("定时", exact=True)
+            count = await labels.count()
+            for index in range(count - 1, -1, -1):
+                label = labels.nth(index)
+                if await label.is_visible():
+                    await label.click(timeout=2000)
+                    clicked = True
+                    break
+        except Exception:
+            clicked = False
+
+        if not clicked:
+            clicked = await page.evaluate("""
+                () => {
+                    const visible = el => {
+                        if (!el) return false;
+                        const style = window.getComputedStyle(el);
+                        const rect = el.getBoundingClientRect();
+                        return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+                    };
+                    const labels = Array.from(document.querySelectorAll('body *')).filter(el => {
+                        if (!visible(el)) return false;
+                        return (el.innerText || el.textContent || '').trim() === '定时';
+                    });
+                    const target = labels[labels.length - 1];
+                    if (!target) return false;
+                    target.click();
+                    return true;
+                }
+            """)
+
+        if not clicked:
+            raise Exception("Could not select WeChat Channels 定时 radio.")
+        await page.wait_for_timeout(800)
+
+        if await self._fill_date_time_input(page, [
+            'input[placeholder*="发表时间"]',
+            'input[placeholder*="发布时间"]',
+            'input[placeholder*="选择时间"]',
+            'input[placeholder*="请选择"]',
+            '.ant-picker input',
+            '[class*="picker"] input',
+            'input',
+        ], minute_part, timeout_ms=10000):
+            logger.info(f"WeChat Channels scheduled time set to {minute_part}")
+            return
+        if await self._fill_date_time_input(page, ['input'], date_part, timeout_ms=5000):
+            logger.info(f"WeChat Channels scheduled date set to {date_part}")
+            return
+        raise Exception("Could not set scheduled publish time on WeChat Channels page.")
+
     async def start_login_session(self) -> str:
         async def _wait_for_login(browser: Browser, context: BrowserContext, page: Page):
             try:
@@ -1670,27 +1953,11 @@ class WechatChannelsPublisher(BaseSocialPlatform):
                     raise Exception("Not logged in to WeChat Channels. Please scan QR code first.")
                 
                 logger.info("Uploading WeChat Channels video file...")
-                file_input = page.locator('input[type="file"]').first
-                if await file_input.count() > 0:
-                    await file_input.set_input_files(video_path, timeout=30000)
-                else:
-                    async with page.expect_file_chooser() as fc_info:
-                        clicked_upload = await self._click_first_visible(page, [
-                            '.upload',
-                            '.btn-upload',
-                            '[class*="upload"]',
-                            'text="上传"',
-                        ], timeout_ms=15000)
-                        if not clicked_upload:
-                            raise Exception("Could not find WeChat Channels upload control.")
-                    file_chooser = await fc_info.value
-                    await file_chooser.set_files(video_path)
-                
-                desc_input = page.locator('.input-editor, .desc-area, [contenteditable="true"]')
-                await desc_input.first.wait_for(state="visible", timeout=180000)
-                await desc_input.first.fill(f"{title}\n{description}")
+                await self._upload_wechat_video(page, video_path)
+                await page.locator('.input-editor, .desc-area, [contenteditable="true"], textarea, input').first.wait_for(state="visible", timeout=180000)
+                await self._fill_wechat_fields(page, title, description)
 
-                await self._enable_platform_schedule(page, scheduled_for)
+                await self._enable_wechat_schedule(page, scheduled_for)
                 
                 publish_btn = page.locator('button:has-text("发表"), button:has-text("发布")').first
                 await publish_btn.wait_for(state="visible", timeout=90000)
@@ -1729,24 +1996,11 @@ class WechatChannelsPublisher(BaseSocialPlatform):
                     raise Exception("Not logged in to WeChat Channels. Please scan QR code first.")
 
                 logger.info("[DEBUG] Uploading WeChat Channels video file...")
-                file_input = page.locator('input[type="file"]').first
-                if await file_input.count() > 0:
-                    await file_input.set_input_files(video_path, timeout=30000)
-                else:
-                    async with page.expect_file_chooser() as fc_info:
-                        clicked_upload = await self._click_first_visible(page, [
-                            '.upload', '.btn-upload', '[class*="upload"]', 'text="上传"',
-                        ], timeout_ms=15000)
-                        if not clicked_upload:
-                            raise Exception("Could not find WeChat Channels upload control.")
-                    file_chooser = await fc_info.value
-                    await file_chooser.set_files(video_path)
+                await self._upload_wechat_video(page, video_path)
+                await page.locator('.input-editor, .desc-area, [contenteditable="true"], textarea, input').first.wait_for(state="visible", timeout=180000)
+                await self._fill_wechat_fields(page, title, description)
 
-                desc_input = page.locator('.input-editor, .desc-area, [contenteditable="true"]')
-                await desc_input.first.wait_for(state="visible", timeout=180000)
-                await desc_input.first.fill(f"{title}\n{description}")
-
-                await self._enable_platform_schedule(page, scheduled_for)
+                await self._enable_wechat_schedule(page, scheduled_for)
 
                 await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 await page.wait_for_timeout(1500)
