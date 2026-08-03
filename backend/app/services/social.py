@@ -676,51 +676,52 @@ class BaseSocialPlatform:
     async def _enable_platform_schedule(self, page: Page, scheduled_for: Optional[datetime]) -> None:
         if not scheduled_for:
             return
-
+        
         local_time = scheduled_for.astimezone(timezone(timedelta(hours=8)))
-        date_value = local_time.strftime("%Y-%m-%d")
-        time_value = local_time.strftime("%H:%M")
         datetime_value = local_time.strftime("%Y-%m-%d %H:%M")
-
-        logger.info(f"Enabling platform scheduled publish for {self.platform_name}: {datetime_value}")
-        clicked = await self._click_first_visible(page, [
+        
+        logger.info(f"Enabling Douyin scheduled publish: {datetime_value}")
+        
+        # Click the schedule toggle/button first
+        schedule_clicked = await self._click_first_visible(page, [
             'label:has-text("定时发布")',
             'label:has-text("定时")',
             'button:has-text("定时发布")',
             'span:has-text("定时发布")',
-            'div:has-text("定时发布")',
             'text="定时发布"',
+            '.date-picker-ioPchj'  # Direct selector for the date picker container
         ], timeout_ms=8000)
-        if not clicked:
-            raise Exception(f"Could not find 定时发布 option on {self.platform_name} publish page.")
-
+        
+        if not schedule_clicked:
+            logger.warning("Could not find schedule toggle, trying direct picker click")
+            # Try clicking directly on the date picker container
+            try:
+                picker = page.locator('.date-picker-ioPchj').first
+                if await picker.count() > 0:
+                    await picker.click(timeout=3000)
+            except:
+                raise Exception("Could not find Douyin schedule time picker")
+        
         await page.wait_for_timeout(1000)
         
-        # Try combined first
-        if await self._fill_date_time_input(page, [
-            'input[placeholder*="发布时间"]',
-            'input[placeholder*="日期和时间"]',
-            'input[placeholder*="发布"]',
-            '[class*="datetime"] input',
-        ], datetime_value, timeout_ms=5000):
-            return
-
-        # Fallback to separate
-        date_filled = await self._fill_date_time_input(page, [
-            'input[placeholder*="日期"]',
-            'input[placeholder*="选择日期"]',
-            'input[placeholder*="年月日"]',
-            'input[type="date"]',
-        ], date_value, timeout_ms=4000)
-        time_filled = await self._fill_date_time_input(page, [
-            'input[placeholder*="时间"]',
-            'input[placeholder*="选择时间"]',
-            'input[placeholder*="时分"]',
-            'input[type="time"]',
-        ], time_value, timeout_ms=4000)
-
-        if not (date_filled and time_filled):
-            raise Exception(f"Could not set scheduled publish time on {self.platform_name} page.")
+        # Fill the datetime input directly
+        try:
+            # Wait for the input to be visible
+            time_input = page.locator('.semi-datepicker-input .semi-input').first
+            await time_input.wait_for(state="visible", timeout=10000)
+            
+            # Clear existing value and set new one
+            await time_input.click(timeout=3000)
+            await time_input.fill(datetime_value, timeout=5000)
+            
+            # Press Enter to confirm
+            await page.keyboard.press("Enter")
+            await page.wait_for_timeout(1000)
+            
+            logger.info(f"Douyin schedule time set to: {datetime_value}")
+        except Exception as e:
+            logger.error(f"Failed to set Douyin schedule time: {e}")
+            raise
 
     async def _enable_xhs_schedule(self, page: Page, scheduled_for: Optional[datetime]) -> None:
         if not scheduled_for:
@@ -883,90 +884,49 @@ class DouyinPublisher(BaseSocialPlatform):
             await page.wait_for_timeout(2000)
 
     async def _fill_douyin_description_fields(self, page: Page, title: str, description: str) -> None:
-        """Fill Douyin's 作品描述 block: first field is 标题, second field is 简介."""
-        script = """
-            ({ title, description }) => {
-                const visible = el => {
-                    if (!el) return false;
-                    const style = window.getComputedStyle(el);
-                    const rect = el.getBoundingClientRect();
-                    return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
-                };
-                const setValue = (el, value) => {
-                    el.scrollIntoView({ block: 'center', inline: 'nearest' });
-                    el.focus && el.focus();
-                    const tag = (el.tagName || '').toLowerCase();
-                    if (tag === 'input' || tag === 'textarea') {
-                        el.value = value;
-                    } else if (el.isContentEditable || el.getAttribute('contenteditable') === 'true') {
-                        el.textContent = value;
-                    } else {
-                        return false;
-                    }
-                    el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
-                    el.dispatchEvent(new Event('change', { bubbles: true }));
-                    return true;
-                };
-                const controls = Array.from(document.querySelectorAll('input, textarea, [contenteditable="true"]')).filter(visible);
-                const titleControls = controls.filter(el => {
-                    const placeholder = (el.getAttribute('placeholder') || el.getAttribute('data-placeholder') || '').trim();
-                    return placeholder.includes('标题');
-                });
-                const descControls = controls.filter(el => {
-                    const placeholder = (el.getAttribute('placeholder') || el.getAttribute('data-placeholder') || '').trim();
-                    return placeholder.includes('简介') || placeholder.includes('描述');
-                });
-                if (titleControls[0] && descControls[0]) {
-                    return setValue(titleControls[0], title) && setValue(descControls[0], description);
-                }
-
-                const labels = Array.from(document.querySelectorAll('body *')).filter(el => {
-                    if (!visible(el)) return false;
-                    const text = (el.innerText || el.textContent || '').trim();
-                    return text === '作品描述' || text.startsWith('作品描述');
-                });
-                for (const label of labels) {
-                    const labelRect = label.getBoundingClientRect();
-                    const nearby = controls.filter(el => {
-                        const rect = el.getBoundingClientRect();
-                        return rect.top >= labelRect.top - 30 && rect.top <= labelRect.top + 360 && rect.left >= labelRect.left - 20;
-                    }).sort((a, b) => {
-                        const ar = a.getBoundingClientRect();
-                        const br = b.getBoundingClientRect();
-                        if (Math.abs(ar.top - br.top) > 8) return ar.top - br.top;
-                        return ar.left - br.left;
-                    });
-                    if (nearby.length >= 2) {
-                        return setValue(nearby[0], title) && setValue(nearby[1], description);
-                    }
-                }
-                return false;
-            }
-        """
+        """Fill Douyin's title and 作品描述 (description) fields using precise selectors."""
         try:
-            if await page.evaluate(script, {"title": title, "description": description}):
-                logger.info("Filled Douyin 作品描述 title and intro fields.")
-                return
+            # 1. Fill title field - specific selector based on actual DOM
+            title_input = page.locator('.semi-input-wrapper input[type="text"], .semi-input-default').first
+            if await title_input.count() > 0 and await title_input.is_visible():
+                await title_input.click(timeout=5000)
+                await title_input.fill(title, timeout=5000)
+                logger.info(f"Filled Douyin title: {title[:50]}...")
+            else:
+                # Fallback: try any input with placeholder containing 标题
+                fallback_title = page.locator('input[placeholder*="标题"]').first
+                if await fallback_title.count() > 0 and await fallback_title.is_visible():
+                    await fallback_title.click(timeout=3000)
+                    await fallback_title.fill(title, timeout=3000)
+                    logger.info(f"Filled Douyin title via fallback")
+                else:
+                    logger.warning("Could not find Douyin title input field")
+            
+            # 2. Fill description/简介 field - contenteditable div
+            desc_editor = page.locator('.zone-container.editor-kit-container.editor').first
+            if await desc_editor.count() > 0 and await desc_editor.is_visible():
+                await desc_editor.click(timeout=5000)
+                # Clear any existing content
+                await page.keyboard.press("Control+A")
+                await page.keyboard.press("Delete")
+                # Type the description
+                await page.keyboard.type(description, delay=10)
+                logger.info(f"Filled Douyin description: {description[:50]}...")
+            else:
+                # Fallback: try any contenteditable with placeholder 简介
+                fallback_desc = page.locator('[contenteditable="true"][data-placeholder*="简介"]').first
+                if await fallback_desc.count() > 0 and await fallback_desc.is_visible():
+                    await fallback_desc.click(timeout=3000)
+                    await page.keyboard.press("Control+A")
+                    await page.keyboard.press("Delete")
+                    await page.keyboard.type(description, delay=10)
+                    logger.info(f"Filled Douyin description via fallback")
+                else:
+                    logger.warning("Could not find Douyin description editor")
+                    
         except Exception as e:
-            logger.warning(f"Douyin label-based field fill failed: {e}")
-
-        title_filled = await self._fill_text_entry(page, [
-            'input[placeholder*="作品作品标题"]',
-            'input[placeholder*="作品标题"]',
-            'input[placeholder*="标题"]',
-            'textarea[placeholder*="作品标题"]',
-            '[contenteditable="true"][data-placeholder*="标题"]',
-        ], title, timeout_ms=10000)
-        desc_filled = await self._fill_text_entry(page, [
-            'textarea[placeholder*="作品简介"]',
-            'textarea[placeholder*="简介"]',
-            'textarea[placeholder*="描述"]',
-            '[contenteditable="true"][data-placeholder*="简介"]',
-            '[contenteditable="true"][data-placeholder*="描述"]',
-            '[contenteditable="true"]',
-        ], description, timeout_ms=10000)
-        if not title_filled or not desc_filled:
-            raise Exception("Could not fill Douyin 作品描述 title/intro fields after upload.")
+            logger.error(f"Failed to fill Douyin title/description: {e}")
+            raise
 
     async def start_login_session(self) -> str:
         async def _wait_for_login(browser: Browser, context: BrowserContext, page: Page):
