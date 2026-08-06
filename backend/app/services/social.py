@@ -1204,9 +1204,12 @@ class DouyinPublisher(BaseSocialPlatform):
 
                 await self._enable_platform_schedule(page, scheduled_for)
 
+                # Wait for all dynamic content to render
+                await page.wait_for_timeout(2000)
+                
                 # Scroll to show publish button area in screenshot
                 await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                await page.wait_for_timeout(1500)
+                await page.wait_for_timeout(2000)
                 await page.screenshot(path=screenshot_path, full_page=True)
                 logger.info(f"[DEBUG] Douyin debug screenshot saved to {screenshot_path}")
                 return screenshot_path
@@ -1433,21 +1436,51 @@ class XiaohongshuPublisher(BaseSocialPlatform):
                 await self._wait_until_upload_ready(page, "Xiaohongshu")
                 await title_input.first.fill(title)
                 
-                desc_filled = await self._fill_text_entry(page, [
-                    'textarea[placeholder*="正文"]',
-                    'textarea[placeholder*="描述"]',
-                    '[contenteditable="true"][data-placeholder*="正文"]',
-                    '[contenteditable="true"][placeholder*="正文"]',
-                    '.ql-editor',
-                    '#post-textarea',
-                    '.post-content',
-                ], description, timeout_ms=8000)
+                # Fill description using precise XHS tiptap editor selectors
+                desc_filled = False
+                try:
+                    # Wait for the editor container to appear
+                    editor_container = page.locator('[data-v-787eeb26]').first
+                    await editor_container.wait_for(state="visible", timeout=30000)
+                    
+                    # Find the contenteditable element inside
+                    contenteditable = editor_container.locator('[contenteditable="true"]').first
+                    await contenteditable.wait_for(state="visible", timeout=10000)
+                    
+                    # Click to focus
+                    await contenteditable.click(timeout=3000)
+                    await page.wait_for_timeout(1000)  # Wait for tiptap to initialize
+                    
+                    # Clear existing content
+                    await contenteditable.evaluate("el => el.innerHTML = '<p><br></p>'")
+                    await page.wait_for_timeout(500)
+                    
+                    # Type the description
+                    await page.keyboard.type(description, delay=10)
+                    desc_filled = True
+                    logger.info("Filled XHS description using data-v-787eeb26 container")
+                except Exception as e:
+                    logger.warning(f"XHS description fill failed: {e}")
+                
                 if not desc_filled:
-                    logger.warning("Could not find a visible Xiaohongshu description field; continuing with title only.")
+                    # Last resort: find ANY contenteditable with the placeholder text
+                    try:
+                        placeholder_editor = page.get_by_placeholder("输入正文描述", exact=False).first
+                        if await placeholder_editor.count() > 0:
+                            await placeholder_editor.click(timeout=3000)
+                            await page.keyboard.type(description, delay=10)
+                            desc_filled = True
+                            logger.info("Filled XHS description using placeholder match")
+                    except:
+                        pass
+                
+                if not desc_filled:
+                    logger.warning("Could not fill XHS description field - continuing with title only")
 
                 await self._enable_xhs_schedule(page, scheduled_for)
                 
-                publish_btn = page.locator('button:has-text("发布")').first
+                # Find the publish button by text content "定时发布"
+                publish_btn = page.locator('button:has-text("定时发布")').first
                 await publish_btn.wait_for(state="visible", timeout=90000)
                 await publish_btn.click(timeout=90000)
                 logger.info("Xiaohongshu publish clicked!")
@@ -1501,21 +1534,82 @@ class XiaohongshuPublisher(BaseSocialPlatform):
                 file_input = page.locator('input[type="file"]').first
                 await file_input.set_input_files(video_path, timeout=30000)
 
-                title_input = page.locator('input.title-input, input[placeholder*="标题"]')
-                await title_input.first.wait_for(state="visible", timeout=180000)
+                # Wait for upload to be ready first
                 await self._wait_until_upload_ready(page, "Xiaohongshu")
-                await title_input.first.fill(title)
+                
+                # Fill title using precise XHS selectors based on actual DOM
+                title_filled = False
+                title_selectors = [
+                    'input.d-text[placeholder*="标题"]',
+                    'input[placeholder*="填写标题"]',
+                    '.input input.d-text',
+                    'input.title-input'
+                ]
+                for selector in title_selectors:
+                    try:
+                        title_input = page.locator(selector).first
+                        if await title_input.count() > 0 and await title_input.is_visible():
+                            await title_input.click(timeout=3000)
+                            await title_input.fill(title, timeout=5000)
+                            title_filled = True
+                            logger.info(f"Filled XHS title using selector: {selector}")
+                            break
+                    except Exception as e:
+                        logger.debug(f"Title selector {selector} failed: {e}")
+                        continue
+                
+                if not title_filled:
+                    logger.warning("Could not fill XHS title field - continuing without title")
 
-                await self._fill_text_entry(page, [
-                    'textarea[placeholder*="正文"]', 'textarea[placeholder*="描述"]',
-                    '[contenteditable="true"][data-placeholder*="正文"]', '[contenteditable="true"][placeholder*="正文"]',
-                    '.ql-editor', '#post-textarea', '.post-content',
-                ], description, timeout_ms=8000)
+                # Fill description - use the EXACT structure from your HTML
+                desc_filled = False
+                try:
+                    # Wait for the editor container to appear
+                    editor_container = page.locator('[data-v-787eeb26]').first
+                    await editor_container.wait_for(state="visible", timeout=30000)
+                    
+                    # Find the contenteditable element inside
+                    contenteditable = editor_container.locator('[contenteditable="true"]').first
+                    await contenteditable.wait_for(state="visible", timeout=10000)
+                    
+                    # Click to focus
+                    await contenteditable.click(timeout=3000)
+                    await page.wait_for_timeout(1000)  # Wait for tiptap to initialize
+                    
+                    # Clear existing content
+                    await contenteditable.evaluate("el => el.innerHTML = '<p><br></p>'")
+                    await page.wait_for_timeout(500)
+                    
+                    # Type the description
+                    await page.keyboard.type(description, delay=10)
+                    desc_filled = True
+                    logger.info("Filled XHS description using data-v-787eeb26 container")
+                except Exception as e:
+                    logger.warning(f"XHS description fill failed: {e}")
+                
+                if not desc_filled:
+                    # Last resort: find ANY contenteditable with the placeholder text
+                    try:
+                        placeholder_editor = page.get_by_placeholder("输入正文描述", exact=False).first
+                        if await placeholder_editor.count() > 0:
+                            await placeholder_editor.click(timeout=3000)
+                            await page.keyboard.type(description, delay=10)
+                            desc_filled = True
+                            logger.info("Filled XHS description using placeholder match")
+                    except:
+                        pass
+                
+                if not desc_filled:
+                    logger.warning("Could not fill XHS description field - continuing with title only")
 
                 await self._enable_xhs_schedule(page, scheduled_for)
 
+                # Wait for all dynamic content to render
+                await page.wait_for_timeout(3000)
+                
+                # Scroll to show entire form in screenshot
                 await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                await page.wait_for_timeout(1500)
+                await page.wait_for_timeout(2000)
                 await page.screenshot(path=screenshot_path, full_page=True)
                 logger.info(f"[DEBUG] Xiaohongshu debug screenshot saved to {screenshot_path}")
                 return screenshot_path
@@ -1919,8 +2013,8 @@ class WechatChannelsPublisher(BaseSocialPlatform):
 
                 await self._enable_wechat_schedule(page, scheduled_for)
                 
-                publish_btn = page.locator('button:has-text("发表"), button:has-text("发布")').first
-                await publish_btn.wait_for(state="visible", timeout=90000)
+                publish_btn = page.locator('button.weui-desktop-btn_primary').first
+                await publish_btn.wait_for(state="visible", timeout=60000)
                 await publish_btn.click(timeout=90000)
                 logger.info("WeChat Channels publish clicked!")
                 await self._wait_for_publish_result(
@@ -1962,8 +2056,22 @@ class WechatChannelsPublisher(BaseSocialPlatform):
 
                 await self._enable_wechat_schedule(page, scheduled_for)
 
+                # Wait for all dynamic content to render
+                await page.wait_for_timeout(2000)
+                
+                # Close datepicker if open (it might be covering the form)
+                try:
+                    datepicker = page.locator('.semi-datepicker, .date-picker, [class*="datepicker"]').first
+                    if await datepicker.count() > 0 and await datepicker.is_visible():
+                        logger.info("WeChat: Closing datepicker before screenshot")
+                        await page.keyboard.press("Escape")
+                        await page.wait_for_timeout(500)
+                except:
+                    pass
+                
+                # Scroll to show publish button area in screenshot
                 await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                await page.wait_for_timeout(1500)
+                await page.wait_for_timeout(2000)
                 await page.screenshot(path=screenshot_path, full_page=True)
                 logger.info(f"[DEBUG] WeChat Channels debug screenshot saved to {screenshot_path}")
                 return screenshot_path
