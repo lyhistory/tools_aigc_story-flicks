@@ -979,36 +979,48 @@ class DouyinPublisher(BaseSocialPlatform):
                     # QR disappeared → likely scanned!
                     if not qr_still_visible and qr_element_present:
                         logger.info(f"Douyin: QR code disappeared at attempt {attempt} (scan detected!)")
-                        
-                        # Small settle delay
-                        await page.wait_for_timeout(1000)
-                        
-                        # Final URL validation - must be non-login douyin.com domain
+
+                        # ✅ 等待页面完成跳转（抖音扫码后通常有 3–6 秒延迟）
+                        for settle in range(6):
+                            await page.wait_for_timeout(1000)
+                            url = page.url.lower()
+                            if "login" not in url and "qrcode" not in url and "signin" not in url:
+                                break
+
+                        # ✅ 明确失败：仍在登录页
                         final_url = page.url.lower()
-                        for bad_kw in ['login', 'signin', 'qrcode', 'auth']:
-                            if bad_kw in final_url:
-                                logger.warning(f"Douyin: After QR disappeared, landed on login-like page again: {final_url}")
-                                continue  # Keep waiting
-                        
-                        # Additional verification: check that page contains dashboard markers
+                        if any(k in final_url for k in ["login", "qrcode", "signin", "auth"]):
+                            logger.warning(f"Douyin: QR scanned but still on login page: {final_url}")
+                            continue
+
+                        # ✅ 明确失败：页面仍显示登录文案
                         try:
-                            dashboard_text = await page.evaluate("() => document.body?.innerText || ''")
-                            dashboard_markers = ["创作者中心", "创作中心", "数据", "作品", "发布"]
-                            if not any(marker in dashboard_text for marker in dashboard_markers):
-                                # Could be a temporary redirect page - keep waiting
-                                logger.warning(f"Douyin: After QR disappear, found no dashboard markers, continuing to wait...")
+                            body_text = await page.locator("body").inner_text(timeout=3000)
+                            if any(k in body_text for k in ["扫码登录", "验证码登录", "登录/注册"]):
+                                logger.warning("Douyin: QR scanned but login text still present")
                                 continue
-                        except Exception as e:
-                            logger.debug(f"Could not verify dashboard markers: {e}")
-                        
-                        # Save validated auth state (give brief moment for any async writes to settle)
+                        except Exception:
+                            pass
+
+                        # ✅ 明确成功：URL + 页面内容双重验证
+                        try:
+                            body_text = await page.locator("body").inner_text(timeout=3000)
+                            dashboard_markers = ["创作者中心", "创作中心", "数据", "作品", "发布"]
+                            if not any(marker in body_text for marker in dashboard_markers):
+                                logger.warning("Douyin: QR scanned but no dashboard markers found")
+                                continue
+                        except Exception:
+                            pass
+
+                        # ✅ 所有校验通过，才保存登录态
                         try:
                             await context.storage_state(path=self.auth_file)
-                            await asyncio.sleep(0.5)  # Small delay to ensure file flush
+                            await asyncio.sleep(0.5)
+                            logger.info("Douyin: Login confirmed and auth state saved")
                         except Exception as e:
                             logger.error(f"Failed to save Douyin storage state: {e}")
                             raise
-                        
+
                         ACTIVE_LOGIN_SESSIONS[self.platform_name]["status"] = "success"
                         return
                     
