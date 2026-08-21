@@ -66,8 +66,10 @@ htmlcov/
 local_settings.py
 db.sqlite3-journal
 media/
+backend/*.png
 
 # Credentials (do not commit)
+backend/backend/auth/
 backend/credentials/
 **/credentials/*.json
 
