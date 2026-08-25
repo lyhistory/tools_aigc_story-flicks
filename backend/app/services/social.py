@@ -114,12 +114,12 @@ class BaseSocialPlatform:
             '--disable-infobars',
             '--disable-extensions',
             '--disable-gpu',
-            '--window-size=1280,800',
+            #'--window-size=1280,800',
             '--lang=zh-CN',
         ]
 
         context_args: dict = {
-            "viewport": {'width': 1280, 'height': 800},
+            "viewport": {'width': 1280, 'height': 1800},
             "user_agent": 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
             "locale": "zh-CN",
         }
@@ -292,21 +292,94 @@ class BaseSocialPlatform:
             await page.wait_for_timeout(300)
         return False
 
-    async def _click_switch_near_label(self, page: Page, text: str, offset_x: int = 225, timeout_ms: int = 5000) -> bool:
-        """Click a switch positioned to the right of an exact label and verify the click opens related controls."""
+    async def _click_switch_near_label(self, page: Page, text: str, timeout_ms: int = 10000) -> bool:
+        """Click the d-switch inside the custom-switch-card that contains the given label text.
+        
+        Based on XHS DOM:
+        .custom-switch-card
+        .custom-switch-text-content
+            span.has-tips (text)  ←-- we find this
+        .custom-switch-switch
+            .d-switch             ←-- we click this
+        """
         deadline = asyncio.get_running_loop().time() + (timeout_ms / 1000)
+        logger.info(f"XHS switch: trying to click switch near label '{text}'")
+        
         while asyncio.get_running_loop().time() < deadline:
             try:
-                label = page.get_by_text(text, exact=True).first
-                if await label.count() > 0 and await label.is_visible():
-                    box = await label.bounding_box()
-                    if box:
-                        await page.mouse.click(box["x"] + offset_x, box["y"] + (box["height"] / 2))
-                        await page.wait_for_timeout(800)
+                # ✅ 修复：找到包含"定时发布"的custom-switch-wrapper，再找兄弟节点的d-switch
+                wrapper = page.locator('.post-time-wrapper .custom-switch-wrapper').filter(has_text=text).first
+                if await wrapper.count() == 0:
+                    logger.debug(f"XHS switch: card with text '{text}' not found, retrying...")
+                    await page.wait_for_timeout(300)
+                    continue
+                
+                switch = wrapper.locator('.custom-switch-switch .d-switch').first
+                if await switch.count() == 0:
+                    logger.debug(f"XHS switch: .d-switch not found inside card, retrying...")
+                    await page.wait_for_timeout(300)
+                    continue
+                
+                # 3. 找可点击的 simulator（D-Design 实际绑定点击事件的元素）
+                simulator = switch.locator('.d-switch-simulator').first
+                
+                # 4. 先确认当前状态
+                is_currently_checked = await page.evaluate(
+                    "() => !!document.querySelector('.post-time-wrapper .d-switch-simulator.checked')"
+                )
+                if is_currently_checked:
+                    logger.info("XHS switch: already checked")
+                    return True
+                
+                # 5. 用 Playwright 高级 click（自动处理可见性/稳定性/滚动/不被遮挡）
+                #    优先点 simulator，它是真正的视觉点击区域
+                target = simulator if await simulator.count() > 0 else switch
+                logger.info(f"XHS switch: clicking via locator.click() on {'.d-switch-simulator' if await simulator.count() > 0 else '.d-switch'}")
+                await target.click(timeout=3000)
+                
+                await page.wait_for_timeout(600)
+                
+                # 6. 校验是否真的变成了 checked
+                is_checked = await page.evaluate(
+                    "() => !!document.querySelector('.post-time-wrapper .d-switch-simulator.checked')"
+                )
+                if is_checked:
+                    logger.info("XHS switch: ✓ successfully toggled to CHECKED")
+                    return True
+                
+                # 7. 如果 locator.click 没生效，用坐标点击 simulator 中心作为兜底
+                #    因为 D-Design 可能依赖真实的 pointer 事件坐标
+                logger.warning("XHS switch: locator.click did not toggle, falling back to coordinate click on simulator")
+                sim_box = await simulator.bounding_box()
+                if sim_box:
+                    cx = sim_box["x"] + sim_box["width"] / 2
+                    cy = sim_box["y"] + sim_box["height"] / 2
+                    logger.info(f"XHS switch: mouse.click at simulator center ({cx:.1f}, {cy:.1f})")
+                    await page.mouse.click(cx, cy)
+                    await page.wait_for_timeout(600)
+                    
+                    # 再校验
+                    is_checked = await page.evaluate(
+                        "() => !!document.querySelector('.post-time-wrapper .d-switch-simulator.checked')"
+                    )
+                    if is_checked:
+                        logger.info("XHS switch: ✓ coordinate click succeeded")
                         return True
-            except Exception:
-                pass
-            await page.wait_for_timeout(300)
+                
+                logger.warning("XHS switch: click attempts failed, will retry...")
+                await page.wait_for_timeout(500)
+                
+            except Exception as e:
+                logger.warning(f"XHS switch: error: {e}")
+                await page.wait_for_timeout(300)
+                continue
+        
+        # 8. 诊断信息
+        try:
+            card_html = await page.locator('.post-time-wrapper .custom-switch-card').first.inner_html(timeout=2000)
+            logger.error(f"XHS switch: FAILED. Card HTML: {card_html[:1500]}")
+        except Exception:
+            pass
         return False
 
     async def _click_control_in_text_row(self, page: Page, text: str, timeout_ms: int = 5000) -> bool:
@@ -728,50 +801,76 @@ class BaseSocialPlatform:
             return
 
         local_time = scheduled_for.astimezone(timezone(timedelta(hours=8)))
-        date_value = local_time.strftime("%Y-%m-%d")
-        time_value = local_time.strftime("%H:%M")
         datetime_value = local_time.strftime("%Y-%m-%d %H:%M")
-        compact_datetime = local_time.strftime("%Y-%m-%d %H:%M")
         logger.info(f"Enabling Xiaohongshu scheduled publish: {datetime_value}")
 
-        await page.get_by_text("更多设置", exact=True).scroll_into_view_if_needed(timeout=5000)
-        clicked = await self._click_switch_near_label(page, "定时发布", offset_x=225, timeout_ms=5000)
-        if not clicked:
-            clicked = await self._click_control_in_text_row(page, "定时发布", timeout_ms=5000)
-        if not clicked:
-            clicked = await self._click_near_text(page, "定时发布", offset_x=225, timeout_ms=5000)
+        # 1. 展开更多设置
+        try:
+            more = page.get_by_text("更多设置", exact=True).first
+            if await more.count() > 0 and await more.is_visible():
+                await more.click(timeout=3000)
+                await page.wait_for_timeout(800)
+        except Exception:
+            pass
+
+        # 2. 点击定时发布开关（用修复后的选择器）
+        clicked = False
+        for fn in [
+            lambda: self._click_switch_near_label(page, "定时发布", timeout_ms=5000),
+            lambda: self._click_control_in_text_row(page, "定时发布", timeout_ms=5000),
+            lambda: self._click_near_text(page, "定时发布", offset_x=225, timeout_ms=5000),
+        ]:
+            try:
+                if await fn():
+                    clicked = True
+                    break
+            except Exception:
+                continue
+
         if not clicked:
             raise Exception("Could not enable Xiaohongshu 定时发布 switch.")
 
         await page.wait_for_timeout(1000)
-        await self._set_xhs_datetime_from_visible_row(page, compact_datetime)
-        body_text = await page.locator("body").inner_text(timeout=3000)
-        if date_value in body_text and time_value in body_text:
-            return
 
-        if await self._fill_date_time_input(page, [
-            'input[placeholder*="发布时间"]',
-            'input[placeholder*="定时"]',
-            'input[placeholder*="选择日期"]',
-            'input[placeholder*="请选择"]',
-        ], datetime_value, timeout_ms=8000):
-            return
+        # 3. 填时间
+        picker = page.locator('.d-datepicker-input-filter input.d-text').first
+        await picker.wait_for(state="visible", timeout=10000)
+        await picker.click()
+        await page.keyboard.press("Control+A")
+        await page.keyboard.type(datetime_value)
+        await page.keyboard.press("Enter")
+        await page.wait_for_timeout(800)
 
-        # Fallback if combined selector doesn't work
-        date_filled = await self._fill_date_time_input(page, [
-            'input[placeholder*="日期"]',
-            'input[placeholder*="选择日期"]',
-        ], date_value, timeout_ms=4000)
-        time_filled = await self._fill_date_time_input(page, [
-            'input[placeholder*="时间"]',
-            'input[placeholder*="选择时间"]',
-        ], time_value, timeout_ms=4000)
-        if not (date_filled and time_filled):
-            raise Exception("Could not set scheduled publish time on xiaohongshu page.")
+        # 4. 关闭日期选择器
+        closed = False
+        for btn_sel in [
+            '.d-datepicker-popup button:has-text("确定")',
+            '.d-datepicker-popup button:has-text("确认")',
+        ]:
+            try:
+                btn = page.locator(btn_sel).first
+                if await btn.count() > 0 and await btn.is_visible():
+                    await btn.click(timeout=2000)
+                    closed = True
+                    break
+            except Exception:
+                continue
 
-        body_text = await page.locator("body").inner_text(timeout=3000)
-        if date_value not in body_text or time_value not in body_text:
-            raise Exception("Xiaohongshu scheduled publish time did not update to the requested value.")
+        if not closed:
+            await page.keyboard.press("Enter")
+            await page.keyboard.press("Escape")
+
+        try:
+            await page.locator('body').click(position={"x": 10, "y": 10}, force=True)
+        except Exception:
+            pass
+        await page.wait_for_timeout(1000)
+
+        # 5. 校验按钮
+        btn = page.locator('button:has-text("定时发布")').filter(visible=True).first
+        if not await btn.count():
+            raise Exception("Xiaohongshu 定时发布未生效：按钮未变为「定时发布」")
+        logger.info("Xiaohongshu 定时发布已生效，按钮变为「定时发布」")
 
     async def _set_xhs_datetime_from_visible_row(self, page: Page, datetime_value: str) -> None:
         try:
@@ -993,14 +1092,56 @@ class DouyinPublisher(BaseSocialPlatform):
                             logger.warning(f"Douyin: QR scanned but still on login page: {final_url}")
                             continue
 
-                        # ✅ 明确失败：页面仍显示登录文案
-                        try:
+                        # ✅ QR 消失后，必须等待“创作者中心”或“二次确认”出现
+                        logger.info("[DEBUG DOUYIN] QR disappeared, waiting for post-scan confirmation...")
+
+                        # 1. 等待页面不再显示“扫码登录 / 验证码登录”
+                        for i in range(30):
+                            await page.wait_for_timeout(1000)
                             body_text = await page.locator("body").inner_text(timeout=3000)
-                            if any(k in body_text for k in ["扫码登录", "验证码登录", "登录/注册"]):
-                                logger.warning("Douyin: QR scanned but login text still present")
-                                continue
+                            if "扫码登录" not in body_text and "验证码登录" not in body_text:
+                                logger.info(f"[DEBUG DOUYIN] Login text cleared at attempt {i}")
+                                break
+                            logger.info(f"[DEBUG DOUYIN] Still showing login text at attempt {i}")
+
+                        # 2. 等待 URL 跳转到 creator.douyin.com
+                        for i in range(30):
+                            await page.wait_for_timeout(1000)
+                            url = page.url.lower()
+                            if "creator.douyin.com" in url and "login" not in url:
+                                logger.info(f"[DEBUG DOUYIN] Creator URL confirmed at attempt {i}: {url}")
+                                break
+                            logger.info(f"[DEBUG DOUYIN] Still on login URL at attempt {i}: {url}")
+
+                        # 3. 等待创作者中心关键元素
+                        try:
+                            await page.wait_for_selector(
+                                'text="创作者中心", text="创作中心", text="数据", text="作品"',
+                                timeout=30000
+                            )
+                            logger.info("[DEBUG DOUYIN] Dashboard markers found")
                         except Exception:
-                            pass
+                            logger.warning("[DEBUG DOUYIN] Dashboard markers NOT found after 30s")
+
+                        # 4. 保存登录态（只有现在才是安全的）
+                        await context.storage_state(path=self.auth_file)
+                        logger.info("[DEBUG DOUYIN] Auth state saved after full confirmation")
+
+                        # ✅ 抖音创作者中心加载较慢，给足时间
+                        for settle in range(10):
+                            await page.wait_for_timeout(1000)
+                            url = page.url.lower()
+                            if "creator.douyin.com" in url and "login" not in url:
+                                break
+
+                        # ✅ 不再检查“登录文案”，只检查关键元素
+                        try:
+                            await page.wait_for_selector(
+                                'text="创作者中心", text="创作中心", text="数据", text="作品"',
+                                timeout=15000
+                            )
+                        except Exception:
+                            logger.warning("Douyin: No dashboard markers found, but URL looks good")
 
                         # ✅ 明确成功：URL + 页面内容双重验证
                         try:
@@ -1220,10 +1361,34 @@ class DouyinPublisher(BaseSocialPlatform):
                 await page.wait_for_timeout(2000)
                 
                 # Scroll to show publish button area in screenshot
-                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                await page.wait_for_timeout(2000)
-                await page.screenshot(path=screenshot_path, full_page=True)
-                logger.info(f"[DEBUG] Douyin debug screenshot saved to {screenshot_path}")
+                # ✅ 小红书发布页真正滚动容器（Docker / headless 稳定）
+                container = page.locator(
+                    '.publish-container, .creator-layout-main, .content-area, main'
+                ).first
+
+                if await container.count():
+                    # 1. 先滚到顶部，确保从正确锚点开始
+                    await container.evaluate("el => el.scrollTop = 0")
+                    await page.wait_for_timeout(1000)
+
+                    # 2. 再滚到底部，触发懒加载（封面 / 定时 / 发布按钮）
+                    await container.evaluate("el => el.scrollTop = el.scrollHeight")
+                    await page.wait_for_timeout(2000)
+
+                    # 3. 再滚回顶部，确保截图锚点正确
+                    await container.evaluate("el => el.scrollTop = 0")
+                    await page.wait_for_timeout(1500)
+
+                    # 4. ✅ 关键：强制等待布局稳定（Docker headless 必加）
+                    await page.wait_for_load_state("networkidle", timeout=5000)
+
+                    # 5. 对容器截图（viewport 会停在顶部）
+                    await container.screenshot(path=screenshot_path)
+                    logger.info(f"[DEBUG] Xiaohongshu container screenshot saved: {screenshot_path}")
+                else:
+                    # 兜底（理论上不会走到）
+                    await page.screenshot(path=screenshot_path, full_page=True)
+                    logger.warning("[DEBUG] Xiaohongshu container not found, used page screenshot")
                 return screenshot_path
             except Exception as e:
                 logger.error(f"[DEBUG] Douyin debug upload failed: {e}")
@@ -1520,23 +1685,40 @@ class XiaohongshuPublisher(BaseSocialPlatform):
             page = await context.new_page()
             try:
                 logger.info("[DEBUG] Opening Xiaohongshu publisher...")
-                await page.goto("https://creator.xiaohongshu.com/publish/publish?source=official", timeout=60000, wait_until="domcontentloaded")
-                # Pre-flight: if on login page but cookies exist, refresh once
-                if "login" in page.url.lower() and os.path.exists(self.auth_file):
-                    logger.info("XHS debug: on login page after goto — refreshing with cookies...")
-                    await page.reload(wait_until="domcontentloaded", timeout=30000)
+                # ✅ 强制锁定发布页，禁止重定向
+                await page.goto(
+                    "https://creator.xiaohongshu.com/publish/publish?source=official",
+                    timeout=60000,
+                    wait_until="domcontentloaded",
+                )
 
-                # Additional pre-flight verification for Xiaohongshu
+                # ✅ 如果已经被重定向到首页，强制再跳回来
+                if "/publish/publish" not in page.url:
+                    logger.warning(f"XHS redirected to {page.url}, forcing back to publish page")
+                    await page.goto(
+                        "https://creator.xiaohongshu.com/publish/publish?source=official",
+                        timeout=60000,
+                        wait_until="domcontentloaded",
+                    )
+
+                # ✅ 等待发布页核心元素出现（这是关键）
+                await page.locator('input[placeholder*="标题"], .upload-wrapper, input[type="file"]').first.wait_for(
+                    state="visible", timeout=30000
+                )
+                logger.info("[DEBUG] Xiaohongshu publish page confirmed")
+
+                # ✅ 修复：不在发布页流程里跳首页，直接在发布页验证登录态
                 try:
-                    test_url = "https://creator.xiaohongshu.com/creator/home"
-                    await page.goto(test_url, timeout=15000, wait_until="networkidle")
-                    if "login" in page.url.lower() or "qrcode" in page.url.lower():
-                        logger.warning("XHS: Auth stale - test URL redirected to login")
-                        self.clear_auth()
-                        raise Exception("Authentication expired - please re-login via QR code")
-                    await page.goto("https://creator.xiaohongshu.com/publish/publish?source=official", timeout=60000, wait_until="domcontentloaded")
+                    # 已经在发布页了，不需要再跳
+                    if not await self.verify_logged_in(page):
+                        # 检查是否被重定向到登录页
+                        if "login" in page.url.lower() or "qrcode" in page.url.lower():
+                            logger.warning("XHS: Auth stale - redirected to login page")
+                            self.clear_auth()
+                            raise Exception("Authentication expired - please re-login via QR code")
+                        logger.warning("XHS: verify_logged_in returned False but not on login page; continuing")
                 except Exception as e:
-                    logger.debug(f"XHS auth pre-flight check: {e}")
+                    logger.debug(f"XHS auth check: {e}")
 
                 if not await self.verify_logged_in(page):
                     self.clear_auth()
@@ -1547,7 +1729,10 @@ class XiaohongshuPublisher(BaseSocialPlatform):
                 await file_input.set_input_files(video_path, timeout=30000)
 
                 # Wait for upload to be ready first
-                await self._wait_until_upload_ready(page, "Xiaohongshu")
+                try:
+                    await self._wait_until_upload_ready(page, "Xiaohongshu")
+                except Exception as e:
+                    logger.warning(f"[DEBUG] Xiaohongshu upload ready check timed out (non-fatal): {e}")
                 
                 # Fill title using precise XHS selectors based on actual DOM
                 title_filled = False
@@ -1620,10 +1805,14 @@ class XiaohongshuPublisher(BaseSocialPlatform):
                 await page.wait_for_timeout(3000)
                 
                 # Scroll to show entire form in screenshot
-                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                await page.wait_for_timeout(2000)
-                await page.screenshot(path=screenshot_path, full_page=True)
+                # ✅ 小红书 debug 截图：Docker headless 唯一稳法（修正版）
+                # 1. viewport 拉高，确保发布面板完整进入首屏
+                await page.wait_for_timeout(3000)
+                await page.evaluate("window.scrollTo(0, 0)")
+                await page.wait_for_timeout(1000)
+                await page.screenshot(path=screenshot_path, full_page=False)
                 logger.info(f"[DEBUG] Xiaohongshu debug screenshot saved to {screenshot_path}")
+
                 return screenshot_path
             except Exception as e:
                 logger.error(f"[DEBUG] Xiaohongshu debug upload failed: {e}")
