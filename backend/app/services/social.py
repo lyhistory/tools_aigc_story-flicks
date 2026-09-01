@@ -1607,89 +1607,103 @@ class XiaohongshuPublisher(BaseSocialPlatform):
             try:
                 logger.info("Opening Xiaohongshu publisher...")
                 await page.goto("https://creator.xiaohongshu.com/publish/publish?source=official", timeout=60000, wait_until="domcontentloaded")
-                # Pre-flight: if on login page but cookies exist, refresh once
                 if "login" in page.url.lower() and os.path.exists(self.auth_file):
                     logger.info("XHS on login page after goto — refreshing with cookies...")
                     await page.reload(wait_until="domcontentloaded", timeout=30000)
                 if not await self.verify_logged_in(page):
                     self.clear_auth()
                     raise Exception("Not logged in to Xiaohongshu. Please scan QR code first.")
-                
+
                 logger.info("Uploading Xiaohongshu video file...")
                 file_input = page.locator('input[type="file"]').first
                 await file_input.set_input_files(video_path, timeout=30000)
-                
+
                 title_input = page.locator('input.title-input, input[placeholder*="标题"]')
                 await title_input.first.wait_for(state="visible", timeout=180000)
                 await self._wait_until_upload_ready(page, "Xiaohongshu")
                 await title_input.first.fill(title)
-                
-                # Fill description using precise XHS tiptap editor selectors
+
+                # Fill description
                 desc_filled = False
                 try:
-                    # Wait for the editor container to appear
                     editor_container = page.locator('[data-v-787eeb26]').first
                     await editor_container.wait_for(state="visible", timeout=30000)
-                    
-                    # Find the contenteditable element inside
                     contenteditable = editor_container.locator('[contenteditable="true"]').first
                     await contenteditable.wait_for(state="visible", timeout=10000)
-                    
-                    # Click to focus
                     await contenteditable.click(timeout=3000)
-                    await page.wait_for_timeout(1000)  # Wait for tiptap to initialize
-                    
-                    # Clear existing content
+                    await page.wait_for_timeout(1000)
                     await contenteditable.evaluate("el => el.innerHTML = '<p><br></p>'")
                     await page.wait_for_timeout(500)
-                    
-                    # Type the description
                     await page.keyboard.type(description, delay=10)
                     desc_filled = True
                     logger.info("Filled XHS description using data-v-787eeb26 container")
                 except Exception as e:
                     logger.warning(f"XHS description fill failed: {e}")
-                
+
                 if not desc_filled:
-                    # Last resort: find ANY contenteditable with the placeholder text
                     try:
                         placeholder_editor = page.get_by_placeholder("输入正文描述", exact=False).first
                         if await placeholder_editor.count() > 0:
                             await placeholder_editor.click(timeout=3000)
                             await page.keyboard.type(description, delay=10)
                             desc_filled = True
-                            logger.info("Filled XHS description using placeholder match")
-                    except:
+                    except Exception:
                         pass
-                
-                if not desc_filled:
-                    logger.warning("Could not fill XHS description field - continuing with title only")
 
                 await self._enable_xhs_schedule(page, scheduled_for)
-                
-                # 查找发布按钮（✅ 完全基于你提供的DOM结构）
-                publish_btn_selector = '.publish-page-publish-btn button.ce-btn.bg-red:has-text("定时发布")'
-                publish_btn = page.locator(publish_btn_selector).first
 
-                # 等待按钮完全可用（开关点亮后前端需要时间更新状态）
-                await page.wait_for_timeout(1500)
+                # ============================================================
+                # 正确方案：在宿主元素上派发 composed: true 事件
+                # Closed Shadow DOM 会拦截普通外部事件，但 composed: true 的事件
+                # 可以穿透 Shadow Boundary 进入内部，触发按钮的点击逻辑
+                # ============================================================
+                logger.info("开始点击小红书定时发布按钮（composed event 方案）...")
 
-                try:
-                    # 等待按钮可点击（和校验逻辑保持一致）
-                    await publish_btn.wait_for(state="enabled", timeout=90000)
-                    # 滚动到按钮位置（确保不被底部栏遮挡）
-                    await publish_btn.scroll_into_view_if_needed()
-                    # 点击按钮（不用force，因为已经确认可点击）
-                    await publish_btn.click(timeout=10000)
-                    logger.info("✅ 已点击 Xiaohongshu 定时发布按钮")
-                except Exception as e:
-                    await page.screenshot(path="xhs_publish_btn_click_failed.png")
-                    raise Exception(f"点击定时发布按钮失败：{e}")
+                host = page.locator('xhs-publish-btn').first
+                await host.wait_for(state="attached", timeout=15000)
+
+                # 用 JS 在宿主上派发完整鼠标事件序列，composed: true 是关键
+                await host.evaluate("""
+                    el => {
+                        const rect = el.getBoundingClientRect();
+                        const x = rect.left + rect.width / 2;
+                        const y = rect.top + rect.height / 2;
+                        const opts = {
+                            bubbles: true,
+                            composed: true,
+                            cancelable: true,
+                            clientX: x,
+                            clientY: y,
+                            view: window
+                        };
+                        el.dispatchEvent(new MouseEvent('mouseenter', opts));
+                        el.dispatchEvent(new MouseEvent('mouseover', opts));
+                        el.dispatchEvent(new MouseEvent('mousedown', opts));
+                        el.dispatchEvent(new MouseEvent('mouseup', opts));
+                        el.dispatchEvent(new MouseEvent('click', opts));
+                    }
+                """)
+
+                logger.info("✅ 已派发 composed 点击事件到 xhs-publish-btn 宿主")
+                await page.wait_for_timeout(3000)
+
+                # 检查是否有确认弹窗
+                for confirm_text in ["确定", "确认", "发布"]:
+                    try:
+                        confirm_btn = page.locator(f'button:has-text("{confirm_text}")').filter(visible=True).first
+                        if await confirm_btn.count() > 0:
+                            logger.info(f"检测到确认弹窗，点击：{confirm_text}")
+                            await confirm_btn.click(timeout=3000)
+                            await page.wait_for_timeout(2000)
+                            break
+                    except Exception:
+                        continue
+
                 await self._wait_for_publish_result(
-                    page, 
-                    "Xiaohongshu", 
-                    "xhs_after_publish.png", 
-                    "https://creator.xiaohongshu.com/publish/publish?source=official", 
+                    page,
+                    "Xiaohongshu",
+                    "xhs_after_publish.png",
+                    "https://creator.xiaohongshu.com/publish/publish?source=official",
                     timeout_ms=45000
                 )
             except Exception as e:
@@ -1700,7 +1714,7 @@ class XiaohongshuPublisher(BaseSocialPlatform):
                 await page.close()
                 await context.close()
                 await browser.close()
-
+                           
     async def debug_upload(self, video_path: str, title: str, description: str, scheduled_for: Optional[datetime] = None) -> str:
         """Upload + fill all fields + set scheduler, but do NOT click publish. Returns screenshot path."""
         screenshot_path = "xhs_debug_upload.png"
