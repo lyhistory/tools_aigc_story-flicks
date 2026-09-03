@@ -30,6 +30,72 @@ import random
 import shutil
 from moviepy.video.tools.subtitles import SubtitlesClip, file_to_subtitles
 import re
+import html
+
+
+# Google's unofficial free translate endpoint is frequently blocked (HTTP 429)
+# on datacenter IPs, so we fall back to MyMemory's free API automatically.
+_TRANSLATE_GOOGLE_BLOCKED = False
+_TRANSLATE_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"}
+
+
+def _google_translate_line(phrase: str) -> str:
+    """Translate one line via Google's free endpoint; raises on any failure."""
+    global _TRANSLATE_GOOGLE_BLOCKED
+    if _TRANSLATE_GOOGLE_BLOCKED:
+        raise RuntimeError("Google translate endpoint unavailable (previously blocked)")
+    try:
+        response = requests.get(
+            "https://translate.googleapis.com/translate_a/single",
+            params={"client": "gtx", "sl": "auto", "tl": "zh-CN", "dt": "t", "q": phrase},
+            headers=_TRANSLATE_HEADERS,
+            timeout=6,
+        )
+        if response.status_code != 200:
+            response.raise_for_status()
+        payload = response.json()
+        translated = ""
+        if isinstance(payload, list) and payload and isinstance(payload[0], list):
+            translated = "".join(
+                str(part[0]) for part in payload[0] if isinstance(part, list) and part and part[0] is not None
+            )
+        translated = html.unescape(translated).strip()
+        if not translated:
+            raise RuntimeError("Google translate returned an empty result")
+        return translated
+    except Exception as err:
+        _TRANSLATE_GOOGLE_BLOCKED = True
+        raise RuntimeError(f"Google translate failed: {err}") from err
+
+
+def _mymemory_translate_line(phrase: str) -> str:
+    """Translate one line via MyMemory's free API; raises on failure/quota."""
+    response = requests.get(
+        "https://api.mymemory.translated.net/get",
+        params={"q": phrase, "langpair": "Autodetect|zh-CN"},
+        headers=_TRANSLATE_HEADERS,
+        timeout=8,
+    )
+    if response.status_code != 200:
+        response.raise_for_status()
+    payload = response.json()
+    translated = ((payload.get("responseData") or {}).get("translatedText") or "").strip()
+    if not translated or "MYMEMORY WARNING" in translated.upper() or "QUERY LENGTH LIMIT" in translated.upper():
+        raise RuntimeError("MyMemory translation unavailable")
+    return html.unescape(translated)
+
+
+def _translate_line_to_chinese(phrase: str) -> str:
+    """Translate an English subtitle line to simplified Chinese with automatic fallback."""
+    last_err = None
+    for translator in (_google_translate_line, _mymemory_translate_line):
+        try:
+            return translator(phrase)
+        except Exception as err:
+            last_err = err
+            logger.warning(f"Translator {translator.__name__} failed for '{phrase}': {err}")
+    raise RuntimeError(f"All translators failed: {last_err}")
+
 
 def wrap_text(text, max_width, font="Arial", fontsize=60):
     # Create ImageFont
@@ -307,25 +373,7 @@ async def render_final_video(
         if cached is not None:
             return cached
         try:
-            response = requests.get(
-                "https://translate.googleapis.com/translate_a/single",
-                params={
-                    "client": "gtx",
-                    "sl": "auto",
-                    "tl": "zh-CN",
-                    "dt": "t",
-                    "q": phrase,
-                },
-                timeout=8,
-            )
-            response.raise_for_status()
-            payload = response.json()
-            translated = ""
-            if isinstance(payload, list) and payload and isinstance(payload[0], list):
-                translated = "".join(
-                    str(part[0]) for part in payload[0] if isinstance(part, list) and part and part[0] is not None
-                )
-            translated = clean_subtitle_text(translated)
+            translated = clean_subtitle_text(_translate_line_to_chinese(phrase))
             zh_subtitle_cache[phrase] = translated
             return translated
         except Exception as e:
@@ -1420,16 +1468,9 @@ async def generate_storyboard_impl(request: VideoGenerateRequest) -> dict:
                             phrase = _clean_sub(item[1])
                             if bool(re.search(r"[A-Za-z]", phrase)):
                                 try:
-                                    resp = requests.get(
-                                        "https://translate.googleapis.com/translate_a/single",
-                                        params={"client": "gtx", "sl": "auto", "tl": "zh-CN", "dt": "t", "q": phrase},
-                                        timeout=8
-                                    )
-                                    payload = resp.json()
-                                    translated = "".join(str(part[0]) for part in payload[0] if isinstance(part, list) and part and part[0] is not None)
-                                    translated_lines.append(translated)
+                                    translated_lines.append(_translate_line_to_chinese(phrase))
                                 except Exception as err:
-                                    logger.warning(f"Google translate failed for '{phrase}': {err}")
+                                    logger.warning(f"Translate failed for '{phrase}': {err}")
                                     translated_lines.append("")
                             else:
                                 translated_lines.append("")
