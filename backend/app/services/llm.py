@@ -2137,6 +2137,35 @@ class LLMService:
             if "objects" in scene and not isinstance(scene["objects"], list):
                 raise LLMResponseValidationError(f"Scene {i} 'objects' must be an array")
 
+    @staticmethod
+    def _extract_json(text):
+        """Robustly extract a JSON object/array from a model response.
+
+        Handles markdown code fences and surrounding prose. Returns None when
+        no valid JSON can be parsed.
+        """
+        if not text or not isinstance(text, str):
+            return None
+        text = text.strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```[a-zA-Z]*\s*", "", text)
+            text = re.sub(r"\s*```$", "", text)
+        try:
+            return json.loads(text)
+        except Exception:
+            pass
+        for open_ch, close_ch in (("{", "}"), ("[", "]")):
+            start = text.find(open_ch)
+            if start == -1:
+                continue
+            end = text.rfind(close_ch)
+            if end > start:
+                try:
+                    return json.loads(text[start:end + 1])
+                except Exception:
+                    continue
+        return None
+
     async def _generate_response(self, *, text_llm_provider: str = None, text_llm_model: str = None, messages: List[Dict[str, str]], response_format: str = "json_object") -> any:
         """生成 LLM 响应
 
@@ -2202,7 +2231,7 @@ class LLMService:
         
         try:
             extra_body = {}
-            if "moonshot" in text_llm_model.lower() or text_llm_provider == "nvidia":
+            if "moonshot" in text_llm_model.lower():
                 extra_body = {"chat_template_kwargs": {"thinking": True}}
                 
             response = text_client.chat.completions.create(
@@ -2210,13 +2239,20 @@ class LLMService:
                 response_format={"type": response_format} if response_format else None,
                 messages=messages,
                 temperature=0.7,
-                max_tokens=2048,
-                timeout=180,
+                max_tokens=8192,
+                timeout=300,
                 extra_body=extra_body if extra_body else None
             )
             logger.info(f"Raw API response received")
             content = response.choices[0].message.content
-            result = json.loads(content)
+            if not content:
+                finish_reason = getattr(response.choices[0], "finish_reason", None)
+                usage = getattr(response, "usage", None)
+                logger.warning(f"LLM returned empty content | finish_reason={finish_reason} | usage={usage}")
+                raise ValueError(f"LLM returned empty content (finish_reason={finish_reason})")
+            result = self._extract_json(content)
+            if result is None:
+                raise ValueError(f"Failed to parse LLM JSON response: {content[:500]}")
             logger.info(f"LLM full response: {result}")
             return result
         except Exception as e:
@@ -2239,7 +2275,7 @@ class LLMService:
                 payload = {
                   "model": text_llm_model,
                   "messages": messages,
-                  "max_tokens": 16384 if "moonshot" in text_llm_model.lower() else 4096,
+                  "max_tokens": 16384 if ("moonshot" in text_llm_model.lower() or text_llm_provider == "nvidia") else 4096,
                   "temperature": 1.0,
                   "stream": True,
                 }
@@ -2249,31 +2285,61 @@ class LLMService:
                 if response_format:
                     payload["response_format"] = {"type": response_format}
 
-                resp = requests.post(invoke_url, headers=headers, json=payload, stream=True, timeout=180)
-                resp.raise_for_status()
-                
-                content_chunks = []
-                for line in resp.iter_lines():
-                    if line:
-                        decoded_line = line.decode('utf-8')
-                        if decoded_line.startswith("data:"):
-                            data_str = decoded_line[5:].strip()
-                            if data_str == "[DONE]":
-                                break
-                            try:
-                                chunk_data = json.loads(data_str)
-                                if chunk_data.get("choices"):
-                                    delta = chunk_data["choices"][0].get("delta", {})
-                                    if "content" in delta and delta["content"] is not None:
-                                        content_chunks.append(delta["content"])
-                            except Exception as parse_e:
-                                logger.warning(f"Failed to parse streaming chunk: {data_str} - {parse_e}")
-                
-                content = "".join(content_chunks)
-                logger.info(f"Fallback streaming finished. Content length: {len(content)}")
-                result = json.loads(content)
-                logger.info(f"Fallback LLM full response: {result}")
-                return result
+                last_net_err = None
+                for attempt in range(2):
+                    try:
+                        resp = requests.post(invoke_url, headers=headers, json=payload, stream=True, timeout=300)
+                        if resp.status_code != 200:
+                            raise RuntimeError(f"Fallback HTTP {resp.status_code}: {resp.text[:1000]}")
+
+                        content_type = resp.headers.get("content-type", "")
+                        if "event-stream" not in content_type:
+                            data = resp.json()
+                            content = (data.get("choices") or [{}])[0].get("message", {}).get("content") or ""
+                            if not content:
+                                raise ValueError("Fallback non-stream response has empty content")
+                            result = self._extract_json(content)
+                            if result is None:
+                                raise ValueError(f"Failed to parse fallback JSON: {content[:500]}")
+                            logger.info(f"Fallback JSON full response: {result}")
+                            return result
+
+                        content_chunks = []
+                        finish_reason = None
+                        for line in resp.iter_lines():
+                            if line:
+                                decoded_line = line.decode('utf-8')
+                                if decoded_line.startswith("data:"):
+                                    data_str = decoded_line[5:].strip()
+                                    if data_str == "[DONE]":
+                                        break
+                                    try:
+                                        chunk_data = json.loads(data_str)
+                                        if chunk_data.get("choices"):
+                                            choice = chunk_data["choices"][0]
+                                            if choice.get("finish_reason"):
+                                                finish_reason = choice["finish_reason"]
+                                            delta = choice.get("delta", {})
+                                            if delta.get("content"):
+                                                content_chunks.append(delta["content"])
+                                    except Exception as parse_e:
+                                        logger.warning(f"Failed to parse streaming chunk: {data_str} - {parse_e}")
+
+                        content = "".join(content_chunks)
+                        logger.info(f"Fallback streaming finished. Content length: {len(content)} | finish_reason={finish_reason}")
+                        if not content:
+                            raise ValueError(f"Fallback stream returned no content (finish_reason={finish_reason})")
+                        result = self._extract_json(content)
+                        if result is None:
+                            raise ValueError(f"Failed to parse fallback JSON: {content[:500]}")
+                        logger.info(f"Fallback LLM full response: {result}")
+                        return result
+                    except (requests.ConnectionError, requests.Timeout) as net_err:
+                        last_net_err = net_err
+                        logger.warning(f"Fallback attempt {attempt + 1}/2 failed with network error: {net_err}")
+                        if attempt == 0:
+                            time.sleep(2)
+                raise RuntimeError(f"Fallback HTTP request failed after retries: {last_net_err}")
             except Exception as e2:
                 logger.error(f"Fallback LLM call failed | provider={text_llm_provider} | model={text_llm_model}", exc_info=True)
                 logger.error(f"Failed to parse response: {e2}")
