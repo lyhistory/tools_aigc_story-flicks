@@ -2223,8 +2223,67 @@ class LLMService:
             except Exception as e:
                 logger.error(f"NIM chat failed: {str(e)}", exc_info=True)
                 raise
-        elif text_llm_provider == "cloudflare": 
-            logger.info(f"todo...........................................")
+        elif text_llm_provider == "cloudflare":
+            # Anthropic Messages API (Workers AI / AI Gateway)
+            if not (settings.cloudflare_api_key or settings.cloudflare_api_token):
+                raise ValueError("Cloudflare provider requires cloudflare_api_key or CLOUDFLARE_API_TOKEN")
+            if not settings.cloudflare_account_id:
+                raise ValueError("Cloudflare provider requires cloudflare_account_id")
+            invoke_url = f"{settings.cloudflare_base_url.rstrip('/')}/{settings.cloudflare_account_id}/ai/v1/messages"
+            headers = {
+                "Authorization": f"Bearer {settings.cloudflare_api_token or settings.cloudflare_api_key}",
+                "Content-Type": "application/json",
+            }
+            # Anthropic Messages API expects system as a top-level field and only
+            # accepts user/assistant roles inside messages (consecutive same-role
+            # messages are merged to keep roles alternating).
+            system_parts = [m["content"] for m in messages if m.get("role") == "system" and m.get("content")]
+            chat_messages = []
+            for m in messages:
+                if m.get("role") not in ("user", "assistant"):
+                    continue
+                content = m.get("content") or ""
+                if chat_messages and chat_messages[-1]["role"] == m["role"]:
+                    chat_messages[-1]["content"] += f"\n{content}"
+                else:
+                    chat_messages.append({"role": m["role"], "content": content})
+            payload = {
+                "model": text_llm_model,
+                "max_tokens": 8192,
+                "messages": chat_messages,
+            }
+            if system_parts:
+                payload["system"] = "\n".join(system_parts)
+
+            try:
+                logger.info(f"Sending Cloudflare Messages request to {invoke_url} | model={text_llm_model}")
+                response = requests.post(invoke_url, headers=headers, json=payload, timeout=300)
+                logger.info(f"Cloudflare HTTP status: {response.status_code}")
+                if response.status_code != 200:
+                    err_message = ""
+                    try:
+                        err_body = response.json()
+                        err_message = str(((err_body.get("error") or {}).get("message")) or "")
+                    except Exception:
+                        pass
+                    detail = err_message or re.sub(r"[{}]", " ", response.text[:500])
+                    raise RuntimeError(f"Cloudflare HTTP {response.status_code}: {detail}")
+                result = response.json()
+                text_parts = []
+                for block in result.get("content") or []:
+                    if isinstance(block, dict) and block.get("type") == "text" and block.get("text"):
+                        text_parts.append(block["text"])
+                content = "".join(text_parts).strip()
+                if not content:
+                    raise RuntimeError(f"Cloudflare response contains no text content: {str(result)[:500]}")
+                parsed = self._extract_json(content)
+                if parsed is None:
+                    raise RuntimeError(f"Failed to parse Cloudflare JSON response: {content[:500]}")
+                logger.info("Cloudflare parsed result: {}", parsed)
+                return parsed
+            except Exception as e:
+                logger.error("Cloudflare chat failed: {}", e, exc_info=True)
+                raise
         if text_llm_model == None:
             text_llm_model = settings.text_llm_model
         
@@ -2258,8 +2317,6 @@ class LLMService:
         except Exception as e:
             logger.warning(f"Standard API call failed (Code 1) errored: {e}. Trying fallback with requests (Code 2)...")
             try:
-                import requests
-                
                 invoke_url = "https://integrate.api.nvidia.com/v1/chat/completions"
                 base_url = settings.nvidia_base_url if text_llm_provider == "nvidia" else (settings.openai_base_url if text_llm_provider == "openai" else None)
                 if base_url:

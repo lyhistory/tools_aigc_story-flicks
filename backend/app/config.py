@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     #cloudflare
     cloudflare_base_url: str = "https://api.cloudflare.com/client/v4/accounts"
     cloudflare_api_key: str = ""
+    cloudflare_api_token: str = ""
     cloudflare_account_id: str = ""
     
     # api key
