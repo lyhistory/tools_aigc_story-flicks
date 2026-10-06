@@ -13,7 +13,7 @@ import requests
 from urllib.parse import urlparse, unquote
 import random
 import logging
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 import io
 
 from tenacity import retry, stop_after_attempt, wait_exponential,retry_if_exception_type,before_sleep_log
@@ -1312,6 +1312,131 @@ class LLMService:
             logger.error(f"Failed to generate image: {e}")
             return ""
 
+    @staticmethod
+    def _resolution_to_size(resolution: str, default: tuple = (1024, 1024)) -> tuple:
+        """Parse a resolution string such as 1024*1024 or 1024x1024 into (width, height)."""
+        try:
+            w_str, h_str = str(resolution or "").replace("X", "*").replace("x", "*").split("*")
+            width, height = int(w_str.strip()), int(h_str.strip())
+            if width > 0 and height > 0:
+                return width, height
+        except Exception:
+            pass
+        return default
+
+    @staticmethod
+    def _load_font_for_placeholder(size: int):
+        """Return a usable PIL font, falling back to the Pillow bundled default font."""
+        try:
+            from app.utils import utils as _utils
+            font_path = os.path.join(
+                _utils.resource_dir(), "fonts", "Noto_Sans", "static", "NotoSans-Bold.ttf"
+            )
+            if os.path.exists(font_path):
+                return ImageFont.truetype(font_path, size)
+        except Exception:
+            pass
+        try:
+            return ImageFont.load_default(size=size)
+        except Exception:
+            return ImageFont.load_default()
+
+    def _create_placeholder_image(
+        self,
+        *,
+        task_dir: str,
+        segment_index: int,
+        resolution: str = None,
+        message: str = "IMAGE UNAVAILABLE",
+    ) -> str:
+        """Write a placeholder PNG for a scene whose image generation failed.
+
+        Keeps storyboard (and later video) generation alive: the file is stored under the
+        same path as a normal scene image (<task_dir>/<segment_index>.png), so it shows up
+        in the storyboard editor and can be replaced there afterwards.
+
+        Returns the absolute path of the placeholder, or "" when it could not be written.
+        """
+        if not task_dir:
+            return ""
+        try:
+            task_path = Path(task_dir)
+            task_path.mkdir(parents=True, exist_ok=True)
+            image_path = task_path / f"{segment_index}.png"
+
+            width, height = self._resolution_to_size(resolution)
+            unit = min(width, height)
+            margin = max(6, int(unit * 0.035))
+            border = max(3, int(unit * 0.008))
+
+            background = (236, 236, 242)
+            frame_color = (176, 176, 190)
+            text_color = (120, 120, 138)
+
+            image = Image.new("RGB", (width, height), background)
+            draw = ImageDraw.Draw(image)
+            draw.rectangle(
+                [margin, margin, width - margin, height - margin],
+                outline=frame_color,
+                width=border,
+            )
+            draw.line(
+                [(margin, margin), (width - margin, height - margin)],
+                fill=frame_color,
+                width=max(2, border // 2),
+            )
+            draw.line(
+                [(width - margin, margin), (margin, height - margin)],
+                fill=frame_color,
+                width=max(2, border // 2),
+            )
+
+            font_big = self._load_font_for_placeholder(max(16, int(unit * 0.075)))
+            font_small = self._load_font_for_placeholder(max(12, int(unit * 0.04)))
+            row_specs = [
+                (message, font_big),
+                (f"Scene {segment_index}", font_small),
+                ("Replace this image from the storyboard editor", font_small),
+            ]
+
+            gap = max(6, int(unit * 0.03))
+            rows = []
+            for text, font in row_specs:
+                try:
+                    box = draw.textbbox((0, 0), text, font=font)
+                    text_w, text_h = box[2] - box[0], box[3] - box[1]
+                except Exception:
+                    text_w, text_h = len(text) * max(8, int(unit * 0.02)), max(12, int(unit * 0.04))
+                rows.append((text, font, text_w, text_h))
+
+            total_h = sum(row[3] for row in rows) + gap * (len(rows) - 1)
+            plate_w = max(
+                int(width * 0.4),
+                min(width - 2 * margin, max(row[2] for row in rows) + 4 * gap),
+            )
+            plate_h = total_h + 2 * gap
+            plate_x = (width - plate_w) // 2
+            plate_y = (height - plate_h) // 2
+            draw.rounded_rectangle(
+                [plate_x, plate_y, plate_x + plate_w, plate_y + plate_h],
+                radius=max(4, int(unit * 0.02)),
+                fill=(255, 255, 255),
+                outline=frame_color,
+                width=max(1, border // 2),
+            )
+
+            text_y = plate_y + gap
+            for text, font, text_w, text_h in rows:
+                draw.text((plate_x + (plate_w - text_w) // 2, text_y), text, font=font, fill=text_color)
+                text_y += text_h + gap
+
+            image.save(str(image_path), "PNG")
+            logger.warning(f"Placeholder image created for scene {segment_index}: {image_path}")
+            return str(image_path)
+        except Exception as e:
+            logger.error(f"Failed to create placeholder image for scene {segment_index}: {e}")
+            return ""
+
     async def generate_story_with_images(self, request: StoryGenerationRequest, task_id: str = None, task_dir: str = None) -> List[Dict[str, Any]]:
         """生成故事和配图
         Args:
@@ -2019,6 +2144,7 @@ class LLMService:
                     segment_index=idx,                 # pass 1-based index
                     **img2img_kwargs
                 )
+                image_placeholder_used = False
                 if not image_url:
                     logger.warning(
                         f"Image generation failed for scene {idx}; waiting 5 minutes before retry"
@@ -2033,12 +2159,18 @@ class LLMService:
                         segment_index=idx,                 # pass 1-based index
                         **img2img_kwargs
                     )
-                    if not image_url:
-                        logger.error(
-                            f"Image generation failed after retry for scene {idx}; aborting video generation"
-                        )
-                        raise RuntimeError("Image generation failed after retry")
-                segment["url"] = image_url
+                if not image_url:
+                    logger.error(
+                        f"Image generation failed after retry for scene {idx}; "
+                        f"falling back to a placeholder image and continuing"
+                    )
+                    image_url = self._create_placeholder_image(
+                        task_dir=str(task_dir),
+                        segment_index=idx,
+                        resolution=request.resolution,
+                    )
+                    image_placeholder_used = True
+                segment["url"] = image_url or None
                 if image_url and os.path.exists(image_url):
                     try:
                         with Image.open(image_url) as im:
@@ -2047,7 +2179,7 @@ class LLMService:
                     except Exception as e:
                         logger.warning(f"Scene {idx} output size check failed: {e}")
                 # Orientation recheck removed per request (no retry)
-                if image_url and not is_cover:
+                if image_url and not is_cover and not image_placeholder_used:
                     previous_focus_terms = set(current_focus_terms)
                     try:
                         if os.path.exists(image_url):
@@ -2066,10 +2198,15 @@ class LLMService:
                     except Exception as e:
                         logger.warning(f"Failed to encode previous_base64: {e}")
             except Exception as e:
-                logger.error(f"Failed to generate image for segment: {e}")
-                segment["url"] = None
-                if isinstance(e, RuntimeError) and "after retry" in str(e):
-                    raise
+                logger.error(
+                    f"Failed to generate image for segment: {e}; "
+                    f"falling back to a placeholder image and continuing"
+                )
+                segment["url"] = self._create_placeholder_image(
+                    task_dir=str(task_dir),
+                    segment_index=idx,
+                    resolution=request.resolution,
+                ) or None
 
         return story_segments
     
