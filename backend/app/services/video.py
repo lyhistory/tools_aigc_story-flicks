@@ -164,59 +164,173 @@ def parse_resolution(resolution: str, fallback=(768, 1344)):
     except Exception:
         return fallback
 
-def fit_image_to_size(img: Image.Image, target_w: int, target_h: int) -> Image.Image:
-    # Fit image inside target without stretching, return sharp fit on transparent canvas
+# Calm, child-friendly motion presets. Motion is applied through a small virtual
+# camera instead of sliding the whole picture, so edges are never exposed and the
+# movement stays slow and even regardless of how long a picture is on screen.
+MOTION_CHOICES = ("none", "auto", "pan", "pan_left", "pan_right", "zoom_in", "zoom_out")
+TRANSITION_CHOICES = ("cut", "fade", "dissolve", "iris", "wipe")
+# Soft dark slate reads as a gentle dip rather than a harsh flash of black/white.
+TRANSITION_BG_RGB = (26, 32, 44)
+# Never drift more than this fraction of the visible picture, so movement stays subtle.
+MAX_PAN_TRAVEL = 0.05
+
+
+def _ease(x: float) -> float:
+    """Smoothstep easing so every move starts and ends softly."""
+    x = max(0.0, min(1.0, float(x)))
+    return x * x * (3.0 - 2.0 * x)
+
+
+def _resolve_motion(motion: str | None, strength: float, seed: int) -> str:
+    choice = (motion or "auto").strip().lower()
+    if choice not in MOTION_CHOICES:
+        choice = "auto"
+    if choice == "auto":
+        # Deterministic per image so a re-render looks identical to the last one.
+        rng = random.Random(seed * 7919 + 17)
+        return rng.choice(("zoom_in", "pan", "zoom_out", "pan"))
+    return choice
+
+
+def _camera_bounds(img: Image.Image, out_w: int, out_h: int, framing: str):
+    """Map the source image onto the output frame: base crop, center and sub size."""
     img_ratio = img.width / img.height
-    target_ratio = target_w / target_h
-    if img_ratio > target_ratio:
-        new_w = target_w
-        new_h = max(1, int(target_w / img_ratio))
+    out_ratio = out_w / out_h
+    if framing == "fill":
+        if img_ratio > out_ratio:
+            base_h = float(img.height)
+            base_w = img.height * out_ratio
+        else:
+            base_w = float(img.width)
+            base_h = img.width / out_ratio
+        return base_w, base_h, img.width / 2.0, img.height / 2.0, out_w, out_h
+    # fit: keep the whole picture visible on top of a blurred backdrop
+    if img_ratio >= out_ratio:
+        sub_w, sub_h = out_w, max(1, int(round(out_w / img_ratio)))
     else:
-        new_h = target_h
-        new_w = max(1, int(target_h * img_ratio))
-    resized = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+        sub_w, sub_h = max(1, int(round(out_h * img_ratio))), out_h
+    return float(img.width), float(img.height), img.width / 2.0, img.height / 2.0, sub_w, sub_h
 
-    canvas = Image.new("RGBA", (target_w, target_h), (0, 0, 0, 0))
-    x = (target_w - new_w) // 2
-    y = (target_h - new_h) // 2
-    canvas.paste(resized, (x, y))
-    return canvas
 
-def build_image_clips(image_file: str, target_w: int, target_h: int, duration: float, image_scale: float = 1.2):
-    img = Image.open(image_file).convert("RGB")
-    # Background: heavy blur of full-frame image
-    bg = img.resize((target_w, target_h), Image.Resampling.LANCZOS)
-    blur_radius = max(24, min(target_w, target_h) // 12)
-    bg = bg.filter(ImageFilter.GaussianBlur(radius=blur_radius))
-    bg_clip = ImageClip(np.array(bg)).with_duration(duration)
-
-    # Foreground: sharp fit on transparent canvas
-    fg_rgba = fit_image_to_size(img, target_w, target_h)
-    fg_np = np.array(fg_rgba)
-    fg_rgb = fg_np[..., :3]
-    fg_mask = fg_np[..., 3] / 255.0
-
-    fg_clip = ImageClip(fg_rgb).with_mask(ImageClip(fg_mask, is_mask=True))
-    origin_image_w, origin_image_h = fg_clip.size
-
-    fg_clip = fg_clip.resized(image_scale)
-    fg_clip = fg_clip.cropped(
-        x_center=fg_clip.w / 2,
-        y_center=fg_clip.h / 2,
-        width=origin_image_w,
-        height=origin_image_h
+def render_camera_frame(img: Image.Image, out_w: int, out_h: int, framing: str,
+                        scale: float, pan_x: float, pan_y: float, backdrop: Image.Image) -> np.ndarray:
+    """Render one frame of a slow zoom/drift for a still image."""
+    base_w, base_h, base_cx, base_cy, sub_w, sub_h = _camera_bounds(img, out_w, out_h, framing)
+    scale = max(1.0, float(scale))
+    crop_w = max(1.0, base_w / scale)
+    crop_h = max(1.0, base_h / scale)
+    # Room left inside the source lets the camera drift without showing empty edges.
+    max_dx = max(0.0, min(base_cx - crop_w / 2.0, img.width - base_cx - crop_w / 2.0))
+    max_dy = max(0.0, min(base_cy - crop_h / 2.0, img.height - base_cy - crop_h / 2.0))
+    max_dx = min(max_dx, crop_w * MAX_PAN_TRAVEL)
+    max_dy = min(max_dy, crop_h * MAX_PAN_TRAVEL)
+    cx = base_cx + max(-1.0, min(1.0, pan_x)) * max_dx
+    cy = base_cy + max(-1.0, min(1.0, pan_y)) * max_dy
+    crop_w_i = max(1, int(round(crop_w)))
+    crop_h_i = max(1, int(round(crop_h)))
+    left = int(round(cx - crop_w / 2.0))
+    top = int(round(cy - crop_h / 2.0))
+    left = max(0, min(left, img.width - crop_w_i))
+    top = max(0, min(top, img.height - crop_h_i))
+    region = img.crop((left, top, left + crop_w_i, top + crop_h_i)).resize(
+        (sub_w, sub_h), Image.Resampling.LANCZOS
     )
-    fg_clip = fg_clip.with_duration(duration)
+    if framing == "fill":
+        return np.array(region.convert("RGB"))
+    canvas = backdrop.copy()
+    canvas.paste(region, ((out_w - sub_w) // 2, (out_h - sub_h) // 2))
+    return np.array(canvas)
 
-    width_diff = origin_image_w * (image_scale - 1)
-    def pan_position(t):
-        if duration <= 0:
-            return (0, 0)
-        x = -width_diff * (t / duration)
-        y = 0
-        return (x, y)
-    fg_clip = fg_clip.with_position(pan_position)
-    return bg_clip, fg_clip, origin_image_w, origin_image_h
+
+def build_image_clips(image_file: str, target_w: int, target_h: int, duration: float,
+                      motion: str = "auto", motion_strength: float = 0.5,
+                      framing: str = "fit", motion_seed: int = 0):
+    """Build the static blurred backdrop plus the gently animated foreground.
+
+    The returned foreground frame is fully opaque and already composited on the
+    backdrop, which keeps the moviepy graph simple and avoids mask alpha issues.
+    """
+    img = Image.open(image_file).convert("RGB")
+    strength = max(0.0, min(1.0, float(motion_strength)))
+    resolved = _resolve_motion(motion, strength, motion_seed)
+
+    blur_radius = max(24, min(target_w, target_h) // 12)
+    backdrop = img.resize((target_w, target_h), Image.Resampling.LANCZOS).filter(
+        ImageFilter.GaussianBlur(radius=blur_radius)
+    )
+    bg_clip = ImageClip(np.array(backdrop)).with_duration(duration)
+
+    if resolved == "none" or duration <= 0 or strength <= 0.0:
+        frame = render_camera_frame(img, target_w, target_h, framing, 1.0, 0.0, 0.0, backdrop)
+        return bg_clip, ImageClip(frame).with_duration(duration), target_w, target_h
+
+    zoom_amount = 0.10 * strength
+    pan_zoom = 0.05 + 0.05 * strength
+    if resolved == "pan_left":
+        direction = -1.0
+    elif resolved == "pan_right":
+        direction = 1.0
+    else:
+        direction = 1.0 if random.Random(motion_seed * 104729 + 3).random() < 0.5 else -1.0
+
+    def camera(t: float):
+        progress = _ease(t / duration)
+        if resolved == "zoom_in":
+            return 1.0 + zoom_amount * progress, 0.0, 0.0
+        if resolved == "zoom_out":
+            return 1.0 + zoom_amount * (1.0 - progress), 0.0, 0.0
+        return 1.0 + pan_zoom, direction * (2.0 * progress - 1.0) * (strength * 0.85), 0.0
+
+    def frame_fn(t: float, _img=img, _w=target_w, _h=target_h,
+                 _framing=framing, _backdrop=backdrop):
+        scale, pan_x, pan_y = camera(t)
+        return render_camera_frame(_img, _w, _h, _framing, scale, pan_x, pan_y, _backdrop)
+
+    fg_clip = VideoClip(frame_function=frame_fn, duration=duration)
+    return bg_clip, fg_clip.with_duration(duration), target_w, target_h
+
+
+def _transition_backdrop_rgb(target_w: int, target_h: int) -> np.ndarray:
+    frame = np.zeros((target_h, target_w, 3), dtype=np.uint8)
+    frame[:, :] = np.array(TRANSITION_BG_RGB, dtype=np.uint8)
+    return frame
+
+
+def _make_transition_mask(kind: str, target_w: int, target_h: int):
+    """Precompute a soft reveal mask (1.0 = incoming scene) for shaped transitions."""
+    if kind == "iris":
+        ys, xs = np.mgrid[0:target_h, 0:target_w]
+        cx = (target_w - 1) / 2.0
+        cy = (target_h - 1) / 2.0
+        max_r = math.hypot(max(cx, target_w - 1 - cx), max(cy, target_h - 1 - cy))
+        dist = np.sqrt((xs - cx) ** 2 + (ys - cy) ** 2) / max(1.0, max_r)
+        soft = 0.18
+
+        def mask(progress, _dist=dist, _soft=soft):
+            edge = progress * (1.0 + 2.0 * _soft) - _soft
+            return np.clip((edge - _dist) / _soft + 0.5, 0.0, 1.0)
+
+        return mask
+    if kind == "wipe":
+        xs = np.linspace(0.0, 1.0, target_w, dtype=np.float32)[None, :]
+        soft = 0.14
+
+        def mask(progress, _xs=xs, _soft=soft):
+            edge = progress * (1.0 + 2.0 * _soft) - _soft
+            return np.clip((edge - _xs) / _soft + 0.5, 0.0, 1.0)
+
+        return mask
+    return None
+
+
+def _blend_transition(prev_frame, next_frame, progress, kind, mask_fn) -> np.ndarray:
+    p = _ease(progress)
+    if kind in ("iris", "wipe") and mask_fn is not None:
+        m = mask_fn(p)[..., None].astype(np.float32)
+        blended = prev_frame.astype(np.float32) * (1.0 - m) + next_frame.astype(np.float32) * m
+        return blended.astype(np.uint8)
+    blended = prev_frame.astype(np.float32) * (1.0 - p) + next_frame.astype(np.float32) * p
+    return blended.astype(np.uint8)
 
 async def generate_scene_assets(
     task_dir: str,
@@ -313,7 +427,12 @@ async def render_final_video(
         subtitle_font: str | None = None,
         subtitle_font_size: int | None = None,
         subtitle_color: str | None = None,
-        karaoke_highlight_color: str | None = None) -> str:
+        karaoke_highlight_color: str | None = None,
+        motion_effect: str | None = "auto",
+        motion_strength: float = 0.5,
+        framing: str | None = "fit",
+        transition: str | None = "dissolve",
+        transition_duration: float = 0.5) -> str:
     """组装最终的视频片段 (Step 2)
     
     Args:
@@ -321,6 +440,14 @@ async def render_final_video(
         scenes (List[StoryScene]): 场景列表
     """
     clips = []
+    scene_transitions: list[str] = []
+    motion_strength = max(0.0, min(1.0, float(motion_strength or 0.0)))
+    framing = (framing or "fit").strip().lower()
+    if framing not in ("fit", "fill"):
+        framing = "fit"
+    motion_effect = (motion_effect or "auto").strip().lower()
+    transition = (transition or "dissolve").strip().lower()
+    transition_duration = max(0.0, float(transition_duration or 0.0))
     target_w, target_h = parse_resolution(resolution) if resolution else (None, None)
     overlay_dir = os.path.join(task_dir, "overlays")
     os.makedirs(overlay_dir, exist_ok=True)
@@ -711,6 +838,9 @@ async def render_final_video(
     shown_keyword_words = set()
     for __i, scene in enumerate(scenes, 1):
         i = getattr(scene, "original_index", None) or __i
+        scene_motion = (getattr(scene, "motion_effect", None) or motion_effect).strip().lower()
+        scene_transition = (getattr(scene, "transition", None) or transition).strip().lower()
+        scene_transitions.append(scene_transition)
         try:
             # 获取文件路径
             image_file = os.path.join(task_dir, f"{i}.png")
@@ -868,14 +998,19 @@ async def render_final_video(
                 image_clips.append((black_clip, black_clip))
                 origin_image_w, origin_image_h = target_w, target_h
             else:
-                for img_file, (win_start, win_end) in zip(all_image_files, image_time_windows):
+                for img_idx, (img_file, (win_start, win_end)) in enumerate(
+                    zip(all_image_files, image_time_windows)
+                ):
                     dur = max(0.1, win_end - win_start)
                     _bg, _fg, origin_image_w, origin_image_h = build_image_clips(
                         image_file=img_file,
                         target_w=target_w,
                         target_h=target_h,
                         duration=dur,
-                        image_scale=1.2
+                        motion=scene_motion,
+                        motion_strength=motion_strength,
+                        framing=framing,
+                        motion_seed=i * 131 + img_idx,
                     )
                     image_clips.append((_bg, _fg))
 
@@ -1191,13 +1326,89 @@ async def render_final_video(
     if not clips:
         raise ValueError("No valid clips to combine")
 
-    # 合并所有片段
-    logger.info("Merging all clips")
-    final_clip = concatenate_videoclips(clips, method="compose")
+    fps = 24
+    durations = [max(0.05, float(c.duration or 0.0)) for c in clips]
+    starts: list[float] = []
+    cursor = 0.0
+    for dur in durations:
+        starts.append(cursor)
+        cursor += dur
+    total_duration = cursor
+
+    # Narration keeps its original timeline: transitions are rendered on the visual
+    # side only, so soft dissolves can never desync the voice over.
+    carrier = concatenate_videoclips(clips, method="compose")
+    carried_audio = getattr(carrier, "audio", None)
+
+    kinds: list[str] = []
+    for idx in range(len(clips)):
+        override = scene_transitions[idx] if idx < len(scene_transitions) else transition
+        kind = (override or transition or "dissolve").strip().lower()
+        kinds.append(kind if kind in TRANSITION_CHOICES else "dissolve")
+    if len(clips) < 2:
+        kinds = ["cut"] * len(clips)
+
+    td = 0.0
+    if len(clips) > 1 and any(k != "cut" for k in kinds):
+        td = min(transition_duration, 0.9 * min(durations))
+
+    mask_cache: dict[str, object] = {}
+
+    def get_mask(kind: str):
+        if kind not in mask_cache:
+            mask_cache[kind] = _make_transition_mask(kind, target_w, target_h)
+        return mask_cache[kind]
+
+    backdrop_rgb = _transition_backdrop_rgb(target_w, target_h)
+
+    def scene_frame(idx: int, local_t: float):
+        local_t = max(0.0, min(local_t, durations[idx] - 1.0 / fps))
+        return clips[idx].get_frame(local_t)
+
+    def final_frame(t: float):
+        idx = 0
+        for k in range(len(starts)):
+            if t + 1e-6 >= starts[k]:
+                idx = k
+            else:
+                break
+        local = t - starts[idx]
+
+        # Incoming transition (its shape is decided by the incoming scene).
+        if td > 0 and idx > 0 and local < td:
+            kind = kinds[idx]
+            next_frame = scene_frame(idx, local)
+            if kind == "fade":
+                return _blend_transition(backdrop_rgb, next_frame, local / td, "dissolve", None)
+            if kind in ("dissolve", "iris", "wipe"):
+                prev_frame = scene_frame(idx - 1, durations[idx - 1])
+                return _blend_transition(prev_frame, next_frame, local / td, kind, get_mask(kind))
+
+        # Outgoing dip-to-colour (decided by the next scene's transition setting).
+        if (td > 0 and idx < len(clips) - 1 and local > durations[idx] - td
+                and kinds[idx + 1] == "fade"):
+            cur = scene_frame(idx, local)
+            progress = (local - (durations[idx] - td)) / td
+            return _blend_transition(cur, backdrop_rgb, progress, "dissolve", None)
+
+        return scene_frame(idx, local)
+
     video_file = os.path.join(task_dir, "video.mp4")
-    logger.info(f"Writing video to {video_file}")
-    final_clip.write_videofile(video_file, fps=24, codec='libx264', audio_codec='aac')
-    
+    logger.info(
+        f"Merging all clips (motion={motion_effect}, framing={framing}, "
+        f"transitions={sorted(set(kinds))}, transition_duration={td:.2f}s)"
+    )
+    try:
+        final_clip = VideoClip(frame_function=final_frame, duration=total_duration).with_fps(fps)
+        if carried_audio is not None:
+            final_clip = final_clip.with_audio(carried_audio)
+        logger.info(f"Writing video to {video_file}")
+        final_clip.write_videofile(video_file, fps=fps, codec='libx264', audio_codec='aac')
+    except Exception as e:
+        logger.error(f"Transition-aware render failed ({e}); falling back to plain concatenation")
+        final_clip = concatenate_videoclips(clips, method="compose")
+        final_clip.write_videofile(video_file, fps=fps, codec='libx264', audio_codec='aac')
+
     return video_file
 
 
@@ -1565,6 +1776,11 @@ async def assemble_video_impl(request: "StoryboardAssembleRequest") -> str:
             subtitle_font_size=request.subtitle_font_size,
             subtitle_color=request.subtitle_color,
             karaoke_highlight_color=request.karaoke_highlight_color,
+            motion_effect=request.motion_effect,
+            motion_strength=request.motion_strength,
+            framing=request.framing,
+            transition=request.transition,
+            transition_duration=request.transition_duration,
         )
     except Exception as e:
         logger.error(f"Failed to assemble video: {e}")

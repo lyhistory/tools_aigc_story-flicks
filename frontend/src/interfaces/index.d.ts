@@ -80,6 +80,11 @@ interface StoryboardAssembleReq {
     subtitle_font_size?: number;
     subtitle_color?: string;
     karaoke_highlight_color?: string;
+    motion_effect?: "auto" | "none" | "pan" | "zoom_in" | "zoom_out";
+    motion_strength?: number;
+    framing?: "fit" | "fill";
+    transition?: "cut" | "fade" | "dissolve" | "iris" | "wipe";
+    transition_duration?: number;
 }
 
 interface StoryboardRes {

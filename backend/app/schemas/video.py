@@ -309,6 +309,8 @@ class StoryScene(BaseModel):
     topic_type: Optional[TopicType] = Field(default=None, description="Topic type of this scene")
     original_index: Optional[int] = Field(default=None, description="Preserves file-binding to .mp3/.srt when scenes are deleted/shifted in UI")
     chinese_translation: Optional[str] = Field(default=None, description="Pre-translated Chinese text for the scene script")
+    motion_effect: Optional[str] = Field(default=None, description="Per-scene override: none|pan|zoom_in|zoom_out|auto")
+    transition: Optional[str] = Field(default=None, description="Per-scene override: cut|fade|dissolve|iris|wipe")
 
 class VideoGenerateRequest(BaseModel):
     """视频生成请求"""
@@ -363,6 +365,11 @@ class StoryboardAssembleRequest(BaseModel):
     subtitle_font_size: Optional[int] = Field(default=None, description="English subtitle font size (px); default depends on resolution")
     subtitle_color: Optional[str] = Field(default=None, description="English subtitle text color hex, e.g. '#F472B6'")
     karaoke_highlight_color: Optional[str] = Field(default=None, description="Hex color string for karaoke highlight background")
+    motion_effect: Optional[str] = Field(default="auto", description="画面运动: auto|none|pan|zoom_in|zoom_out")
+    motion_strength: float = Field(default=0.5, ge=0.0, le=1.0, description="运动幅度 0-1，越小越柔和")
+    framing: Optional[str] = Field(default="fit", description="构图: fit(完整显示,模糊背景)|fill(填满裁切)")
+    transition: Optional[str] = Field(default="dissolve", description="转场: cut|fade|dissolve|iris|wipe")
+    transition_duration: float = Field(default=0.5, ge=0.0, le=1.5, description="转场时长(秒)")
 
 
 class VideoGenerateResponse(BaseModel):

@@ -45,6 +45,32 @@ const FONT_STYLE_MAP: Record<string, React.CSSProperties> = {
 const DEFAULT_FONT = 'NotoSans-Bold';
 const DEFAULT_FONT_SIZE = 58;
 
+type MotionEffect = 'auto' | 'none' | 'pan' | 'zoom_in' | 'zoom_out';
+type FramingMode = 'fit' | 'fill';
+type TransitionKind = 'cut' | 'fade' | 'dissolve' | 'iris' | 'wipe';
+
+// Child-friendly defaults: calm movement and soft transitions, no flashes or fast motion.
+const MOTION_OPTIONS: { label: string; value: MotionEffect }[] = [
+    { label: 'Auto — gentle mix (recommended)', value: 'auto' },
+    { label: 'Still — picture does not move', value: 'none' },
+    { label: 'Slow zoom in', value: 'zoom_in' },
+    { label: 'Slow zoom out', value: 'zoom_out' },
+    { label: 'Gentle drift', value: 'pan' },
+];
+
+const FRAMING_OPTIONS: { label: string; value: FramingMode }[] = [
+    { label: 'Fit — show the whole picture', value: 'fit' },
+    { label: 'Fill — cover the frame', value: 'fill' },
+];
+
+const TRANSITION_OPTIONS: { label: string; value: TransitionKind }[] = [
+    { label: 'Soft dissolve (recommended)', value: 'dissolve' },
+    { label: 'Soft fade through dark', value: 'fade' },
+    { label: 'Circle reveal', value: 'iris' },
+    { label: 'Gentle wipe', value: 'wipe' },
+    { label: 'Hard cut — no transition', value: 'cut' },
+];
+
 const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
     taskId, scenes: initialScenes, resolution, chineseSubtitleEnabled, karaoke, subject, topicType, onClose
 }) => {
@@ -98,6 +124,11 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
     const [fontSize, setFontSize] = useState<number>(DEFAULT_FONT_SIZE);
     const [subtitleColor, setSubtitleColor] = useState<string>('#F472B6');
     const [karaokeHighlightColor, setKaraokeHighlightColor] = useState<string>('#FFFF00');
+    const [motionEffect, setMotionEffect] = useState<MotionEffect>('auto');
+    const [motionStrength, setMotionStrength] = useState<number>(0.5);
+    const [framing, setFraming] = useState<FramingMode>('fit');
+    const [transition, setTransition] = useState<TransitionKind>('dissolve');
+    const [transitionDuration, setTransitionDuration] = useState<number>(0.5);
 
     const getRecommendedHighlightColors = (fontColorHex: string) => {
         const hex = fontColorHex.replace('#', '');
@@ -329,6 +360,11 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
                 subtitle_font: selectedFont,
                 subtitle_font_size: fontSize,
                 subtitle_color: subtitleColor,
+                motion_effect: motionEffect,
+                motion_strength: motionStrength,
+                framing: framing,
+                transition: transition,
+                transition_duration: transitionDuration,
             });
             if (res.success && res.data?.video_url) {
                 message.success({ content: 'Video assembled successfully!', key: 'assemble' });
@@ -539,6 +575,72 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
                         />
                     </div>
                 )}
+            </Card>
+
+            {/* Final render style: calm motion + soft transitions, tuned for young viewers */}
+            <Card
+                size="small"
+                title="Final Video Style"
+                style={{ marginBottom: 20 }}
+            >
+                <Text type="secondary" style={{ display: 'block', marginBottom: 12 }}>
+                    Gentle movement and soft transitions keep the video calm and easy on the eyes for kids.
+                </Text>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 24 }}>
+                    <div style={{ minWidth: 240 }}>
+                        <Text style={{ display: 'block', marginBottom: 6 }}>Picture motion</Text>
+                        <Select
+                            style={{ width: 240 }}
+                            value={motionEffect}
+                            onChange={(value) => setMotionEffect(value as MotionEffect)}
+                            options={MOTION_OPTIONS}
+                        />
+                    </div>
+                    <div style={{ minWidth: 240 }}>
+                        <Text style={{ display: 'block', marginBottom: 6 }}>Framing</Text>
+                        <Select
+                            style={{ width: 240 }}
+                            value={framing}
+                            onChange={(value) => setFraming(value as FramingMode)}
+                            options={FRAMING_OPTIONS}
+                        />
+                    </div>
+                    <div style={{ minWidth: 240 }}>
+                        <Text style={{ display: 'block', marginBottom: 6 }}>Scene transition</Text>
+                        <Select
+                            style={{ width: 240 }}
+                            value={transition}
+                            onChange={(value) => setTransition(value as TransitionKind)}
+                            options={TRANSITION_OPTIONS}
+                        />
+                    </div>
+                </div>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 24, marginTop: 16 }}>
+                    <div style={{ flex: 1, minWidth: 260 }}>
+                        <Text style={{ display: 'block', marginBottom: 6 }}>
+                            Motion amount: <b>{Math.round(motionStrength * 100)}%</b>
+                        </Text>
+                        <Slider
+                            min={0}
+                            max={1}
+                            step={0.05}
+                            value={motionStrength}
+                            onChange={setMotionStrength}
+                        />
+                    </div>
+                    <div style={{ flex: 1, minWidth: 260 }}>
+                        <Text style={{ display: 'block', marginBottom: 6 }}>
+                            Transition length: <b>{transitionDuration.toFixed(1)}s</b>
+                        </Text>
+                        <Slider
+                            min={0.2}
+                            max={1}
+                            step={0.1}
+                            value={transitionDuration}
+                            onChange={setTransitionDuration}
+                        />
+                    </div>
+                </div>
             </Card>
 
             <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
