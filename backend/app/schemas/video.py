@@ -323,6 +323,7 @@ class VideoGenerateRequest(BaseModel):
     segments: int = Field(default=3, ge=1, le=10, description="分段数量")
     language: Language = Field(default=Language.CHINESE_CN, description="故事语言")
     story_prompt: Optional[str] = Field(default=None, description="故事提示词")
+    use_provided_content: bool = Field(default=False, description="开启后 story_prompt 视为完整成稿，跳过文本 LLM，仅拆分为分镜")
     topic_type: Optional[TopicType] = Field(default=None, description="主题类型")
     image_style: ImageStyle = Field(default=ImageStyle.realistic, description="图片风格")
     subject: Optional[str] = Field(default=None, description="Optional cover subject")

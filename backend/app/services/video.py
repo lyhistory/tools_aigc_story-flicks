@@ -1468,6 +1468,7 @@ async def generate_video(request: VideoGenerateRequest):
                 topic_type=request.topic_type,
                 subject=request.subject,
                 learner_age=request.learner_age,
+                use_provided_content=request.use_provided_content,
             )
             logger.info(f"generate_video StoryGenerationRequest: {req}")
             story_list = await llm_service.generate_story_with_images(
@@ -1599,6 +1600,7 @@ async def generate_storyboard_impl(request: VideoGenerateRequest) -> dict:
             topic_type=request.topic_type,
             subject=request.subject,
             learner_age=request.learner_age,
+            use_provided_content=request.use_provided_content,
         )
         logger.info(f"generate_storyboard_impl StoryGenerationRequest: {req}")
         story_list = await llm_service.generate_story_with_images(

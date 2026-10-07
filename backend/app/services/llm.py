@@ -404,6 +404,135 @@ class LLMService:
             return f"{under_1000(thousands)} thousand".strip()
         return str(n)
 
+    _SCENE_SEPARATOR_RE = re.compile(r"^\s*[-*_=]{3,}\s*$")
+    _SCENE_LABEL_RE = re.compile(
+        r"^\s*(?:"
+        r"#{1,6}\s*"
+        r"|\(?\d{1,2}\)?\s*[.、:：)]\s+"
+        r"|(?:scene|shot|chapter|part|分镜|场景|第\s*\d+\s*[幕场章节])\s*[\d一二三四五六七八九十]*\s*[:：.\-)]?\s*"
+        r")",
+        flags=re.I,
+    )
+
+    @staticmethod
+    def _ensure_sentence_end(text: str) -> str:
+        value = (text or "").strip()
+        if not value:
+            return value
+        if re.search(r"[.!?。！？…:：;；\"'”’）)]$", value):
+            return value
+        return value + ("。" if re.search(r"[\u4e00-\u9fff]", value) else ".")
+
+    @staticmethod
+    def _split_into_scene_chunks(text: str) -> List[str]:
+        """Split finished content into scenes on explicit markers or blank lines."""
+        normalized = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+        chunks: List[str] = []
+        current: List[str] = []
+
+        def flush():
+            joined = "\n".join(current).strip()
+            if joined:
+                chunks.append(joined)
+            current.clear()
+
+        for raw_line in normalized.split("\n"):
+            line = raw_line.strip()
+            if not line:
+                flush()
+                continue
+            if LLMService._SCENE_SEPARATOR_RE.match(line):
+                flush()
+                continue
+            if LLMService._SCENE_LABEL_RE.match(line):
+                flush()
+                remainder = LLMService._SCENE_LABEL_RE.sub("", line, count=1).strip()
+                if remainder:
+                    current.append(remainder)
+                continue
+            current.append(line)
+        flush()
+        return chunks
+
+    @staticmethod
+    def _split_sentences(text: str) -> List[str]:
+        parts = re.split(r"(?<=[.!?。！？…])\s*", (text or "").strip())
+        return [part.strip() for part in parts if part and part.strip()]
+
+    @staticmethod
+    def _chunk_sentences_into(sentences: List[str], target: int) -> List[str]:
+        """Balance sentences into at most `target` roughly equal chunks."""
+        if target <= 1 or len(sentences) <= target:
+            return list(sentences)
+        total_chars = sum(len(s) for s in sentences)
+        per_chunk = total_chars / target
+        chunks: List[str] = []
+        current: List[str] = []
+        current_len = 0
+        for sentence in sentences:
+            current.append(sentence)
+            current_len += len(sentence)
+            if current_len >= per_chunk and len(chunks) < target - 1:
+                chunks.append(" ".join(current))
+                current = []
+                current_len = 0
+        if current:
+            chunks.append(" ".join(current))
+        return chunks
+
+    @staticmethod
+    def _merge_chunks_to_target(chunks: List[str], target: int) -> List[str]:
+        if target <= 1:
+            return ["\n\n".join(chunks)] if chunks else []
+        if len(chunks) <= target:
+            return list(chunks)
+        merged: List[str] = []
+        cursor = 0
+        total = len(chunks)
+        for bucket in range(target):
+            remaining_chunks = total - cursor
+            remaining_buckets = target - bucket
+            take = -(-remaining_chunks // remaining_buckets)  # ceil division
+            group = chunks[cursor:cursor + take]
+            cursor += take
+            if group:
+                merged.append("\n\n".join(group))
+        if cursor < total:
+            merged[-1] = merged[-1] + "\n\n" + "\n\n".join(chunks[cursor:])
+        return merged
+
+    @staticmethod
+    def _split_provided_content(content: str, segments: int, topic_type=None) -> List[Dict[str, Any]]:
+        """Turn finished user content into storyboard scenes without any LLM call."""
+        text = LLMService._strip_invisible_chars(content or "").strip()
+        if not text:
+            return []
+        target = max(1, int(segments or 1))
+        explicit = LLMService._split_into_scene_chunks(text)
+        if len(explicit) > 1:
+            chunks = LLMService._merge_chunks_to_target(explicit, target)
+        else:
+            chunks = LLMService._chunk_sentences_into(LLMService._split_sentences(text), target)
+        if not chunks:
+            chunks = [text]
+
+        scenes: List[Dict[str, Any]] = []
+        for chunk in chunks:
+            script = LLMService._ensure_sentence_end(chunk)
+            if not script:
+                continue
+            scenes.append({
+                "script": script,
+                "scene_prompt": (
+                    "Create a warm, family-friendly children's illustration for this scene. "
+                    f"Scene: {script} "
+                    "Bright colors, soft rounded shapes, no text, no scary elements."
+                ),
+                "objects": [],
+                "topic_type": topic_type,
+            })
+        return scenes
+
     @staticmethod
     def _is_ordered_sequence_prompt(story_prompt: str) -> bool:
         lower = (story_prompt or "").lower()
@@ -493,7 +622,8 @@ class LLMService:
             List[Dict[str, Any]]: 故事场景列表
         """
         request.story_prompt = self._strip_invisible_chars((request.story_prompt or "")).strip()
-        if request.story_prompt:
+        use_provided_content = bool(getattr(request, "use_provided_content", False))
+        if request.story_prompt and not use_provided_content:
             request.story_prompt = await self._normalize_story_prompt(
                 request.story_prompt,
                 request.language,
@@ -544,6 +674,12 @@ class LLMService:
                 "objects": [],
                 "topic_type": "sequence",
             }]
+
+        if use_provided_content:
+            logger.info(
+                "use_provided_content enabled -> skipping story LLM and splitting supplied content into scenes"
+            )
+            return self._split_provided_content(request.story_prompt, request.segments, topic_type)
 
         if request.segments == 1:
             # Special case: exactly 1 segment -> skip scene-generation LLM and use normalized prompt
@@ -1451,6 +1587,7 @@ class LLMService:
         story_segments = await self.generate_story(
             request,
         )
+        use_provided_content = bool(getattr(request, "use_provided_content", False))
         req_topic_type = getattr(request, "topic_type", None)
         subject = (getattr(request, "subject", None) or "").strip()
         subject = self._strip_invisible_chars(subject)
@@ -2071,13 +2208,13 @@ class LLMService:
                 segment["topic_type"] = segment.get("topic_type") or req_topic_type
                 segment["script"] = self._strip_invisible_chars(segment.get("script", ""))
                 segment["scene_prompt"] = self._strip_invisible_chars(segment.get("scene_prompt", ""))
-                if is_dialogue_topic and not is_cover:
+                if is_dialogue_topic and not is_cover and not use_provided_content:
                     segment["script"] = to_voiceover_dialogue(segment.get("script", ""))
-                if is_edu_topic and not use_exact_counts and not is_cover:
+                if is_edu_topic and not use_exact_counts and not is_cover and not use_provided_content:
                     segment["script"] = soften_counts_in_text(segment.get("script", ""))
                     segment["scene_prompt"] = soften_counts_in_text(segment.get("scene_prompt", ""))
                 objs = []
-                if is_edu_topic and not is_cover:
+                if is_edu_topic and not is_cover and not use_provided_content:
                     objs = ensure_unique_objects(segment, idx, used_objects)
                     ensure_objects_in_script(segment, objs, use_exact_counts)
                 else:

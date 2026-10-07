@@ -22,6 +22,7 @@ type FieldType = {
     segments: number; // 分段数量 (1-10)
     language?: Language; // 故事语言
     story_prompt?: string; // 故事提示词，测试模式不需要，非测试模式必填
+    use_provided_content?: boolean; // Use story_prompt as the finished story (skip story LLM)
     topic_type?: "dialogue" | "explanation" | "scene" | "sequence";
     image_style?: string; // 图片风格，测试模式不需要，非测试模式必填
     subject?: string; // Optional cover subject
@@ -366,11 +367,32 @@ const App: React.FC = () => {
                         </Select>
                     </Form.Item>
                     <Form.Item<FieldType>
-                        label={t('storyForm.textPrompt')}
-                        name="story_prompt"
-                        rules={[{ required: true, message: t('storyForm.textPromptMissMsg') }]}
+                        label="Use My Content Directly"
+                        name="use_provided_content"
+                        valuePropName="checked"
+                        initialValue={false}
+                        tooltip="When on, the text below is treated as your finished story. The AI will not rewrite it — it is only split into scenes, then images and voice are generated as usual."
                     >
-                        <Input.TextArea rows={4} placeholder={t('storyForm.storyPromptPlaceholder')} />
+                        <Switch />
+                    </Form.Item>
+                    <Form.Item noStyle shouldUpdate={(prev, curr) => prev.use_provided_content !== curr.use_provided_content}>
+                        {({ getFieldValue }) => {
+                            const usesOwnContent = !!getFieldValue('use_provided_content');
+                            return (
+                                <Form.Item<FieldType>
+                                    label={usesOwnContent ? 'Your Full Story' : t('storyForm.textPrompt')}
+                                    name="story_prompt"
+                                    rules={[{ required: true, message: t('storyForm.textPromptMissMsg') }]}
+                                >
+                                    <Input.TextArea
+                                        rows={usesOwnContent ? 10 : 4}
+                                        placeholder={usesOwnContent
+                                            ? 'Paste your finished story here. Optionally mark scene breaks with blank lines, "---", or numbered lines like "1.".'
+                                            : t('storyForm.storyPromptPlaceholder')}
+                                    />
+                                </Form.Item>
+                            );
+                        }}
                     </Form.Item>
                     <Form.Item<FieldType>
                         label="Topic Type"

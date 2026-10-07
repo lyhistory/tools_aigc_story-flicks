@@ -30,6 +30,7 @@ interface VideoGenerateReq {
     segments: number; // 分段数量 (1-10)
     language?: Language; // 故事语言
     story_prompt?: string; // 故事提示词，测试模式不需要，非测试模式必填
+    use_provided_content?: boolean; // Use story_prompt as the finished story: skip story LLM, only split into scenes
     topic_type?: "dialogue" | "explanation" | "scene" | "sequence";
     image_style?: string; // 图片风格，测试模式不需要，非测试模式必填
     subject?: string; // optional cover subject
