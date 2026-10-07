@@ -173,6 +173,8 @@ TRANSITION_CHOICES = ("cut", "fade", "dissolve", "iris", "wipe")
 TRANSITION_BG_RGB = (26, 32, 44)
 # Never drift more than this fraction of the visible picture, so movement stays subtle.
 MAX_PAN_TRAVEL = 0.05
+# A touch of zoom is what gives the camera room to drift without exposing edges.
+PAN_SCALE = 1.0 + MAX_PAN_TRAVEL + 0.01
 
 
 def _ease(x: float) -> float:
@@ -181,65 +183,55 @@ def _ease(x: float) -> float:
     return x * x * (3.0 - 2.0 * x)
 
 
-def _resolve_motion(motion: str | None, strength: float, seed: int) -> str:
+def _resolve_motion(motion: str | None) -> str:
     choice = (motion or "auto").strip().lower()
     if choice not in MOTION_CHOICES:
         choice = "auto"
-    if choice == "auto":
-        # Deterministic per image so a re-render looks identical to the last one.
-        rng = random.Random(seed * 7919 + 17)
-        return rng.choice(("zoom_in", "pan", "zoom_out", "pan"))
-    return choice
+    # "auto" is the calm default: one slow push-in, never a sideways sway.
+    return "zoom_in" if choice == "auto" else choice
 
 
-def _camera_bounds(img: Image.Image, out_w: int, out_h: int, framing: str):
-    """Map the source image onto the output frame: base crop, center and sub size."""
+def _cover_resize(img: Image.Image, target_w: int, target_h: int, scale: float = 1.0) -> Image.Image:
+    """Scale to cover target*scale (keeping aspect) and center-crop in one pass."""
+    target_w = max(1, int(round(target_w * scale)))
+    target_h = max(1, int(round(target_h * scale)))
+    ratio = max(target_w / img.width, target_h / img.height)
+    new_w = max(1, int(round(img.width * ratio)))
+    new_h = max(1, int(round(img.height * ratio)))
+    resized = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+    left = (new_w - target_w) // 2
+    top = (new_h - target_h) // 2
+    return resized.crop((left, top, left + target_w, top + target_h))
+
+
+def _display_size(img: Image.Image, out_w: int, out_h: int, framing: str):
+    """Size of the picture as drawn inside the frame, before any camera move."""
+    if framing == "fill":
+        return out_w, out_h
     img_ratio = img.width / img.height
     out_ratio = out_w / out_h
-    if framing == "fill":
-        if img_ratio > out_ratio:
-            base_h = float(img.height)
-            base_w = img.height * out_ratio
-        else:
-            base_w = float(img.width)
-            base_h = img.width / out_ratio
-        return base_w, base_h, img.width / 2.0, img.height / 2.0, out_w, out_h
-    # fit: keep the whole picture visible on top of a blurred backdrop
     if img_ratio >= out_ratio:
-        sub_w, sub_h = out_w, max(1, int(round(out_w / img_ratio)))
-    else:
-        sub_w, sub_h = max(1, int(round(out_h * img_ratio))), out_h
-    return float(img.width), float(img.height), img.width / 2.0, img.height / 2.0, sub_w, sub_h
+        return out_w, max(1, int(round(out_w / img_ratio)))
+    return max(1, int(round(out_h * img_ratio))), out_h
 
 
-def render_camera_frame(img: Image.Image, out_w: int, out_h: int, framing: str,
-                        scale: float, pan_x: float, pan_y: float, backdrop: Image.Image) -> np.ndarray:
-    """Render one frame of a slow zoom/drift for a still image."""
-    base_w, base_h, base_cx, base_cy, sub_w, sub_h = _camera_bounds(img, out_w, out_h, framing)
-    scale = max(1.0, float(scale))
-    crop_w = max(1.0, base_w / scale)
-    crop_h = max(1.0, base_h / scale)
-    # Room left inside the source lets the camera drift without showing empty edges.
-    max_dx = max(0.0, min(base_cx - crop_w / 2.0, img.width - base_cx - crop_w / 2.0))
-    max_dy = max(0.0, min(base_cy - crop_h / 2.0, img.height - base_cy - crop_h / 2.0))
-    max_dx = min(max_dx, crop_w * MAX_PAN_TRAVEL)
-    max_dy = min(max_dy, crop_h * MAX_PAN_TRAVEL)
-    cx = base_cx + max(-1.0, min(1.0, pan_x)) * max_dx
-    cy = base_cy + max(-1.0, min(1.0, pan_y)) * max_dy
-    crop_w_i = max(1, int(round(crop_w)))
-    crop_h_i = max(1, int(round(crop_h)))
-    left = int(round(cx - crop_w / 2.0))
-    top = int(round(cy - crop_h / 2.0))
-    left = max(0, min(left, img.width - crop_w_i))
-    top = max(0, min(top, img.height - crop_h_i))
-    region = img.crop((left, top, left + crop_w_i, top + crop_h_i)).resize(
-        (sub_w, sub_h), Image.Resampling.LANCZOS
-    )
-    if framing == "fill":
-        return np.array(region.convert("RGB"))
-    canvas = backdrop.copy()
-    canvas.paste(region, ((out_w - sub_w) // 2, (out_h - sub_h) // 2))
-    return np.array(canvas)
+def _render_camera_frame(pre_img: Image.Image, disp_w: int, disp_h: int,
+                         scale: float, pan_x: float, pan_y: float) -> np.ndarray:
+    """Sample one frame of the camera move with a float affine transform.
+
+    Sampling with fractional coefficients keeps the motion perfectly smooth;
+    rounding a crop box to whole pixels is what made the picture visibly jitter.
+    """
+    win_w = pre_img.width / max(1.0, float(scale))
+    win_h = pre_img.height / max(1.0, float(scale))
+    max_dx = max(0.0, min((pre_img.width - win_w) / 2.0, win_w * MAX_PAN_TRAVEL))
+    max_dy = max(0.0, min((pre_img.height - win_h) / 2.0, win_h * MAX_PAN_TRAVEL))
+    cx = pre_img.width / 2.0 + max(-1.0, min(1.0, pan_x)) * max_dx
+    cy = pre_img.height / 2.0 + max(-1.0, min(1.0, pan_y)) * max_dy
+    matrix = (win_w / disp_w, 0.0, cx - win_w / 2.0, 0.0, win_h / disp_h, cy - win_h / 2.0)
+    return np.array(pre_img.transform(
+        (disp_w, disp_h), Image.AFFINE, matrix, resample=Image.Resampling.BILINEAR
+    ))
 
 
 def build_image_clips(image_file: str, target_w: int, target_h: int, duration: float,
@@ -247,25 +239,40 @@ def build_image_clips(image_file: str, target_w: int, target_h: int, duration: f
                       framing: str = "fit", motion_seed: int = 0):
     """Build the static blurred backdrop plus the gently animated foreground.
 
-    The returned foreground frame is fully opaque and already composited on the
-    backdrop, which keeps the moviepy graph simple and avoids mask alpha issues.
+    The picture is scaled once up front, then each frame is sampled with a float
+    affine transform, so slow zooms stay smooth instead of snapping between pixels.
+    The foreground frame is opaque and already composited on the backdrop.
     """
     img = Image.open(image_file).convert("RGB")
     strength = max(0.0, min(1.0, float(motion_strength)))
-    resolved = _resolve_motion(motion, strength, motion_seed)
+    requested = (motion or "auto").strip().lower()
+    auto_mode = requested in ("", "auto")
+    resolved = _resolve_motion(requested)
 
     blur_radius = max(24, min(target_w, target_h) // 12)
     backdrop = img.resize((target_w, target_h), Image.Resampling.LANCZOS).filter(
         ImageFilter.GaussianBlur(radius=blur_radius)
     )
     bg_clip = ImageClip(np.array(backdrop)).with_duration(duration)
+    disp_w, disp_h = _display_size(img, target_w, target_h, framing)
+
+    def compose(region: np.ndarray) -> np.ndarray:
+        if framing == "fill":
+            return region
+        canvas = backdrop.copy()
+        canvas.paste(Image.fromarray(region), ((target_w - disp_w) // 2, (target_h - disp_h) // 2))
+        return np.array(canvas)
 
     if resolved == "none" or duration <= 0 or strength <= 0.0:
-        frame = render_camera_frame(img, target_w, target_h, framing, 1.0, 0.0, 0.0, backdrop)
+        frame = compose(np.array(_cover_resize(img, disp_w, disp_h, 1.0)))
         return bg_clip, ImageClip(frame).with_duration(duration), target_w, target_h
 
-    zoom_amount = 0.10 * strength
-    pan_zoom = 0.05 + 0.05 * strength
+    # "auto" is intentionally the calmest option: a smaller push-in, one direction only.
+    zoom_amount = (0.07 if auto_mode else 0.10) * strength
+    pan_scale = PAN_SCALE + 0.04 * strength
+    overscan = (1.0 + zoom_amount if resolved in ("zoom_in", "zoom_out") else pan_scale) + 0.01
+    pre_img = _cover_resize(img, disp_w, disp_h, overscan)
+
     if resolved == "pan_left":
         direction = -1.0
     elif resolved == "pan_right":
@@ -279,12 +286,11 @@ def build_image_clips(image_file: str, target_w: int, target_h: int, duration: f
             return 1.0 + zoom_amount * progress, 0.0, 0.0
         if resolved == "zoom_out":
             return 1.0 + zoom_amount * (1.0 - progress), 0.0, 0.0
-        return 1.0 + pan_zoom, direction * (2.0 * progress - 1.0) * (strength * 0.85), 0.0
+        return pan_scale, direction * (2.0 * progress - 1.0) * (strength * 0.85), 0.0
 
-    def frame_fn(t: float, _img=img, _w=target_w, _h=target_h,
-                 _framing=framing, _backdrop=backdrop):
+    def frame_fn(t: float, _pre=pre_img, _dw=disp_w, _dh=disp_h):
         scale, pan_x, pan_y = camera(t)
-        return render_camera_frame(_img, _w, _h, _framing, scale, pan_x, pan_y, _backdrop)
+        return compose(_render_camera_frame(_pre, _dw, _dh, scale, pan_x, pan_y))
 
     fg_clip = VideoClip(frame_function=frame_fn, duration=duration)
     return bg_clip, fg_clip.with_duration(duration), target_w, target_h

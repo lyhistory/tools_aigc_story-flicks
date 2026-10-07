@@ -51,7 +51,7 @@ type TransitionKind = 'cut' | 'fade' | 'dissolve' | 'iris' | 'wipe';
 
 // Child-friendly defaults: calm movement and soft transitions, no flashes or fast motion.
 const MOTION_OPTIONS: { label: string; value: MotionEffect }[] = [
-    { label: 'Auto — gentle mix (recommended)', value: 'auto' },
+    { label: 'Auto — slow gentle zoom (recommended)', value: 'auto' },
     { label: 'Still — picture does not move', value: 'none' },
     { label: 'Slow zoom in', value: 'zoom_in' },
     { label: 'Slow zoom out', value: 'zoom_out' },
