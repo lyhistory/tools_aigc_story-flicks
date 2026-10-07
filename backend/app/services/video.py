@@ -338,6 +338,81 @@ def _blend_transition(prev_frame, next_frame, progress, kind, mask_fn) -> np.nda
     blended = prev_frame.astype(np.float32) * (1.0 - p) + next_frame.astype(np.float32) * p
     return blended.astype(np.uint8)
 
+
+def _slot_line_index(value, line_count: int):
+    """Clamp a 0-based SRT line index exactly as stored by the storyboard UI."""
+    if value is None or line_count <= 0:
+        return None
+    try:
+        idx = int(value)
+    except (TypeError, ValueError):
+        return None
+    return max(0, min(line_count - 1, idx))
+
+
+def _compute_slot_windows(slots, srt_times, scene_duration: float):
+    """Map ordered image slots onto one scene's timeline, in seconds.
+
+    ``sub_start`` / ``sub_end`` are 0-based SRT line indices, matching what the
+    storyboard UI sends. A slot begins at the start of its first assigned line;
+    when that is missing we fall back to the end of the previous assigned range.
+    Windows are always ordered, gap-free and cover the whole scene, so a picture
+    never freezes on a stale frame or flashes a blank gap. When there is no
+    usable subtitle timing we split the scene evenly instead.
+    """
+    n = len(slots)
+    scene_duration = max(0.0, float(scene_duration))
+    if n <= 1:
+        return [(0.0, scene_duration)]
+
+    line_count = len(srt_times or [])
+
+    def line_start(value):
+        idx = _slot_line_index(value, line_count)
+        return srt_times[idx][0] if idx is not None else None
+
+    def line_end(value):
+        idx = _slot_line_index(value, line_count)
+        return srt_times[idx][1] if idx is not None else None
+
+    def even_split():
+        per = scene_duration / n
+        return [
+            (i * per, scene_duration if i + 1 == n else (i + 1) * per)
+            for i in range(n)
+        ]
+
+    has_assignments = line_count > 0 and any(
+        s.get("sub_start") is not None or s.get("sub_end") is not None for s in slots
+    )
+    if not has_assignments:
+        return even_split()
+
+    boundaries = [0.0]
+    cursor = 0.0
+    for i in range(1, n):
+        boundary = line_start(slots[i].get("sub_start"))
+        if boundary is None:
+            boundary = line_end(slots[i - 1].get("sub_end"))
+        if boundary is not None:
+            cursor = max(cursor, min(scene_duration, float(boundary)))
+        boundaries.append(cursor)
+
+    windows = []
+    for i in range(n):
+        start = boundaries[i]
+        end = boundaries[i + 1] if i + 1 < n else scene_duration
+        windows.append((start, max(start, min(scene_duration, end))))
+    windows[-1] = (windows[-1][0], scene_duration)
+
+    # Every slot must own at least a sliver of time; otherwise fall back so no
+    # picture ends up hidden behind the last one.
+    if any(end - start <= 1e-3 for start, end in windows):
+        return even_split()
+
+    return windows
+
+
 async def generate_scene_assets(
     task_dir: str,
     scenes: List[StoryScene],
@@ -916,67 +991,10 @@ async def render_final_video(
 
             n_images = len(resolved_slots)
 
-            # --- Compute per-image time windows using SRT data ---
+            # --- Map each image slot onto the scene timeline using SRT timing ---
             # subs is already loaded above; build a list of (start_s, end_s) per SRT line
             srt_times = [(float(ta), float(tb)) for (ta, tb), _ in subs]  # 0-indexed
-
-            def _srt_window(sub_start, sub_end) -> tuple[float, float]:
-                """Return (start_s, end_s) spanning the given SRT line range."""
-                if not srt_times:
-                    return (0.0, subtitle_duration)
-                start_idx = max(0, int(sub_start)) if sub_start is not None else 0
-                end_idx = min(len(srt_times) - 1, int(sub_end)) if sub_end is not None else len(srt_times) - 1
-                return (srt_times[start_idx][0], srt_times[end_idx][1])
-
-            # Determine whether any slot has explicit subtitle assignments
-            has_assignments = any(
-                s["sub_start"] is not None or s["sub_end"] is not None
-                for s in resolved_slots
-            )
-
-            if has_assignments:
-                # 1. Resolve start times for each slot based on sub_start
-                # If a slot lacks sub_start, it defaults to the end time of the previous slot (or 0.0)
-                windows: list[tuple[float, float]] = []
-                current_start = 0.0
-                
-                start_times = []
-                for idx, slot in enumerate(resolved_slots):
-                    st = slot["sub_start"]
-                    if st is not None and srt_times:
-                        st_idx = int(st)
-                        # Frontend sends 1-indexed values (Start=1 means first subtitle)
-                        if st_idx > 0:
-                            st_idx -= 1
-                        srt_idx = max(0, min(len(srt_times) - 1, st_idx))
-                        t_val = srt_times[srt_idx][0]
-                        
-                        # Ensure monotonic increasing time (can't go backwards)
-                        t_val = max(current_start, t_val)
-                        start_times.append(t_val)
-                        current_start = t_val
-                    else:
-                        start_times.append(current_start)
-                        
-                # 2. Build the windows. Each image holds until the next image's start time, 
-                # or until the end of the scene.
-                for i in range(len(start_times)):
-                    w_start = start_times[i]
-                    w_end = start_times[i+1] if i + 1 < len(start_times) else subtitle_duration
-                    windows.append((w_start, w_end))
-                    
-                image_time_windows = windows
-            else:
-                # No assignments — even split
-                if n_images > 0:
-                    per_dur = subtitle_duration / n_images
-                    image_time_windows = [(idx * per_dur, (idx + 1) * per_dur) for idx in range(n_images)]
-                    # clamp last window to subtitle_duration
-                    if image_time_windows:
-                        image_time_windows[-1] = (image_time_windows[-1][0], subtitle_duration)
-                else:
-                    # No images at all (user deleted all slots)
-                    image_time_windows = [(0.0, subtitle_duration)]
+            image_time_windows = _compute_slot_windows(resolved_slots, srt_times, subtitle_duration)
 
             all_image_files = [s["path"] for s in resolved_slots]
             logger.info(f"Scene {i} resolved image files: {all_image_files}")
@@ -1019,6 +1037,29 @@ async def render_final_video(
                         motion_seed=i * 131 + img_idx,
                     )
                     image_clips.append((_bg, _fg))
+
+            def _fallback_scene_clip():
+                """Whole-scene, narration-length clip used if subtitle rendering fails.
+
+                Rebuilds the first picture across the full scene duration so the
+                audio timeline always stays aligned with the visuals on errors.
+                """
+                dur = max(0.1, subtitle_duration)
+                if all_image_files:
+                    fb_bg, fb_fg, fb_w, fb_h = build_image_clips(
+                        image_file=all_image_files[0],
+                        target_w=target_w,
+                        target_h=target_h,
+                        duration=dur,
+                        motion=scene_motion,
+                        motion_strength=motion_strength,
+                        framing=framing,
+                        motion_seed=i * 131,
+                    )
+                    return CompositeVideoClip([fb_bg, fb_fg], (fb_w, fb_h)).with_duration(dur).with_fps(24)
+                return ImageClip(
+                    np.zeros((target_h, target_w, 3), dtype=np.uint8)
+                ).with_duration(dur).with_fps(24)
 
             # audio will be attached to the final composite clip
             # Fonts
@@ -1285,46 +1326,88 @@ async def render_final_video(
                         CompositeVideoClip([bg, fg], (origin_image_w, origin_image_h))
                         for bg, fg in image_clips
                     ]
-                    if subtitle_items:
-                        logger.info(f"Subtitle items rendered for scene {i}: {len(subtitle_items)} | images: {n_images}")
-                        fps = 24
-                        _windows = image_time_windows # capture in closure
-                        def make_frame(t, _base_clips=base_clips, _subtitle_items=subtitle_items, _windows=_windows):
-                            # find which window t falls into
-                            img_idx = 0
-                            for idx, (ws, we) in enumerate(_windows):
-                                if ws <= t <= we:
-                                    img_idx = idx
-                                    break
-                            else:
-                                if t > _windows[-1][1]:
-                                    img_idx = len(_windows) - 1
 
-                            # remap t to local clip time
-                            win_start, win_end = _windows[img_idx]
-                            local_t = t - win_start
-                            win_dur = win_end - win_start
-                            local_t = max(0.0, min(local_t, win_dur - 1.0 / fps))
-                            frame = _base_clips[img_idx].get_frame(local_t)
-                            return overlay_frame_with_subs(frame, t, _subtitle_items)
-                        try:
-                            video_clip = VideoClip(frame_function=make_frame, duration=subtitle_duration).with_fps(fps)
-                        except TypeError:
-                            video_clip = VideoClip(make_frame=make_frame, duration=subtitle_duration).with_fps(fps)
+                    fps = 24
+                    _windows = image_time_windows  # captured in the closure
+                    _base_clips = base_clips
+
+                    # Slot-to-slot transitions inside a scene. These are visual
+                    # only: the narration audio and subtitle timeline are never
+                    # touched, so a dissolve between pictures cannot desync the
+                    # voice-over from the captions. A "fade" dip is a scene
+                    # boundary effect, so slots cross-dissolve instead of flashing.
+                    slot_kind = (scene_transition or "dissolve").strip().lower()
+                    if slot_kind not in TRANSITION_CHOICES:
+                        slot_kind = "dissolve"
+                    if slot_kind == "fade":
+                        slot_kind = "dissolve"
+                    slot_boundaries = [_windows[k][1] for k in range(len(_windows) - 1)]
+                    slot_td = 0.0
+                    if slot_kind != "cut" and slot_boundaries and len(_base_clips) > 1:
+                        min_win = min(max(1e-3, we - ws) for ws, we in _windows)
+                        slot_td = min(transition_duration, 0.5, 0.6 * min_win)
+                    slot_mask = (
+                        _make_transition_mask(slot_kind, target_w, target_h)
+                        if slot_kind in ("iris", "wipe") else None
+                    )
+
+                    def scene_image_frame(t, _windows=_windows, _base_clips=_base_clips,
+                                          _bounds=slot_boundaries, _td=slot_td,
+                                          _kind=slot_kind, _mask=slot_mask, _fps=fps):
+                        def _slot_local(idx, tt):
+                            win_start, win_end = _windows[idx]
+                            win_dur = max(0.0, win_end - win_start)
+                            local_t = max(0.0, min(tt - win_start, max(0.0, win_dur - 1.0 / _fps)))
+                            return _base_clips[idx].get_frame(local_t)
+
+                        idx = 0
+                        for k, (ws, _we) in enumerate(_windows):
+                            if t + 1e-9 >= ws:
+                                idx = k
+                            else:
+                                break
+                        if _td > 0:
+                            half = _td / 2.0
+                            for k, boundary in enumerate(_bounds):
+                                if k + 1 >= len(_base_clips):
+                                    break
+                                if abs(t - boundary) <= half:
+                                    progress = (t - (boundary - half)) / _td
+                                    return _blend_transition(
+                                        _slot_local(k, t),
+                                        _slot_local(k + 1, t),
+                                        progress,
+                                        _kind,
+                                        _mask,
+                                    )
+                        return _slot_local(idx, t)
+
+                    if subtitle_items:
+                        logger.info(
+                            f"Subtitle items rendered for scene {i}: {len(subtitle_items)} "
+                            f"| images: {n_images} | slot_transition={slot_kind}({slot_td:.2f}s)"
+                        )
+
+                        def make_frame(t, _scene=scene_image_frame, _items=subtitle_items):
+                            return overlay_frame_with_subs(_scene(t), t, _items)
                     else:
                         logger.warning(f"No subtitle items rendered for scene {i}")
-                        # concatenate the bare image clips
-                        video_clip = concatenate_videoclips(base_clips, method="compose")
+
+                        def make_frame(t, _scene=scene_image_frame):
+                            return _scene(t)
+
+                    try:
+                        video_clip = VideoClip(frame_function=make_frame, duration=subtitle_duration).with_fps(fps)
+                    except TypeError:
+                        video_clip = VideoClip(make_frame=make_frame, duration=subtitle_duration).with_fps(fps)
                     clips.append(video_clip.with_audio(audio_clip))
                     logger.info(f"Added subtitles for scene {i}")
                 except Exception as e:
                     logger.error(f"Failed to add subtitles for scene {i}: {str(e)}")
-                    video_clip = CompositeVideoClip([bg_clip, fg_clip], (origin_image_w, origin_image_h))
-                    clips.append(video_clip.with_audio(audio_clip))
+                    clips.append(_fallback_scene_clip().with_audio(audio_clip))
             else:
                 logger.warning(f"Subtitle file not found: {subtitle_file}")
-                video_clip = CompositeVideoClip([bg_clip, fg_clip], (origin_image_w, origin_image_h))
-                clips.append(video_clip.with_audio(audio_clip))
+                clips.append(_fallback_scene_clip().with_audio(audio_clip))
         except Exception as e:
             logger.error(f"Failed to process scene {i}: {str(e)}")
             raise e

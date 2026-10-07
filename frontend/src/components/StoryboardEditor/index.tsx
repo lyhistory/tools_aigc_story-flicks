@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Button, Card, Typography, Space, Popconfirm, message, Modal, Slider, Image, Select, Badge, Spin, Input, Upload, Divider, ColorPicker } from 'antd';
+import { Button, Card, Typography, Space, Popconfirm, message, Modal, Slider, Image, Select, Badge, Spin, Input, Upload, Divider, ColorPicker, Tooltip } from 'antd';
 import { DeleteOutlined, ReloadOutlined, SwapOutlined, CheckCircleFilled, UploadOutlined, LinkOutlined } from '@ant-design/icons';
 import { assembleVideo, regenerateImage, getSubtitleFonts, retranslateScript, uploadImage } from '../../services/index';
 import { useVideoStore } from '../../stores/index';
@@ -217,7 +217,14 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
             if (i !== sceneIdx) return s;
             const newSlots = [...(s.image_slots || [])];
             if (newSlots[slotIdx]) {
-                newSlots[slotIdx] = { ...newSlots[slotIdx], sub_start: start, sub_end: end };
+                let nextStart = start;
+                let nextEnd = end;
+                // Keep each range ordered so a slot always spans a real subtitle
+                // range; picking End before Start should not invert the mapping.
+                if (nextStart != null && nextEnd != null && nextStart > nextEnd) {
+                    [nextStart, nextEnd] = [nextEnd, nextStart];
+                }
+                newSlots[slotIdx] = { ...newSlots[slotIdx], sub_start: nextStart, sub_end: nextEnd };
             }
             return { ...s, image_slots: newSlots };
         }));
@@ -253,9 +260,11 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
         for (let i = 0; i < script.length; i++) {
             const char = script[i];
             
-            if (char === "\n") {
-                if (txt.trim()) result.push(txt.trim());
-                txt = "";
+            // Mirror the backend (sanitize_text_for_tts collapses all whitespace,
+            // newlines included) so these numbered lines match the subtitle lines
+            // the renderer actually indexes. A "\n" is just a space here.
+            if (/\s/.test(char)) {
+                txt += " ";
                 continue;
             }
             
@@ -585,6 +594,7 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
             >
                 <Text type="secondary" style={{ display: 'block', marginBottom: 12 }}>
                     Gentle movement and soft transitions keep the video calm and easy on the eyes for kids.
+                    The chosen transition also blends between extra images (slots) inside a scene.
                 </Text>
                 <div style={{ display: 'flex', flexWrap: 'wrap', gap: 24 }}>
                     <div style={{ minWidth: 240 }}>
@@ -606,7 +616,7 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
                         />
                     </div>
                     <div style={{ minWidth: 240 }}>
-                        <Text style={{ display: 'block', marginBottom: 6 }}>Scene transition</Text>
+                        <Text style={{ display: 'block', marginBottom: 6 }}>Scene &amp; slot transition</Text>
                         <Select
                             style={{ width: 240 }}
                             value={transition}
@@ -719,6 +729,23 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
                                                         ))}
                                                     </Select>
                                                 </Space.Compact>
+                                                {(() => {
+                                                    const lastLine = Math.max(0, lines.length - 1);
+                                                    const hasRange = slot.sub_start != null || slot.sub_end != null;
+                                                    const rs = Math.min(slot.sub_start ?? 0, lastLine);
+                                                    const reIdx = Math.min(slot.sub_end ?? lastLine, lastLine);
+                                                    const preview = lines
+                                                        .slice(rs, reIdx + 1)
+                                                        .map((l, k) => `${rs + k + 1}. ${l}`)
+                                                        .join('\n');
+                                                    return (
+                                                        <Tooltip title={preview || 'Whole scene'}>
+                                                            <div style={{ fontSize: 10, color: hasRange ? '#1677ff' : '#bbb', marginTop: 2, cursor: 'default' }}>
+                                                                {hasRange ? `Lines ${rs + 1}–${reIdx + 1}` : 'Whole scene'}
+                                                            </div>
+                                                        </Tooltip>
+                                                    );
+                                                })()}
                                             </div>
                                         </div>
                                     );
