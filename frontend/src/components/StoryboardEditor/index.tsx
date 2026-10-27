@@ -531,13 +531,18 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
                                 }}
                             />
                         ))}
-                        {/* Custom hex input */}
-                        <input
-                            type="color"
+                        {/* Full-spectrum picker so any shade (lighter or deeper) is reachable.
+                            Alpha is locked: fade makes subtitles harder to read, not easier. */}
+                        <ColorPicker
                             value={subtitleColor}
-                            onChange={e => setSubtitleColor(e.target.value)}
-                            title="Custom color"
-                            style={{ width: 32, height: 32, padding: 0, border: 'none', borderRadius: '50%', cursor: 'pointer' }}
+                            onChange={(color) => setSubtitleColor(color.toHexString())}
+                            showText
+                            disabledAlpha
+                            presets={[{
+                                label: 'Subtitle colours',
+                                colors: ['#F472B6', '#FFFFFF', '#FACC15', '#4ADE80', '#60A5FA',
+                                         '#F87171', '#FB923C', '#A78BFA', '#000000', '#111827', '#1F2937'],
+                            }]}
                         />
                     </div>
                 </div>
@@ -570,7 +575,7 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
                         <ColorPicker
                             showText
                             value={karaokeHighlightColor}
-                            onChange={(color) => setKaraokeHighlightColor(color.toHexString())}
+                            onChange={(color) => setKaraokeHighlightColor(color.toRgbString())}
                             presets={[
                                 {
                                     label: 'Recommended for Contrast',
@@ -582,6 +587,9 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
                                 }
                             ]}
                         />
+                        <Text type="secondary" style={{ display: 'block', fontSize: 11, marginTop: 6 }}>
+                            A solid highlight reads best over pictures; drag the alpha down to soften it.
+                        </Text>
                     </div>
                 )}
             </Card>

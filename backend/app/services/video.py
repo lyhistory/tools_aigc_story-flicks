@@ -413,6 +413,95 @@ def _compute_slot_windows(slots, srt_times, scene_duration: float):
     return windows
 
 
+def _parse_rgba_color(value, default: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+    """Parse '#RGB', '#RRGGBB', '#RRGGBBAA', 'rgb(...)' or 'rgba(...)' to RGBA."""
+    if not value:
+        return default
+    s = str(value).strip()
+    try:
+        if s.startswith("#"):
+            h = s.lstrip("#")
+            if len(h) == 3:
+                h = "".join(c * 2 for c in h)
+            if len(h) == 6:
+                return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16), default[3])
+            if len(h) == 8:
+                return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16), int(h[6:8], 16))
+        m = re.match(r"rgba?\(([^)]+)\)", s, re.IGNORECASE)
+        if m:
+            parts = [p.strip() for p in m.group(1).split(",")]
+            r, g, b = (int(round(float(p))) for p in parts[:3])
+            a = round(float(parts[3]) * 255) if len(parts) > 3 else default[3]
+            clamp = lambda v: max(0, min(255, int(v)))
+            return (clamp(r), clamp(g), clamp(b), clamp(a))
+    except Exception as e:
+        logger.warning(f"Failed to parse color {value!r}: {e}")
+    return default
+
+
+def _normalize_token(token) -> str:
+    """Lowercase, strip non-letters and simple suffixes, for fuzzy word matching."""
+    t = re.sub(r"[^a-zA-Z]", "", str(token or "").lower())
+    for suf in ("ing", "ed", "es", "s"):
+        if t.endswith(suf) and len(t) > len(suf) + 2:
+            return t[: -len(suf)]
+    return t
+
+
+def _align_karaoke_words(phrase_tokens, words, start_ptr: int,
+                         line_start: float, line_end: float,
+                         look_ahead: int = 4):
+    """Bind one subtitle line's tokens to the ASR word timings.
+
+    Each token is matched against the word stream within a small look-ahead
+    window using normalized text, instead of blindly consuming the next word.
+    A mis-heard word (e.g. "with that" transcribed as "without") used to shift
+    the highlight for every later line in the scene; matching by text stops that
+    cascade, and a token with no match keeps its even-timing estimate. Returns
+    ``(word_infos, next_ptr)``.
+    """
+    line_start = float(line_start)
+    line_end = float(line_end)
+    approx_step = max(0.05, line_end - line_start) / max(1, len(phrase_tokens))
+    ptr = int(start_ptr)
+    prev_end = line_start
+    infos = []
+    last = len(phrase_tokens) - 1
+    for token_idx, token in enumerate(phrase_tokens):
+        ws = line_start + token_idx * approx_step
+        we = line_end if token_idx == last else line_start + (token_idx + 1) * approx_step
+        tok_norm = _normalize_token(token)
+        match_idx = None
+        if tok_norm:
+            for offset in range(look_ahead):
+                cand = ptr + offset
+                if cand >= len(words):
+                    break
+                if _normalize_token(words[cand].get("word", "")) == tok_norm:
+                    match_idx = cand
+                    break
+        if match_idx is not None:
+            w = words[match_idx]
+            ptr = match_idx + 1
+            ws = max(line_start, prev_end, float(w.get("start", ws)))
+            we = min(line_end, float(w.get("end", we)))
+            asr_word = str(w.get("word", ""))
+        else:
+            ws = max(line_start, prev_end, ws)
+            asr_word = None
+        if we <= ws:
+            we = ws + max(0.03, approx_step * 0.8)
+        prev_end = we
+        infos.append({
+            "token_index": token_idx,
+            "word": token,
+            "asr_word": asr_word,
+            "start": round(ws, 4),
+            "end": round(we, 4),
+        })
+    return infos, ptr
+
+
 async def generate_scene_assets(
     task_dir: str,
     scenes: List[StoryScene],
@@ -533,14 +622,9 @@ async def render_final_video(
     overlay_dir = os.path.join(task_dir, "overlays")
     os.makedirs(overlay_dir, exist_ok=True)
     
-    parsed_highlight_bg_rgba = (255, 241, 153, 180) # default yellow
-    if karaoke_highlight_color and karaoke_highlight_color.startswith("#"):
-        try:
-            hex_color = karaoke_highlight_color.lstrip('#')
-            if len(hex_color) == 6:
-                parsed_highlight_bg_rgba = (*tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4)), 180)
-        except Exception as e:
-            logger.warning(f"Failed to parse karaoke_highlight_color {karaoke_highlight_color}: {e}")
+    # Alpha stays high by default so the karaoke highlight reads clearly over busy
+    # pictures instead of washing out; the colour picker can still lower it.
+    parsed_highlight_bg_rgba = _parse_rgba_color(karaoke_highlight_color, (255, 241, 153, 235))
             
     zh_subtitle_cache: dict[str, str] = {}
     def sanitize_pronunciation(text: str) -> str:
@@ -590,16 +674,39 @@ async def render_final_video(
             return ""
 
     def normalize_token(token: str) -> str:
-        t = re.sub(r"[^a-zA-Z]", "", token.lower())
-        for suf in ["ing", "ed", "es", "s"]:
-            if t.endswith(suf) and len(t) > len(suf) + 2:
-                return t[: -len(suf)]
-        return t
+        return _normalize_token(token)
 
     def tokenize_karaoke_words(text: str) -> list[str]:
         if not text:
             return []
         return [m.group(0) for m in re.finditer(r"[A-Za-z]+(?:'[A-Za-z]+)?|\d+", text)]
+
+    def subtitle_stroke(fill_hex: str, font_size: int) -> tuple[str, int]:
+        """Pick an outline that keeps the subtitle readable on any picture.
+
+        Light text gets a darker outline (and vice versa) so a pastel colour
+        stays crisp instead of dissolving into a bright, busy photo.
+        """
+        try:
+            h = (fill_hex or "").lstrip("#")
+            if len(h) == 3:
+                h = "".join(c * 2 for c in h)
+            r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+        except Exception:
+            return ("#FFFFFF", max(2, int(font_size * 0.06)))
+        luma = 0.2126 * r + 0.7152 * g + 0.0722 * b
+        # 140 keeps bright/pastel picks (e.g. the pink default, luma ~147) on the
+        # dark-outline side so they stay crisp instead of glowing white.
+        return (("#1F2937" if luma >= 140 else "#FFFFFF"), max(2, int(font_size * 0.06)))
+
+    def readable_text_on(rgba) -> str:
+        """Dark or light text, whichever reads better on the given background."""
+        try:
+            r, g, b = int(rgba[0]), int(rgba[1]), int(rgba[2])
+        except Exception:
+            return "#111827"
+        luma = 0.2126 * r + 0.7152 * g + 0.0722 * b
+        return "#111827" if luma >= 140 else "#FFFFFF"
 
     def load_karaoke_words(words_file: str) -> tuple[list[dict], str]:
         if not os.path.exists(words_file):
@@ -1188,18 +1295,29 @@ async def render_final_video(
                             kw = {} if is_sequence_scene else find_keyword_in_text(phrase, scene.keywords)
                             highlight_word = (kw.get("word") or "").strip() if kw else ""
                             highlight_norm = normalize_token(highlight_word) if highlight_word else ""
+                            if is_sequence_scene:
+                                sub_font_size = 148
+                                sub_color = "#1F2937"
+                                sub_stroke_w = max(3, int(origin_image_h * 0.008))
+                                sub_stroke_fill = "#FFFFFF"
+                            else:
+                                sub_font_size = subtitle_font_size or 58
+                                sub_color = subtitle_color or "#F472B6"
+                                # A matching outline keeps any chosen colour crisp
+                                # on busy art instead of looking washed out.
+                                sub_stroke_fill, sub_stroke_w = subtitle_stroke(sub_color, sub_font_size)
                             sub_img_en = render_text_rgba(
                                 phrase,
                                 subtitle_font_path,
-                                (148 if is_sequence_scene else (subtitle_font_size or 58)),
-                                ("#1F2937" if is_sequence_scene else (subtitle_color or "#F472B6")),
+                                sub_font_size,
+                                sub_color,
                                 max_width=int(origin_image_w * 0.9),
                                 bg_rgba=(0, 0, 0, 0),
                                 highlight_word=highlight_word,
                                 highlight_bg_rgba=(254, 240, 138, 220),
                                 highlight_text_color="#111827",
-                                stroke_width=(max(3, int(origin_image_h * 0.008)) if is_sequence_scene else 0),
-                                stroke_fill=("#FFFFFF" if is_sequence_scene else None),
+                                stroke_width=sub_stroke_w,
+                                stroke_fill=sub_stroke_fill,
                             )
                             zh_sub_img = None
                             if (
@@ -1229,45 +1347,30 @@ async def render_final_video(
                             phrase_tokens = tokenize_karaoke_words(phrase)
                             karaoke_words_line = []
                             if karaoke_enabled and phrase_tokens:
-                                line_dur = max(0.05, line_end - line_start)
-                                approx_step = line_dur / len(phrase_tokens)
-                                for token_idx, token in enumerate(phrase_tokens):
-                                    ws = line_start + token_idx * approx_step
-                                    we = line_end if token_idx == len(phrase_tokens) - 1 else line_start + (token_idx + 1) * approx_step
-                                    if karaoke_word_ptr < len(karaoke_words_all):
-                                        w = karaoke_words_all[karaoke_word_ptr]
-                                        karaoke_word_ptr += 1
-                                        ws = max(line_start, float(w.get("start", ws)))
-                                        we = min(line_end, float(w.get("end", we)))
-                                        if we <= ws:
-                                            we = min(line_end, ws + max(0.03, approx_step * 0.8))
-                                    karaoke_words_line.append(
-                                        {
-                                            "token_index": token_idx,
-                                            "word": token,
-                                            "start": round(ws, 4),
-                                            "end": round(max(ws + 0.03, we), 4),
-                                        }
-                                    )
+                                karaoke_words_line, karaoke_word_ptr = _align_karaoke_words(
+                                    phrase_tokens,
+                                    karaoke_words_all,
+                                    karaoke_word_ptr,
+                                    line_start,
+                                    line_end,
+                                )
                             sub_karaoke_imgs = {}
                             if karaoke_enabled and karaoke_words_line and not is_sequence_scene:
                                 for word_info in karaoke_words_line:
                                     token_idx = int(word_info["token_index"])
-                                    token_norm = normalize_token(word_info.get("word", ""))
-                                    is_keyword_token = bool(highlight_norm and token_norm == highlight_norm)
                                     kara_bg = parsed_highlight_bg_rgba
-                                    if is_keyword_token:
-                                        kara_bg = parsed_highlight_bg_rgba
                                     kara_img_en = render_text_rgba(
                                         phrase,
                                         subtitle_font_path,
-                                        (subtitle_font_size or 58),
-                                        (subtitle_color or "#F472B6"),
+                                        sub_font_size,
+                                        sub_color,
                                         max_width=int(origin_image_w * 0.9),
                                         bg_rgba=(0, 0, 0, 0),
                                         highlight_token_index=token_idx,
                                         highlight_bg_rgba=kara_bg,
-                                        highlight_text_color="#111827",
+                                        highlight_text_color=readable_text_on(kara_bg),
+                                        stroke_width=sub_stroke_w,
+                                        stroke_fill=sub_stroke_fill,
                                     )
                                     kara_img = stack_subtitle_images(
                                         kara_img_en,
