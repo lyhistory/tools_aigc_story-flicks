@@ -2,10 +2,9 @@ import React, { useState, useEffect } from 'react';
 import type { FormProps } from 'antd';
 import { Button, Form, Input, InputNumber, Select, message, Switch, Tooltip, Radio } from 'antd';
 import { useTranslation } from 'react-i18next'
-import { getVoiceList, getLLMProviders, generateVideo, generateStoryboard, getVoiceOptions } from '../../services/index';
+import { getVoiceList, getLLMProviders, generateStoryboard, getVoiceOptions, createTask } from '../../services/index';
 import { VOICE_LANGUAGES, VOICE_LANGUAGES_LABELS, VOICE_PROVIDERS, LEARNER_AGE_OPTIONS } from '../../constants';
 import styles from './index.module.css'
-import { useVideoStore } from "../../stores/index";
 import StoryboardEditor from '../StoryboardEditor';
 import VideoResult from '../VideoResult';
 
@@ -44,14 +43,13 @@ const VOICE_RATE_OPTIONS = [
 
 
 const App: React.FC = () => {
-    const { setVideoUrl, setAssembling } = useVideoStore();
     const { t } = useTranslation();
     const [form] = Form.useForm();
     const [voiceOptions, setVoiceOptions] = useState<{ providers: string[]; languages: Record<string, string[]> }>({ providers: [], languages: {} });
     const [voiceLanguages, setVoiceLanguages] = useState<string[]>(VOICE_LANGUAGES);
     const [nowVoiceList, setNowVoiceList] = useState<string[]>([]);
 
-    const [mode, setMode] = useState<'simple' | 'storyboard'>('storyboard');
+    const [mode, setMode] = useState<'llm' | 'free'>('llm');
     const [storyboardData, setStoryboardData] = useState<{ task_id: string, scenes: any[] } | null>(null);
     const [generating, setGenerating] = useState(false);
 
@@ -110,45 +108,48 @@ const App: React.FC = () => {
     }, []);
     const onFinish: FormProps<FieldType>['onFinish'] = async (values) => {
         console.log('Success:', values);
+        setGenerating(true);
+
+        if (mode === 'free') {
+            message.loading({ content: 'Creating Free Mode timeline...', key: 'gen' });
+            try {
+                const res = await createTask();
+                if (res?.success === false || !res?.data?.task_id) {
+                    throw new Error(res?.message || 'Could not create Free Mode task');
+                }
+                setStoryboardData({ task_id: res.data.task_id, scenes: [] });
+                message.success({ content: 'Free Mode timeline ready. Add your first scene.', key: 'gen' });
+            } catch (err: unknown) {
+                const detail = err instanceof Error ? err.message : JSON.stringify(err);
+                message.error({ content: 'Failed to start Free Mode: ' + detail, key: 'gen' }, 10);
+                console.log('createTask err', err);
+            } finally {
+                setGenerating(false);
+            }
+            return;
+        }
+
         const payload = {
             ...values,
             segments: values.topic_type === 'sequence' ? 1 : values.segments,
             karaoke_highlight_color: typeof values.karaoke_highlight_color === 'string' ? values.karaoke_highlight_color : (values.karaoke_highlight_color as any)?.toHexString?.() || '#FFFF00',
         };
-        setGenerating(true);
-        if (mode === 'simple') {
-            setAssembling(true);
-            message.loading({ content: 'Generating Video, please wait...', key: 'gen' });
-            try {
-                const res = await generateVideo(payload);
-                if (res?.success === false) throw new Error(res?.message || 'Generate Video Failed');
-                message.success({ content: 'Generate Video Success', key: 'gen' });
-                if (res?.data?.video_url) setVideoUrl(res.data.video_url + '?t=' + Date.now());
-            } catch (err: any) {
-                message.error({ content: 'Generate Video Failed: ' + (err?.message || JSON.stringify(err)), key: 'gen' }, 10);
-                console.log('generateVideo err', err);
-            } finally {
-                setGenerating(false);
-                setAssembling(false);
+        message.loading({ content: 'Step 1: Generating Storyboard assets...', key: 'gen' });
+        try {
+            const res = await generateStoryboard(payload);
+            if (res?.success === false) throw new Error(res?.message || 'Generate Storyboard Failed');
+            message.success({ content: 'Storyboard generated! Please edit below.', key: 'gen' });
+            if (res?.data) {
+                setStoryboardData({
+                    task_id: res.data.task_id,
+                    scenes: res.data.scenes
+                });
             }
-        } else {
-            message.loading({ content: 'Step 1: Generating Storyboard assets...', key: 'gen' });
-            try {
-                const res = await generateStoryboard(payload);
-                if (res?.success === false) throw new Error(res?.message || 'Generate Storyboard Failed');
-                message.success({ content: 'Storyboard generated! Please edit below.', key: 'gen' });
-                if (res?.data) {
-                    setStoryboardData({
-                        task_id: res.data.task_id,
-                        scenes: res.data.scenes
-                    });
-                }
-            } catch (err: any) {
-                message.error({ content: 'Generate Storyboard Failed: ' + (err?.message || JSON.stringify(err)), key: 'gen' }, 10);
-                console.log('generateStoryboard err', err);
-            } finally {
-                setGenerating(false);
-            }
+        } catch (err: any) {
+            message.error({ content: 'Generate Storyboard Failed: ' + (err?.message || JSON.stringify(err)), key: 'gen' }, 10);
+            console.log('generateStoryboard err', err);
+        } finally {
+            setGenerating(false);
         }
     };
 
@@ -180,12 +181,19 @@ const App: React.FC = () => {
     // defaults are set from backend in the initial load effect
     return (
         <div className={styles.formDiv}>
-            <div style={{ marginBottom: 24, textAlign: 'center' }}>
-                <Radio.Group value={mode} onChange={e => setMode(e.target.value)} buttonStyle="solid">
-                    <Radio.Button value="simple">Simple Mode</Radio.Button>
-                    <Radio.Button value="storyboard">Storyboard Mode</Radio.Button>
-                </Radio.Group>
-            </div>
+            {!storyboardData && (
+                <div style={{ marginBottom: 24, textAlign: 'center' }}>
+                    <Radio.Group value={mode} onChange={e => setMode(e.target.value)} buttonStyle="solid">
+                        <Radio.Button value="llm">LLM Mode</Radio.Button>
+                        <Radio.Button value="free">Free Mode</Radio.Button>
+                    </Radio.Group>
+                    <div style={{ marginTop: 8, fontSize: 12, color: '#888' }}>
+                        {mode === 'llm'
+                            ? 'AI writes the story and generates scene images before you edit.'
+                            : 'Build the timeline yourself — no text or image AI involved.'}
+                    </div>
+                </div>
+            )}
             {!storyboardData ? (
                 <Form
                     form={form}
@@ -198,6 +206,8 @@ const App: React.FC = () => {
                     onFinishFailed={onFinishFailed}
                     autoComplete="off"
                 >
+                    {mode === 'llm' && (
+                        <>
                     <Form.Item<FieldType>
                         label={t('storyForm.txtLLMProvider')}
                         name="text_llm_provider"
@@ -238,6 +248,8 @@ const App: React.FC = () => {
                     >
                         <Input placeholder={t('storyForm.imageLLMPlaceholder')} />
                     </Form.Item>
+                        </>
+                    )}
                     <Form.Item<FieldType>
                         label={t('storyForm.resolution')}
                         name="resolution"
@@ -245,6 +257,8 @@ const App: React.FC = () => {
                     >
                         <Input placeholder={t('storyForm.resolutionPlaceholder')} />
                     </Form.Item>
+                    {mode === 'llm' && (
+                        <>
                     <Form.Item<FieldType>
                         label={
                             <Tooltip title="Use img2img/inpainting to keep visual continuity. Turn off for text-to-image models.">
@@ -268,6 +282,8 @@ const App: React.FC = () => {
                     >
                         <Switch defaultChecked />
                     </Form.Item>
+                        </>
+                    )}
                     <Form.Item<FieldType>
                         label="Voice Provider"
                         name="voice_provider"
@@ -373,6 +389,8 @@ const App: React.FC = () => {
                     >
                         <Switch />
                     </Form.Item>
+                    {mode === 'llm' && (
+                        <>
                     <Form.Item<FieldType>
                         label="Subject (Optional)"
                         name="subject"
@@ -454,9 +472,11 @@ const App: React.FC = () => {
                             );
                         }}
                     </Form.Item>
+                        </>
+                    )}
                     <Form.Item label={null}>
                         <Button type="primary" htmlType="submit" loading={generating}>
-                            {mode === 'simple' ? t('storyForm.submit') : 'Step 1: Generate Storyboard'}
+                            {mode === 'llm' ? 'Step 1: Generate Storyboard' : 'Start Free Timeline'}
                         </Button>
                     </Form.Item>
                 </Form>
@@ -464,11 +484,16 @@ const App: React.FC = () => {
                 <StoryboardEditor
                     taskId={storyboardData.task_id}
                     scenes={storyboardData.scenes}
+                    mode={mode}
                     resolution={form.getFieldValue('resolution') || '1080*1920'}
                     chineseSubtitleEnabled={form.getFieldValue('chinese_subtitle_enabled')}
                     karaoke={form.getFieldValue('karaoke')}
                     subject={form.getFieldValue('subject')}
                     topicType={form.getFieldValue('topic_type')}
+                    voiceProvider={form.getFieldValue('voice_provider')}
+                    voiceName={form.getFieldValue('voice_name')}
+                    voiceRate={form.getFieldValue('voice_rate')}
+                    language={form.getFieldValue('language')}
                     onClose={() => setStoryboardData(null)}
                 />
             )}

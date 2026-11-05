@@ -38,6 +38,13 @@ export async function generateStoryboard(data: VideoGenerateReq): Promise<Storyb
     });
 }
 
+export async function createTask(): Promise<{ success: boolean; data?: { task_id: string }; message?: string | null }> {
+    return request({
+        url: "/api/video/create_task",
+        method: "post",
+    });
+}
+
 export async function assembleVideo(data: StoryboardAssembleReq): Promise<VideoGenerateRes> {
     return request<VideoGenerateRes>({
         url: "/api/video/assemble_video",
@@ -80,6 +87,14 @@ export async function retranslateScript(data: RetranslateScriptReq): Promise<{ s
         url: "/api/video/retranslate_script",
         method: "post",
         data,
+    });
+}
+
+export async function translateScenes(scripts: string[]): Promise<{ success: boolean; data?: { translations: string[] }; message?: string | null }> {
+    return request({
+        url: "/api/video/translate_scenes",
+        method: "post",
+        data: { scripts },
     });
 }
 

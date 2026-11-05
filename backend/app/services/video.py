@@ -3,13 +3,14 @@ import time
 import json
 import math
 import uuid
+import hashlib
 from typing import List
 from app.schemas.llm import StoryGenerationRequest
 from loguru import logger
 from app.models.const import StoryType, ImageStyle
 from app.schemas.video import VideoGenerateRequest, StoryScene, StoryboardAssembleRequest, RegenerateImageRequest
 from app.services.llm import llm_service
-from app.services.voice import generate_voice
+from app.services.voice import generate_voice, sanitize_text_for_tts, split_text_for_subtitles
 from app.utils import utils
 from moviepy import (
     VideoFileClip,
@@ -502,6 +503,29 @@ def _align_karaoke_words(phrase_tokens, words, start_ptr: int,
     return infos, ptr
 
 
+def _scene_voice_signature(
+    scene: StoryScene,
+    voice_name: str,
+    voice_rate: float,
+    language: str,
+    voice_provider: str,
+    karaoke: bool,
+) -> str:
+    payload = {
+        "script": getattr(scene, "script", "") or "",
+        "voice_name": voice_name or "",
+        "voice_rate": voice_rate,
+        "language": language or "",
+        "voice_provider": (voice_provider or "gtts").lower(),
+        "karaoke": bool(karaoke),
+        "is_cover": bool(getattr(scene, "is_cover", False)),
+        "subject": getattr(scene, "subject", None) or "",
+        "topic_type": str(getattr(scene, "topic_type", None) or ""),
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.sha1(encoded).hexdigest()
+
+
 async def generate_scene_assets(
     task_dir: str,
     scenes: List[StoryScene],
@@ -510,6 +534,7 @@ async def generate_scene_assets(
     language: str,
     voice_provider: str,
     karaoke: bool,
+    reuse_unchanged: bool = False,
 ):
     """生成每个场景所需的音频和字幕资产 (Step 1)
     """
@@ -519,6 +544,27 @@ async def generate_scene_assets(
             image_file = os.path.join(task_dir, f"{i}.png")
             audio_file = os.path.join(task_dir, f"{i}.mp3")
             subtitle_file = os.path.join(task_dir, f"{i}.srt")
+            words_file = os.path.join(task_dir, f"{i}.words.json")
+            signature_file = os.path.join(task_dir, f"{i}.voice.json")
+            signature = _scene_voice_signature(
+                scene, voice_name, voice_rate, language, voice_provider, karaoke
+            )
+
+            if reuse_unchanged and os.path.exists(audio_file) and os.path.exists(subtitle_file) and os.path.exists(signature_file):
+                try:
+                    with open(signature_file, "r", encoding="utf-8") as f:
+                        cached_signature = json.load(f).get("signature")
+                    if cached_signature == signature:
+                        logger.info(f"Reusing unchanged voice assets for scene {i}")
+                        continue
+                except Exception as cache_err:
+                    logger.warning(f"Could not read voice cache for scene {i}: {cache_err}")
+
+            if reuse_unchanged and os.path.exists(words_file):
+                try:
+                    os.remove(words_file)
+                except Exception as remove_err:
+                    logger.warning(f"Could not remove stale karaoke file for scene {i}: {remove_err}")
 
             logger.info(f"Generating voice assets for scene {i}")
             is_cover_scene = bool(getattr(scene, "is_cover", False)) or bool((getattr(scene, "subject", None) or "").strip())
@@ -545,6 +591,8 @@ async def generate_scene_assets(
                 karaoke=(karaoke or is_sequence_scene),
                 sequence_mode=is_sequence_scene,
             )
+            with open(signature_file, "w", encoding="utf-8") as f:
+                json.dump({"signature": signature}, f, ensure_ascii=False)
         except Exception as e:
             logger.error(f"Failed to process assets for scene {i}: {str(e)}")
             raise e
@@ -1916,6 +1964,35 @@ Original Machine-Translated Chinese Script:
         logger.error(f"LLM translation failed: {e}")
         raise e
 
+def translate_scenes_to_chinese(scripts: List[str]) -> List[str]:
+    """Translate each scene into one Chinese line per subtitle line.
+
+    The split mirrors the subtitle pipeline (sanitize whitespace, then split on
+    sentence punctuation) so every line lines up with the SRT renderer.
+    """
+    cache: dict[str, str] = {}
+    translations: List[str] = []
+    for script in scripts:
+        clean_text = sanitize_text_for_tts(script or "")
+        lines = split_text_for_subtitles(clean_text)
+        translated_lines: List[str] = []
+        for line in lines:
+            phrase = line.strip()
+            if not phrase or not re.search(r"[A-Za-z]", phrase):
+                translated_lines.append("")
+                continue
+            if phrase not in cache:
+                try:
+                    translated = _translate_line_to_chinese(phrase)
+                    cache[phrase] = re.sub(r"\s*\n+\s*", " ", translated or "").strip()
+                except Exception as err:
+                    logger.warning(f"Translate failed for '{phrase}': {err}")
+                    cache[phrase] = ""
+            translated_lines.append(cache[phrase])
+        translations.append("\n".join(translated_lines))
+    return translations
+
+
 async def assemble_video_impl(request: "StoryboardAssembleRequest") -> str:
     """Storyboard Step 2: Assemble Video from edited scenes list"""
     try:
@@ -1925,39 +2002,80 @@ async def assemble_video_impl(request: "StoryboardAssembleRequest") -> str:
             raise ValueError(f"Task directory not found: {task_dir}. Assets must be generated first.")
             
         story_file = os.path.join(task_dir, "story.json")
+        story_data = {}
         if os.path.exists(story_file):
             with open(story_file, "r", encoding="utf-8") as f:
                 story_data = json.load(f)
-            story_data["scenes"] = [scene.model_dump() for scene in request.scenes]
-            with open(story_file, "w", encoding="utf-8") as f:
-                json.dump(story_data, f, ensure_ascii=False, indent=2)
+        story_data["task_id"] = task_id
+        story_data["scenes"] = [scene.model_dump() for scene in request.scenes]
+        if request.generate_audio:
+            story_data["mode"] = "free"
+        with open(story_file, "w", encoding="utf-8") as f:
+            json.dump(story_data, f, ensure_ascii=False, indent=2)
 
-        # Pre-process edited scenes: if URL points to a different image, copy it over or download it
+        # Pre-process edited scenes: make every image URL resolvable from this task dir.
+        def localize_image(url: str, stem: str) -> str:
+            if not url:
+                return url
+            url_path = url.split("?")[0]
+            target_img = os.path.join(task_dir, f"{stem}.png")
+            local_url = f"http://127.0.0.1:8889/tasks/{task_id}/{stem}.png"
+            if "/tasks/" in url_path:
+                rel_path = url_path.split("/tasks/")[-1]
+                tasks_root = os.path.dirname(task_dir)
+                source_img = os.path.join(tasks_root, rel_path.replace("/", os.sep))
+                if os.path.exists(source_img):
+                    if os.path.abspath(source_img) != os.path.abspath(target_img):
+                        shutil.copy2(source_img, target_img)
+                        logger.info(f"Reused image: copied {source_img} to {target_img}")
+                    return local_url
+            elif url_path.startswith("http"):
+                try:
+                    response = requests.get(url_path, timeout=10)
+                    if response.status_code == 200:
+                        with open(target_img, "wb") as f:
+                            f.write(response.content)
+                        logger.info(f"Reused image: downloaded external {url_path} to {target_img}")
+                        return local_url
+                    logger.error(f"Failed to download {url_path}, status: {response.status_code}")
+                except Exception as e:
+                    logger.error(f"Failed to download external image {url_path}: {e}")
+            elif os.path.exists(url_path):
+                if os.path.abspath(url_path) != os.path.abspath(target_img):
+                    shutil.copy2(url_path, target_img)
+                return local_url
+            return url
+
         for i, scene in enumerate(request.scenes, 1):
             original_index = getattr(scene, "original_index", None) or i
             if scene.url:
-                url_path = scene.url.split("?")[0]
-                target_img = os.path.join(task_dir, f"{original_index}.png")
-                if "/tasks/" in url_path:
-                    rel_path = url_path.split("/tasks/")[-1]
-                    tasks_root = os.path.dirname(task_dir)
-                    source_img = os.path.join(tasks_root, rel_path.replace("/", os.sep))
-                    if os.path.exists(source_img) and source_img != target_img:
-                        import shutil
-                        shutil.copy2(source_img, target_img)
-                        logger.info(f"Reused image: copied {source_img} to {target_img}")
-                elif url_path.startswith("http"):
-                    try:
-                        import requests
-                        response = requests.get(url_path, timeout=10)
-                        if response.status_code == 200:
-                            with open(target_img, "wb") as f:
-                                f.write(response.content)
-                            logger.info(f"Reused image: downloaded external {url_path} to {target_img}")
-                        else:
-                            logger.error(f"Failed to download {url_path}, status: {response.status_code}")
-                    except Exception as e:
-                        logger.error(f"Failed to download external image {url_path}: {e}")
+                scene.url = localize_image(scene.url, str(original_index))
+            for slot_idx, slot in enumerate(getattr(scene, "image_slots", None) or [], 1):
+                if slot.url:
+                    slot.url = localize_image(slot.url, f"{original_index}_slot{slot_idx}")
+
+        if request.generate_audio:
+            for i, scene in enumerate(request.scenes, 1):
+                if not (getattr(scene, "script", "") or "").strip():
+                    raise ValueError(f"Scene {i} has no transcript. Add a transcript before generating the video.")
+                has_image = bool(getattr(scene, "url", None)) or any(
+                    bool(getattr(slot, "url", None))
+                    for slot in (getattr(scene, "image_slots", None) or [])
+                )
+                if not has_image:
+                    raise ValueError(f"Scene {i} has no image. Upload or select an image before generating the video.")
+
+            logger.info(f"Free mode: preparing voice and subtitle assets for {len(request.scenes)} scenes")
+            await generate_scene_assets(
+                task_dir=task_dir,
+                scenes=request.scenes,
+                voice_name=request.voice_name or "default",
+                voice_rate=request.voice_rate,
+                language=request.language or "fixed-en-GB",
+                voice_provider=request.voice_provider or "gtts",
+                karaoke=request.karaoke,
+                reuse_unchanged=True,
+            )
 
 
         return await render_final_video(

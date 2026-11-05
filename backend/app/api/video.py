@@ -4,9 +4,27 @@ from app.services.video import generate_video, generate_storyboard_impl, assembl
 from app.schemas.video import VideoGenerateRequest, VideoGenerateResponse, StoryScene, StoryboardAssembleRequest, RegenerateImageRequest
 import os
 import json
-from app.utils.utils import extract_id
+import time
+import asyncio
+from uuid import uuid4
+from app.utils.utils import extract_id, task_dir
 
 router = APIRouter()
+
+
+@router.post("/create_task")
+async def create_task_endpoint():
+    """Create an empty task for Free Mode (no LLM or image generation)."""
+    try:
+        task_id = f"{int(time.time())}_{uuid4().hex[:6]}"
+        t_dir = task_dir(task_id)
+        story_data = {"task_id": task_id, "mode": "free", "scenes": []}
+        with open(os.path.join(t_dir, "story.json"), "w", encoding="utf-8") as f:
+            json.dump(story_data, f, ensure_ascii=False, indent=2)
+        return VideoGenerateResponse(success=True, data={"task_id": task_id})
+    except Exception as e:
+        logger.error(f"Failed to create task: {str(e)}")
+        return VideoGenerateResponse(success=False, message=str(e))
 
 @router.post("/generate")
 async def generate_video_endpoint(
@@ -81,8 +99,8 @@ async def regenerate_image_endpoint(request: RegenerateImageRequest):
             message=str(e)
         )
 
-from app.schemas.video import RetranslateScriptRequest
-from app.services.video import retranslate_script_impl
+from app.schemas.video import RetranslateScriptRequest, TranslateScenesRequest
+from app.services.video import retranslate_script_impl, translate_scenes_to_chinese
 
 @router.post("/retranslate_script")
 async def retranslate_script_endpoint(request: RetranslateScriptRequest):
@@ -95,6 +113,23 @@ async def retranslate_script_endpoint(request: RetranslateScriptRequest):
         )
     except Exception as e:
         logger.error(f"Failed to retranslate script: {str(e)}")
+        return VideoGenerateResponse(
+            success=False,
+            message=str(e)
+        )
+
+
+@router.post("/translate_scenes")
+async def translate_scenes_endpoint(request: TranslateScenesRequest):
+    """Translate scene transcripts into one Chinese line per subtitle line."""
+    try:
+        translations = await asyncio.to_thread(translate_scenes_to_chinese, request.scripts)
+        return VideoGenerateResponse(
+            success=True,
+            data={"translations": translations}
+        )
+    except Exception as e:
+        logger.error(f"Failed to translate scenes: {str(e)}")
         return VideoGenerateResponse(
             success=False,
             message=str(e)

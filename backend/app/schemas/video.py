@@ -355,6 +355,11 @@ class RetranslateScriptRequest(BaseModel):
     text_llm_model: Optional[str] = Field(default=None, description="Text LLM model to use")
 
 
+class TranslateScenesRequest(BaseModel):
+    """Translate scene transcripts into one Chinese line per subtitle line."""
+    scripts: List[str] = Field(default_factory=list, description="Scene transcripts in timeline order")
+
+
 class StoryboardAssembleRequest(BaseModel):
     """第二阶段：视频拼装请求"""
     task_id: str = Field(description="任务ID（Step 1 返回的）")
@@ -371,6 +376,11 @@ class StoryboardAssembleRequest(BaseModel):
     framing: Optional[str] = Field(default="fit", description="构图: fit(完整显示,模糊背景)|fill(填满裁切)")
     transition: Optional[str] = Field(default="dissolve", description="转场: cut|fade|dissolve|iris|wipe")
     transition_duration: float = Field(default=0.5, ge=0.0, le=1.5, description="转场时长(秒)")
+    generate_audio: bool = Field(default=False, description="自由模式：按当前 transcript 重新生成音频和字幕")
+    voice_provider: Optional[str] = Field(default="gtts", description="自由模式语音提供商")
+    voice_name: Optional[str] = Field(default="default", description="自由模式语音名称")
+    voice_rate: float = Field(default=1.0, description="自由模式语音速率")
+    language: Optional[str] = Field(default="fixed-en-GB", description="自由模式语音语言")
 
 
 class VideoGenerateResponse(BaseModel):

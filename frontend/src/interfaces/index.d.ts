@@ -86,6 +86,11 @@ interface StoryboardAssembleReq {
     framing?: "fit" | "fill";
     transition?: "cut" | "fade" | "dissolve" | "iris" | "wipe";
     transition_duration?: number;
+    generate_audio?: boolean;
+    voice_provider?: string;
+    voice_name?: string;
+    voice_rate?: number;
+    language?: string;
 }
 
 interface StoryboardRes {

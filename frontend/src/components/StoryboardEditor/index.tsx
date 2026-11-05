@@ -1,7 +1,7 @@
-import React, { useState, useEffect } from 'react';
-import { Button, Card, Typography, Space, Popconfirm, message, Modal, Slider, Image, Select, Badge, Spin, Input, Upload, Divider, ColorPicker, Tooltip } from 'antd';
-import { DeleteOutlined, ReloadOutlined, SwapOutlined, CheckCircleFilled, UploadOutlined, LinkOutlined } from '@ant-design/icons';
-import { assembleVideo, regenerateImage, getSubtitleFonts, retranslateScript, uploadImage } from '../../services/index';
+import React, { useState, useEffect, useRef } from 'react';
+import { Button, Card, Typography, Space, Popconfirm, message, Modal, Slider, Image, Select, Badge, Spin, Input, Upload, Divider, ColorPicker, Tooltip, Empty } from 'antd';
+import { DeleteOutlined, ReloadOutlined, SwapOutlined, CheckCircleFilled, UploadOutlined, LinkOutlined, PlusOutlined, ArrowUpOutlined, ArrowDownOutlined, TranslationOutlined } from '@ant-design/icons';
+import { assembleVideo, regenerateImage, getSubtitleFonts, retranslateScript, uploadImage, translateScenes } from '../../services/index';
 import { useVideoStore } from '../../stores/index';
 
 const { Text } = Typography;
@@ -11,12 +11,17 @@ interface FontOption { id: string; label: string; default: boolean; }
 interface StoryboardEditorProps {
     taskId: string;
     scenes: StoryScene[];
+    mode: 'llm' | 'free';
     resolution: string;
     chineseSubtitleEnabled: boolean;
     karaoke: boolean;
     karaokeHighlightColor?: string;
     subject?: string;
     topicType?: string;
+    voiceProvider?: string;
+    voiceName?: string;
+    voiceRate?: number;
+    language?: string;
     onClose: () => void;
 }
 
@@ -45,6 +50,11 @@ const FONT_STYLE_MAP: Record<string, React.CSSProperties> = {
 const DEFAULT_FONT = 'NotoSans-Bold';
 const DEFAULT_FONT_SIZE = 58;
 
+const getRequestError = (error: unknown): string => {
+    const maybe = error as { response?: { data?: { message?: string } }; message?: string };
+    return maybe?.response?.data?.message || maybe?.message || String(error);
+};
+
 type MotionEffect = 'auto' | 'none' | 'pan' | 'zoom_in' | 'zoom_out';
 type FramingMode = 'fit' | 'fill';
 type TransitionKind = 'cut' | 'fade' | 'dissolve' | 'iris' | 'wipe';
@@ -72,14 +82,19 @@ const TRANSITION_OPTIONS: { label: string; value: TransitionKind }[] = [
 ];
 
 const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
-    taskId, scenes: initialScenes, resolution, chineseSubtitleEnabled, karaoke, subject, topicType, onClose
+    taskId, scenes: initialScenes, mode, resolution, chineseSubtitleEnabled, karaoke, subject, topicType,
+    voiceProvider, voiceName, voiceRate, language, onClose
 }) => {
+    const isFreeMode = mode === 'free';
     const [scenes, setScenes] = useState<StoryScene[]>(() =>
         initialScenes.map((s, idx) => ({ 
             ...s, 
             extra_images: s.extra_images || [],
             original_index: s.original_index || idx + 1
         }))
+    );
+    const nextSceneIndexRef = useRef(
+        initialScenes.reduce((max, scene) => Math.max(max, Number(scene.original_index) || 0), 0) + 1
     );
     const [allGeneratedImages, setAllGeneratedImages] = useState<{ label: string; url: string }[]>([]);
 
@@ -292,13 +307,56 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
         return result.filter(seg => /[\w\u4e00-\u9fa5]/.test(seg));
     };
 
+    const getChineseLines = (text?: string) => {
+        return text ? text.split('\n') : [];
+    };
+
+    const updateChineseLine = (sceneIdx: number, lineIdx: number, value: string, lineCount: number) => {
+        setScenes(prev => prev.map((scene, idx) => {
+            if (idx !== sceneIdx) return scene;
+            const current = getChineseLines(scene.chinese_translation);
+            const next = Array.from({ length: lineCount }, (_, i) => i === lineIdx ? value : (current[i] || ''));
+            return { ...scene, chinese_translation: next.join('\n') };
+        }));
+    };
+
     const handleDelete = (index: number) => {
         const newScenes = [...scenes];
         newScenes.splice(index, 1);
         setScenes(newScenes);
     };
 
+    const handleAddScene = (afterIndex?: number) => {
+        const newScene: StoryScene = {
+            script: '',
+            scene_prompt: '',
+            objects: [],
+            keywords: [],
+            extra_images: [],
+            image_slots: [],
+            original_index: nextSceneIndexRef.current++,
+        };
+        setScenes(prev => {
+            const next = [...prev];
+            const insertAt = afterIndex == null ? next.length : Math.min(afterIndex + 1, next.length);
+            next.splice(insertAt, 0, newScene);
+            return next;
+        });
+    };
+
+    const handleMoveScene = (index: number, direction: -1 | 1) => {
+        const target = index + direction;
+        if (target < 0 || target >= scenes.length) return;
+        setScenes(prev => {
+            const next = [...prev];
+            [next[index], next[target]] = [next[target], next[index]];
+            return next;
+        });
+    };
+
     const [retranslatingIndexes, setRetranslatingIndexes] = useState<{ [key: number]: boolean }>({});
+    const [translatingIndexes, setTranslatingIndexes] = useState<{ [key: number]: boolean }>({});
+    const [translatingAll, setTranslatingAll] = useState(false);
 
     const [externalUrl, setExternalUrl] = useState('');
     const [uploading, setUploading] = useState(false);
@@ -351,13 +409,96 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
         }
     };
 
+    const handleTranslateScene = async (index: number, scene: StoryScene) => {
+        const script = (scene.script || '').trim();
+        if (!script) {
+            message.warning(`Scene ${index + 1} has no English transcript to translate.`);
+            return;
+        }
+        setTranslatingIndexes(prev => ({ ...prev, [index]: true }));
+        try {
+            const res = await translateScenes([script]);
+            const translation = res?.data?.translations?.[0];
+            if (!res?.success || typeof translation !== 'string') {
+                throw new Error(res?.message || 'Translation failed');
+            }
+            setScenes(prev => prev.map((s, i) => i === index ? { ...s, chinese_translation: translation } : s));
+            const translatedLines = getChineseLines(translation).filter(line => line.trim()).length;
+            if (translatedLines === 0) {
+                message.warning(`Scene ${index + 1} translation came back empty.`);
+            } else {
+                message.success(`Scene ${index + 1} translated (${translatedLines} line(s)).`);
+            }
+        } catch (e: unknown) {
+            const detail = getRequestError(e);
+            message.error(`Scene ${index + 1} translation failed: ${detail}`);
+        } finally {
+            setTranslatingIndexes(prev => ({ ...prev, [index]: false }));
+        }
+    };
+
+    const handleTranslateAll = async () => {
+        if (!chineseSubtitleEnabled || scenes.length === 0) return;
+        if (!scenes.some(scene => (scene.script || '').trim())) {
+            message.warning('Write at least one English transcript before translating.');
+            return;
+        }
+        const scripts = scenes.map(scene => scene.script || '');
+        setTranslatingAll(true);
+        try {
+            const res = await translateScenes(scripts);
+            const translations = res?.data?.translations;
+            if (!res?.success || !Array.isArray(translations) || translations.length !== scripts.length) {
+                throw new Error(res?.message || 'Translation failed');
+            }
+            setScenes(prev => prev.map((scene, index) => ({
+                ...scene,
+                chinese_translation: translations[index] || '',
+            })));
+            const translatedScenes = translations.filter(text => text.trim()).length;
+            const translatedLines = translations.reduce(
+                (total, text) => total + getChineseLines(text).filter(line => line.trim()).length,
+                0,
+            );
+            if (translatedScenes === 0) {
+                message.warning('No lines were translated. Check your network and try again.');
+            } else {
+                message.success(`Translated ${translatedScenes} scene(s), ${translatedLines} line(s).`);
+            }
+        } catch (e: unknown) {
+            const detail = getRequestError(e);
+            message.error(`Translate All failed: ${detail}`);
+        } finally {
+            setTranslatingAll(false);
+        }
+    };
+
     const handleAssemble = async () => {
         if (scenes.length === 0) {
             message.warning("Timeline is empty! Cannot assemble empty video.");
             return;
         }
+        if (isFreeMode) {
+            const missingTranscript = scenes.findIndex(scene => !(scene.script || '').trim());
+            if (missingTranscript >= 0) {
+                message.warning(`Scene ${missingTranscript + 1} has no transcript. Add a transcript before generating the video.`);
+                return;
+            }
+            const missingImage = scenes.findIndex(scene => {
+                const hasPrimary = !!(scene.url || '').trim();
+                const hasSlot = (scene.image_slots || []).some(slot => !!(slot.url || '').trim());
+                return !hasPrimary && !hasSlot;
+            });
+            if (missingImage >= 0) {
+                message.warning(`Scene ${missingImage + 1} has no image. Upload or select an image first.`);
+                return;
+            }
+        }
         setAssembling(true);
-        message.loading({ content: 'Assembling Video Phase 2, please wait...', key: 'assemble' });
+        message.loading({
+            content: isFreeMode ? 'Generating voice, subtitles, and video, please wait...' : 'Assembling Video Phase 2, please wait...',
+            key: 'assemble',
+        });
         try {
             const res = await assembleVideo({
                 task_id: taskId,
@@ -374,6 +515,13 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
                 framing: framing,
                 transition: transition,
                 transition_duration: transitionDuration,
+                ...(isFreeMode ? {
+                    generate_audio: true,
+                    voice_provider: voiceProvider,
+                    voice_name: voiceName || 'default',
+                    voice_rate: voiceRate ?? 1.0,
+                    language: language || 'fixed-en-GB',
+                } : {}),
             });
             if (res.success && res.data?.video_url) {
                 message.success({ content: 'Video assembled successfully!', key: 'assemble' });
@@ -383,7 +531,8 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
                 throw new Error(res.message || "Unknown error during assembly");
             }
         } catch (e: any) {
-            message.error({ content: 'Assembly failed: ' + e.message, key: 'assemble' });
+            const detail = e?.response?.data?.message || e?.message || 'Unknown error';
+            message.error({ content: 'Assembly failed: ' + detail, key: 'assemble' });
         } finally {
             setAssembling(false);
         }
@@ -440,20 +589,38 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
         <div style={{ marginTop: 24, padding: 24, background: '#f5f5f5', borderRadius: 8 }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 16 }}>
                 <div>
-                    <h2 style={{ margin: 0, marginBottom: 8 }}>Storyboard Timeline</h2>
+                    <h2 style={{ margin: 0, marginBottom: 8 }}>
+                        {isFreeMode ? 'Free Mode Timeline' : 'Storyboard Timeline'}
+                    </h2>
                     <Space>
                         {topicType && <Badge count={`Topic: ${topicType}`} style={{ backgroundColor: '#108ee9' }} />}
                         {subject && <Badge count={`Subject: ${subject}`} style={{ backgroundColor: '#87d068' }} />}
                     </Space>
                 </div>
                 <Space>
+                    {isFreeMode && chineseSubtitleEnabled && (
+                        <Button
+                            icon={<TranslationOutlined />}
+                            loading={translatingAll}
+                            disabled={scenes.length === 0}
+                            onClick={handleTranslateAll}
+                            title="Translate every scene's English transcript into Chinese, one Chinese line per subtitle line"
+                        >
+                            Translate All to Chinese
+                        </Button>
+                    )}
+                    {isFreeMode && (
+                        <Button type="primary" icon={<PlusOutlined />} onClick={() => handleAddScene()}>
+                            Add Scene
+                        </Button>
+                    )}
                     <Button onClick={() => {
                         setScenes(initialScenes.map((s, idx) => ({ 
                             ...s, 
                             extra_images: s.extra_images || [],
                             original_index: s.original_index || idx + 1
                         })));
-                        message.success("Storyboard restored to initial state.");
+                        message.success(isFreeMode ? "Timeline cleared." : "Storyboard restored to initial state.");
                     }}>Restore Initial State</Button>
                     <Button onClick={onClose}>Close Editor</Button>
                 </Space>
@@ -662,8 +829,23 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
             </Card>
 
             <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+                {scenes.length === 0 && (
+                    <Card size="small" style={{ width: '100%', textAlign: 'center' }}>
+                        <Empty
+                            description={isFreeMode
+                                ? 'No scenes yet. Add a scene, paste its transcript, and choose your own image.'
+                                : 'No scenes in this timeline.'}
+                        >
+                            {isFreeMode && (
+                                <Button type="primary" icon={<PlusOutlined />} onClick={() => handleAddScene()}>
+                                    Add First Scene
+                                </Button>
+                            )}
+                        </Empty>
+                    </Card>
+                )}
                 {scenes.map((scene, idx) => (
-                    <Card key={idx} size="small" style={{ width: '100%' }}>
+                    <Card key={scene.original_index ?? idx} size="small" style={{ width: '100%' }}>
                         <div style={{ display: 'flex', gap: 16, alignItems: 'flex-start' }}>
                             {/* Image slots UI - Left Side */}
                             <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', maxWidth: '60%' }}>
@@ -775,7 +957,7 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
                                         onMouseLeave={e => (e.currentTarget.style.borderColor = '#d9d9d9')}
                                     >
                                         <span style={{ fontSize: 20 }}>＋</span>
-                                        <span>Add Slot</span>
+                                        <span>{isFreeMode ? 'Add Image' : 'Add Slot'}</span>
                                     </div>
                                 </div>
                             </div>
@@ -785,43 +967,147 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
                                 <div style={{ display: 'flex', justifyContent: 'space-between' }}>
                                     <Text strong>Scene {idx + 1} {scene.is_cover ? "(Cover)" : ""}</Text>
                                     <Space>
-                                        <Button
-                                            type="default"
-                                            size="small"
-                                            icon={<ReloadOutlined />}
-                                            loading={!!regeneratingIndexes[idx]}
-                                            onClick={() => openRegenModal(idx, scene)}
-                                        >
-                                            Regen
-                                        </Button>
+                                        {isFreeMode && (
+                                            <>
+                                                <Button
+                                                    size="small"
+                                                    icon={<ArrowUpOutlined />}
+                                                    disabled={idx === 0}
+                                                    onClick={() => handleMoveScene(idx, -1)}
+                                                    title="Move scene up"
+                                                />
+                                                <Button
+                                                    size="small"
+                                                    icon={<ArrowDownOutlined />}
+                                                    disabled={idx === scenes.length - 1}
+                                                    onClick={() => handleMoveScene(idx, 1)}
+                                                    title="Move scene down"
+                                                />
+                                            </>
+                                        )}
+                                        {!isFreeMode && (
+                                            <Button
+                                                type="default"
+                                                size="small"
+                                                icon={<ReloadOutlined />}
+                                                loading={!!regeneratingIndexes[idx]}
+                                                onClick={() => openRegenModal(idx, scene)}
+                                            >
+                                                Regen
+                                            </Button>
+                                        )}
                                         <Button
                                             type="default"
                                             size="small"
                                             icon={<SwapOutlined />}
                                             onClick={() => openReuseModal(idx, 'replace-primary')}
                                         >
-                                            Replace...
+                                            {isFreeMode ? 'Change Image...' : 'Replace...'}
                                         </Button>
+                                        {isFreeMode && (
+                                            <Button
+                                                size="small"
+                                                icon={<PlusOutlined />}
+                                                onClick={() => handleAddScene(idx)}
+                                                title="Add a scene after this one"
+                                            />
+                                        )}
                                         <Popconfirm title="Delete this scene?" onConfirm={() => handleDelete(idx)}>
                                             <Button type="text" danger icon={<DeleteOutlined />} size="small" />
                                         </Popconfirm>
                                     </Space>
                                 </div>
-                                <div style={{ margin: '8px 0', fontSize: 13, lineHeight: '1.8' }}>
-                                    {getScriptLines(scene.script).map((line, lIdx) => (
-                                        <div key={lIdx} style={{ marginBottom: 6, display: 'flex', alignItems: 'flex-start' }}>
-                                            <Badge 
-                                                count={lIdx + 1} 
-                                                size="small" 
-                                                style={{ backgroundColor: '#52c41a', marginRight: 10, flexShrink: 0, marginTop: 4 }} 
-                                            />
-                                            <Text>{line}</Text>
-                                        </div>
-                                    ))}
-                                </div>
-                                <Text type="secondary" style={{ fontSize: 11 }}><b>Prompt:</b> {scene.scene_prompt}</Text>
+                                {isFreeMode ? (
+                                    <div style={{ margin: '8px 0' }}>
+                                        <Text type="secondary" strong style={{ display: 'block', marginBottom: 4 }}>
+                                            Transcript
+                                        </Text>
+                                        <Input.TextArea
+                                            value={scene.script}
+                                            onChange={(e) => setScenes(prev => prev.map((s, i) => i === idx ? { ...s, script: e.target.value } : s))}
+                                            autoSize={{ minRows: 4, maxRows: 14 }}
+                                            placeholder="Paste or type this scene's transcript here..."
+                                            style={{ fontSize: 13 }}
+                                        />
+                                        <Text type="secondary" style={{ fontSize: 11 }}>
+                                            {getScriptLines(scene.script).length} subtitle line(s). Voice and subtitles regenerate when you click Generate Video.
+                                        </Text>
+                                    </div>
+                                ) : (
+                                    <div style={{ margin: '8px 0', fontSize: 13, lineHeight: '1.8' }}>
+                                        {getScriptLines(scene.script).map((line, lIdx) => (
+                                            <div key={lIdx} style={{ marginBottom: 6, display: 'flex', alignItems: 'flex-start' }}>
+                                                <Badge
+                                                    count={lIdx + 1}
+                                                    size="small"
+                                                    style={{ backgroundColor: '#52c41a', marginRight: 10, flexShrink: 0, marginTop: 4 }}
+                                                />
+                                                <Text>{line}</Text>
+                                            </div>
+                                        ))}
+                                    </div>
+                                )}
+                                {!isFreeMode && (
+                                    <Text type="secondary" style={{ fontSize: 11 }}><b>Prompt:</b> {scene.scene_prompt}</Text>
+                                )}
                                 
-                                {chineseSubtitleEnabled && scene.chinese_translation !== undefined && (
+                                {isFreeMode && chineseSubtitleEnabled && (() => {
+                                    const englishLines = getScriptLines(scene.script);
+                                    const chineseLines = getChineseLines(scene.chinese_translation);
+                                    return (
+                                        <div style={{ marginTop: 12, borderTop: '1px solid #f0f0f0', paddingTop: 12 }}>
+                                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, marginBottom: 4 }}>
+                                                <Text type="secondary" strong>Chinese Translation</Text>
+                                                <Button
+                                                    size="small"
+                                                    type="dashed"
+                                                    icon={<TranslationOutlined />}
+                                                    loading={!!translatingIndexes[idx]}
+                                                    onClick={() => handleTranslateScene(idx, scene)}
+                                                >
+                                                    Translate This Scene
+                                                </Button>
+                                            </div>
+                                            <Text type="secondary" style={{ display: 'block', fontSize: 11, marginBottom: 8 }}>
+                                                One Chinese line per English subtitle line, in the same order. Translate All to Chinese overwrites these lines.
+                                            </Text>
+                                            {englishLines.length === 0 ? (
+                                                <Text type="secondary" style={{ fontSize: 12 }}>
+                                                    Type an English transcript above first.
+                                                </Text>
+                                            ) : (
+                                                <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                                                    {englishLines.map((line, lineIdx) => (
+                                                        <div key={lineIdx} style={{ display: 'flex', gap: 10, alignItems: 'flex-start' }}>
+                                                            <Badge
+                                                                count={lineIdx + 1}
+                                                                size="small"
+                                                                style={{ backgroundColor: '#52c41a', flexShrink: 0, marginTop: 6 }}
+                                                            />
+                                                            <div style={{ flex: 1, minWidth: 0 }}>
+                                                                <div style={{ fontSize: 12, color: '#595959', marginBottom: 3, lineHeight: 1.5 }}>
+                                                                    {line}
+                                                                </div>
+                                                                <Input
+                                                                    value={chineseLines[lineIdx] || ''}
+                                                                    onChange={(e) => updateChineseLine(idx, lineIdx, e.target.value, englishLines.length)}
+                                                                    placeholder={`Chinese translation for line ${lineIdx + 1}`}
+                                                                    style={{ fontSize: 13 }}
+                                                                />
+                                                            </div>
+                                                        </div>
+                                                    ))}
+                                                </div>
+                                            )}
+                                            {chineseLines.length > 0 && chineseLines.length !== englishLines.length && (
+                                                <Text type="warning" style={{ display: 'block', fontSize: 11, marginTop: 8 }}>
+                                                    Line count mismatch: {englishLines.length} English line(s), {chineseLines.length} Chinese line(s). Click Translate This Scene or fill each line to match.
+                                                </Text>
+                                            )}
+                                        </div>
+                                    );
+                                })()}
+                                {!isFreeMode && chineseSubtitleEnabled && scene.chinese_translation !== undefined && (
                                     <div style={{ marginTop: 12 }}>
                                         <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
                                             <Text type="secondary" strong>Chinese Subtitle Translation</Text>
@@ -840,25 +1126,36 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
                                             autoSize={{ minRows: 2, maxRows: 6 }}
                                             style={{ fontSize: 13 }}
                                         />
-                                        <Text type="secondary" style={{ fontSize: 11 }}>Note: Keep line count the same as English script segments.</Text>
+                                        <Text type="secondary" style={{ fontSize: 11 }}>Note: Use one Chinese line per English subtitle line, in the same order.</Text>
                                     </div>
                                 )}
                             </div>
                         </div>
                     </Card>
                 ))}
+                {isFreeMode && scenes.length > 0 && (
+                    <Button
+                        type="dashed"
+                        size="large"
+                        icon={<PlusOutlined />}
+                        onClick={() => handleAddScene()}
+                        style={{ width: '100%' }}
+                    >
+                        Add Scene
+                    </Button>
+                )}
             </div>
 
             <div style={{ marginTop: 24, textAlign: 'right' }}>
                 <Button type="primary" size="large" onClick={handleAssemble} loading={assembling}>
-                    Step 2: Generate Video
+                    {isFreeMode ? 'Generate Video' : 'Step 2: Generate Video'}
                 </Button>
             </div>
 
             <Modal
                 title={
                     reuseMode === 'add-extra'
-                        ? `Add Extra Image to Scene ${(targetSceneIdx ?? 0) + 1}`
+                        ? `${isFreeMode ? 'Add Image to' : 'Add Extra Image to'} Scene ${(targetSceneIdx ?? 0) + 1}`
                         : `Replace Primary Image for Scene ${(targetSceneIdx ?? 0) + 1}`
                 }
                 open={reuseModalVisible}
@@ -868,7 +1165,9 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
             >
                 <Text type="secondary" style={{ display: 'block', marginBottom: 12 }}>
                     {reuseMode === 'add-extra'
-                        ? 'Pick an image to add as an extra. The scene will cycle through images in order.'
+                        ? (isFreeMode
+                            ? 'Upload, link, or pick an image. Add more image slots later to switch pictures during the subtitles.'
+                            : 'Pick an image to add as an extra. The scene will cycle through images in order.')
                         : 'Pick an image to replace the primary image for this scene.'}
                 </Text>
                 
@@ -890,7 +1189,9 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
                     <Button onClick={handleAddExternalUrl} icon={<LinkOutlined />}>Use Link</Button>
                 </Space>
                 
-                <Divider style={{ margin: '12px 0' }} orientation="left" plain>Or Select from Generated Images</Divider>
+                <Divider style={{ margin: '12px 0' }} orientation="left" plain>
+                    {isFreeMode ? 'Or Select from Timeline Images' : 'Or Select from Generated Images'}
+                </Divider>
 
                 <div style={{ display: 'flex', flexWrap: 'wrap', gap: 16 }}>
                     {allGeneratedImages.map((img, poolIdx) => (
