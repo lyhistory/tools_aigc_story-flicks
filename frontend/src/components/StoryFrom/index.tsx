@@ -49,7 +49,7 @@ const App: React.FC = () => {
     const [voiceLanguages, setVoiceLanguages] = useState<string[]>(VOICE_LANGUAGES);
     const [nowVoiceList, setNowVoiceList] = useState<string[]>([]);
 
-    const [mode, setMode] = useState<'llm' | 'free'>('llm');
+    const [mode, setMode] = useState<'llm' | 'free'>('free');
     const [storyboardData, setStoryboardData] = useState<{ task_id: string, scenes: any[] } | null>(null);
     const [generating, setGenerating] = useState(false);
 
