@@ -93,6 +93,54 @@ interface StoryboardAssembleReq {
     language?: string;
 }
 
+interface InteractiveHighlight {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+    shape: 'rect' | 'ellipse';
+    color: string;
+}
+
+interface InteractiveRound {
+    question_image_url: string;
+    question_script: string;
+    question_translation: string;
+    answer_script: string;
+    answer_translation: string;
+    answer_image_url?: string | null;
+    countdown_seconds: number;
+    countdown_position: string;
+    countdown_sound: string;
+    countdown_label: string;
+    highlights: InteractiveHighlight[];
+}
+
+interface InteractiveBookend {
+    image_url: string;
+    script: string;
+    translation: string;
+}
+
+interface InteractiveAssembleReq {
+    task_id: string;
+    rounds: InteractiveRound[];
+    intro?: InteractiveBookend | null;
+    outro?: InteractiveBookend | null;
+    resolution?: string;
+    chinese_subtitle_enabled?: boolean;
+    karaoke?: boolean;
+    subtitle_font?: string;
+    subtitle_font_size?: number;
+    subtitle_color?: string;
+    karaoke_highlight_color?: string;
+    framing?: 'fit' | 'fill';
+    voice_provider?: string;
+    voice_name?: string;
+    voice_rate?: number;
+    language?: string;
+}
+
 interface StoryboardRes {
     success: boolean;
     data?: {

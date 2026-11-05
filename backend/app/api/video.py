@@ -1,7 +1,22 @@
 from fastapi import APIRouter, HTTPException, Query
 from loguru import logger
-from app.services.video import generate_video, generate_storyboard_impl, assemble_video_impl, regenerate_image_impl, SUBTITLE_FONT_MAP, DEFAULT_SUBTITLE_FONT
-from app.schemas.video import VideoGenerateRequest, VideoGenerateResponse, StoryScene, StoryboardAssembleRequest, RegenerateImageRequest
+from app.services.video import (
+    generate_video,
+    generate_storyboard_impl,
+    assemble_video_impl,
+    assemble_interactive_impl,
+    regenerate_image_impl,
+    SUBTITLE_FONT_MAP,
+    DEFAULT_SUBTITLE_FONT,
+)
+from app.schemas.video import (
+    VideoGenerateRequest,
+    VideoGenerateResponse,
+    StoryScene,
+    StoryboardAssembleRequest,
+    InteractiveAssembleRequest,
+    RegenerateImageRequest,
+)
 import os
 import json
 import time
@@ -13,12 +28,13 @@ router = APIRouter()
 
 
 @router.post("/create_task")
-async def create_task_endpoint():
-    """Create an empty task for Free Mode (no LLM or image generation)."""
+async def create_task_endpoint(mode: str = Query("free")):
+    """Create an empty task for Free or Interactive Mode."""
     try:
         task_id = f"{int(time.time())}_{uuid4().hex[:6]}"
         t_dir = task_dir(task_id)
-        story_data = {"task_id": task_id, "mode": "free", "scenes": []}
+        normalized_mode = mode if mode in ("free", "interactive") else "free"
+        story_data = {"task_id": task_id, "mode": normalized_mode, "scenes": []}
         with open(os.path.join(t_dir, "story.json"), "w", encoding="utf-8") as f:
             json.dump(story_data, f, ensure_ascii=False, indent=2)
         return VideoGenerateResponse(success=True, data={"task_id": task_id})
@@ -82,6 +98,26 @@ async def assemble_video_endpoint(request: StoryboardAssembleRequest):
             success=False,
             message=str(e)
         )
+
+
+@router.post("/assemble_interactive")
+async def assemble_interactive_endpoint(request: InteractiveAssembleRequest):
+    """Assemble an interactive education video from question/countdown/answer rounds."""
+    try:
+        video_file = await assemble_interactive_impl(request)
+        task_id = extract_id(video_file)
+        video_url = "http://127.0.0.1:8889/tasks/" + task_id + "/video.mp4"
+        return VideoGenerateResponse(
+            success=True,
+            data={"video_url": video_url}
+        )
+    except Exception as e:
+        logger.error(f"Failed to assemble interactive video: {str(e)}")
+        return VideoGenerateResponse(
+            success=False,
+            message=str(e)
+        )
+
 
 @router.post("/regenerate_image")
 async def regenerate_image_endpoint(request: RegenerateImageRequest):

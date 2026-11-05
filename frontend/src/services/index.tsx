@@ -38,16 +38,25 @@ export async function generateStoryboard(data: VideoGenerateReq): Promise<Storyb
     });
 }
 
-export async function createTask(): Promise<{ success: boolean; data?: { task_id: string }; message?: string | null }> {
+export async function createTask(mode: 'free' | 'interactive' = 'free'): Promise<{ success: boolean; data?: { task_id: string }; message?: string | null }> {
     return request({
         url: "/api/video/create_task",
         method: "post",
+        params: { mode },
     });
 }
 
 export async function assembleVideo(data: StoryboardAssembleReq): Promise<VideoGenerateRes> {
     return request<VideoGenerateRes>({
         url: "/api/video/assemble_video",
+        method: "post",
+        data,
+    });
+}
+
+export async function assembleInteractive(data: InteractiveAssembleReq): Promise<VideoGenerateRes> {
+    return request<VideoGenerateRes>({
+        url: "/api/video/assemble_interactive",
         method: "post",
         data,
     });

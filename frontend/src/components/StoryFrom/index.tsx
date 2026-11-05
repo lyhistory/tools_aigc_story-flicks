@@ -6,6 +6,7 @@ import { getVoiceList, getLLMProviders, generateStoryboard, getVoiceOptions, cre
 import { VOICE_LANGUAGES, VOICE_LANGUAGES_LABELS, VOICE_PROVIDERS, LEARNER_AGE_OPTIONS } from '../../constants';
 import styles from './index.module.css'
 import StoryboardEditor from '../StoryboardEditor';
+import InteractiveEditor from '../InteractiveEditor';
 import VideoResult from '../VideoResult';
 
 type FieldType = {
@@ -49,8 +50,8 @@ const App: React.FC = () => {
     const [voiceLanguages, setVoiceLanguages] = useState<string[]>(VOICE_LANGUAGES);
     const [nowVoiceList, setNowVoiceList] = useState<string[]>([]);
 
-    const [mode, setMode] = useState<'llm' | 'free'>('free');
-    const [storyboardData, setStoryboardData] = useState<{ task_id: string, scenes: any[] } | null>(null);
+    const [mode, setMode] = useState<'llm' | 'free' | 'interactive'>('free');
+    const [storyboardData, setStoryboardData] = useState<{ task_id: string, scenes: any[], mode?: 'llm' | 'free' | 'interactive' } | null>(null);
     const [generating, setGenerating] = useState(false);
 
     const [llmProviders, setLLMProviders] = useState<{
@@ -110,18 +111,22 @@ const App: React.FC = () => {
         console.log('Success:', values);
         setGenerating(true);
 
-        if (mode === 'free') {
-            message.loading({ content: 'Creating Free Mode timeline...', key: 'gen' });
+        if (mode === 'free' || mode === 'interactive') {
+            const modeLabel = mode === 'free' ? 'Free Mode' : 'Interactive Mode';
+            message.loading({ content: `Creating ${modeLabel} timeline...`, key: 'gen' });
             try {
-                const res = await createTask();
+                const res = await createTask(mode);
                 if (res?.success === false || !res?.data?.task_id) {
-                    throw new Error(res?.message || 'Could not create Free Mode task');
+                    throw new Error(res?.message || `Could not create ${modeLabel} task`);
                 }
-                setStoryboardData({ task_id: res.data.task_id, scenes: [] });
-                message.success({ content: 'Free Mode timeline ready. Add your first scene.', key: 'gen' });
+                setStoryboardData({ task_id: res.data.task_id, scenes: [], mode });
+                const readyMessage = mode === 'free'
+                    ? 'Free Mode timeline ready. Add your first scene.'
+                    : 'Interactive Mode timeline ready. Add your first question round.';
+                message.success({ content: readyMessage, key: 'gen' });
             } catch (err: unknown) {
                 const detail = err instanceof Error ? err.message : JSON.stringify(err);
-                message.error({ content: 'Failed to start Free Mode: ' + detail, key: 'gen' }, 10);
+                message.error({ content: `Failed to start ${modeLabel}: ` + detail, key: 'gen' }, 10);
                 console.log('createTask err', err);
             } finally {
                 setGenerating(false);
@@ -142,7 +147,8 @@ const App: React.FC = () => {
             if (res?.data) {
                 setStoryboardData({
                     task_id: res.data.task_id,
-                    scenes: res.data.scenes
+                    scenes: res.data.scenes,
+                    mode: 'llm'
                 });
             }
         } catch (err: any) {
@@ -184,13 +190,14 @@ const App: React.FC = () => {
             {!storyboardData && (
                 <div style={{ marginBottom: 24, textAlign: 'center' }}>
                     <Radio.Group value={mode} onChange={e => setMode(e.target.value)} buttonStyle="solid">
-                        <Radio.Button value="llm">LLM Mode</Radio.Button>
                         <Radio.Button value="free">Free Mode</Radio.Button>
+                        <Radio.Button value="interactive">Interactive Mode</Radio.Button>
+                        <Radio.Button value="llm">LLM Mode</Radio.Button>
                     </Radio.Group>
                     <div style={{ marginTop: 8, fontSize: 12, color: '#888' }}>
-                        {mode === 'llm'
-                            ? 'AI writes the story and generates scene images before you edit.'
-                            : 'Build the timeline yourself — no text or image AI involved.'}
+                        {mode === 'llm' && 'AI writes the story and generates scene images before you edit.'}
+                        {mode === 'free' && 'Build the timeline yourself — no text or image AI involved.'}
+                        {mode === 'interactive' && 'Build question → countdown → answer rounds for interactive learning videos.'}
                     </div>
                 </div>
             )}
@@ -476,26 +483,42 @@ const App: React.FC = () => {
                     )}
                     <Form.Item label={null}>
                         <Button type="primary" htmlType="submit" loading={generating}>
-                            {mode === 'llm' ? 'Step 1: Generate Storyboard' : 'Start Free Timeline'}
+                            {mode === 'llm' && 'Step 1: Generate Storyboard'}
+                            {mode === 'free' && 'Start Free Timeline'}
+                            {mode === 'interactive' && 'Start Interactive Timeline'}
                         </Button>
                     </Form.Item>
                 </Form>
             ) : (
-                <StoryboardEditor
-                    taskId={storyboardData.task_id}
-                    scenes={storyboardData.scenes}
-                    mode={mode}
-                    resolution={form.getFieldValue('resolution') || '1080*1920'}
-                    chineseSubtitleEnabled={form.getFieldValue('chinese_subtitle_enabled')}
-                    karaoke={form.getFieldValue('karaoke')}
-                    subject={form.getFieldValue('subject')}
-                    topicType={form.getFieldValue('topic_type')}
-                    voiceProvider={form.getFieldValue('voice_provider')}
-                    voiceName={form.getFieldValue('voice_name')}
-                    voiceRate={form.getFieldValue('voice_rate')}
-                    language={form.getFieldValue('language')}
-                    onClose={() => setStoryboardData(null)}
-                />
+                storyboardData.mode === 'interactive' ? (
+                    <InteractiveEditor
+                        taskId={storyboardData.task_id}
+                        resolution={form.getFieldValue('resolution') || '1080*1920'}
+                        chineseSubtitleEnabled={form.getFieldValue('chinese_subtitle_enabled')}
+                        karaoke={form.getFieldValue('karaoke')}
+                        voiceProvider={form.getFieldValue('voice_provider')}
+                        voiceName={form.getFieldValue('voice_name')}
+                        voiceRate={form.getFieldValue('voice_rate')}
+                        language={form.getFieldValue('language')}
+                        onClose={() => setStoryboardData(null)}
+                    />
+                ) : (
+                    <StoryboardEditor
+                        taskId={storyboardData.task_id}
+                        scenes={storyboardData.scenes}
+                        mode={storyboardData.mode === 'llm' ? 'llm' : 'free'}
+                        resolution={form.getFieldValue('resolution') || '1080*1920'}
+                        chineseSubtitleEnabled={form.getFieldValue('chinese_subtitle_enabled')}
+                        karaoke={form.getFieldValue('karaoke')}
+                        subject={form.getFieldValue('subject')}
+                        topicType={form.getFieldValue('topic_type')}
+                        voiceProvider={form.getFieldValue('voice_provider')}
+                        voiceName={form.getFieldValue('voice_name')}
+                        voiceRate={form.getFieldValue('voice_rate')}
+                        language={form.getFieldValue('language')}
+                        onClose={() => setStoryboardData(null)}
+                    />
+                )
             )}
             <VideoResult />
         </div>

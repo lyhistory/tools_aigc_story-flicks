@@ -4,11 +4,18 @@ import json
 import math
 import uuid
 import hashlib
+import wave
 from typing import List
 from app.schemas.llm import StoryGenerationRequest
 from loguru import logger
 from app.models.const import StoryType, ImageStyle
-from app.schemas.video import VideoGenerateRequest, StoryScene, StoryboardAssembleRequest, RegenerateImageRequest
+from app.schemas.video import (
+    VideoGenerateRequest,
+    StoryScene,
+    StoryboardAssembleRequest,
+    InteractiveAssembleRequest,
+    RegenerateImageRequest,
+)
 from app.services.llm import llm_service
 from app.services.voice import generate_voice, sanitize_text_for_tts, split_text_for_subtitles
 from app.utils import utils
@@ -440,6 +447,159 @@ def _parse_rgba_color(value, default: tuple[int, int, int, int]) -> tuple[int, i
     return default
 
 
+COUNTDOWN_POSITION_ANCHORS = {
+    "top_left": (0.07, 0.10, "left", "top"),
+    "top_center": (0.50, 0.10, "center", "top"),
+    "top_right": (0.93, 0.10, "right", "top"),
+    "center_left": (0.07, 0.50, "left", "center"),
+    "center": (0.50, 0.50, "center", "center"),
+    "center_right": (0.93, 0.50, "right", "center"),
+    "bottom_left": (0.07, 0.90, "left", "bottom"),
+    "bottom": (0.50, 0.90, "center", "bottom"),
+    "bottom_right": (0.93, 0.90, "right", "bottom"),
+}
+
+
+def _countdown_overlay_position(
+    position: str,
+    image_width: int,
+    image_height: int,
+    overlay_width: int,
+    overlay_height: int,
+) -> tuple[int, int]:
+    """Return top-left pixel position for a countdown badge."""
+    ax, ay, align_x, align_y = COUNTDOWN_POSITION_ANCHORS.get(
+        (position or "center").strip().lower(),
+        COUNTDOWN_POSITION_ANCHORS["center"],
+    )
+    anchor_x = int(image_width * ax)
+    anchor_y = int(image_height * ay)
+    if align_x == "left":
+        x = anchor_x
+    elif align_x == "right":
+        x = anchor_x - overlay_width
+    else:
+        x = anchor_x - overlay_width // 2
+    if align_y == "top":
+        y = anchor_y
+    elif align_y == "bottom":
+        y = anchor_y - overlay_height
+    else:
+        y = anchor_y - overlay_height // 2
+    return (
+        max(0, min(image_width - overlay_width, x)),
+        max(0, min(image_height - overlay_height, y)),
+    )
+
+
+def _apply_highlight_regions(image_file: str, regions) -> None:
+    """Dim outside and outline answer highlights directly in the scene image."""
+    if not regions or not os.path.exists(image_file):
+        return
+    try:
+        base = Image.open(image_file).convert("RGBA")
+        width, height = base.size
+        if width <= 0 or height <= 0:
+            return
+        mask = Image.new("L", (width, height), 0)
+        mask_draw = ImageDraw.Draw(mask)
+        cleaned = []
+        for region in regions:
+            try:
+                rx = max(0.0, min(1.0, float(getattr(region, "x", 0.0) or 0.0)))
+                ry = max(0.0, min(1.0, float(getattr(region, "y", 0.0) or 0.0)))
+                rw = max(0.005, min(1.0 - rx, float(getattr(region, "width", 0.0) or 0.0)))
+                rh = max(0.005, min(1.0 - ry, float(getattr(region, "height", 0.0) or 0.0)))
+            except (TypeError, ValueError):
+                continue
+            x1, y1 = int(rx * width), int(ry * height)
+            x2, y2 = int((rx + rw) * width), int((ry + rh) * height)
+            if x2 <= x1 or y2 <= y1:
+                continue
+            shape = (getattr(region, "shape", "rect") or "rect").strip().lower()
+            if shape == "ellipse":
+                mask_draw.ellipse([x1, y1, x2, y2], fill=255)
+            else:
+                mask_draw.rounded_rectangle(
+                    [x1, y1, x2, y2],
+                    radius=max(4, int(min(x2 - x1, y2 - y1) * 0.08)),
+                    fill=255,
+                )
+            cleaned.append((x1, y1, x2, y2, shape, getattr(region, "color", "#FFD54F")))
+        if not cleaned:
+            return
+
+        dim_alpha = Image.eval(mask, lambda value: 0 if value else 118)
+        dim = Image.new("RGBA", (width, height), (8, 15, 23, 0))
+        dim.putalpha(dim_alpha)
+        base = Image.alpha_composite(base, dim)
+        draw = ImageDraw.Draw(base)
+        outline_width = max(4, int(min(width, height) * 0.007))
+        for x1, y1, x2, y2, shape, color_value in cleaned:
+            color = _parse_rgba_color(color_value, (255, 213, 79, 255))
+            outline = (color[0], color[1], color[2], 255)
+            shadow = (15, 23, 42, 220)
+            if shape == "ellipse":
+                draw.ellipse([x1, y1, x2, y2], outline=shadow, width=outline_width + 4)
+                draw.ellipse([x1, y1, x2, y2], outline=outline, width=outline_width)
+            else:
+                radius = max(4, int(min(x2 - x1, y2 - y1) * 0.08))
+                draw.rounded_rectangle(
+                    [x1, y1, x2, y2], radius=radius,
+                    outline=shadow, width=outline_width + 4,
+                )
+                draw.rounded_rectangle(
+                    [x1, y1, x2, y2], radius=radius,
+                    outline=outline, width=outline_width,
+                )
+        base.convert("RGB").save(image_file, format="PNG")
+        logger.info(f"Applied {len(cleaned)} highlight region(s) to {image_file}")
+    except Exception as err:
+        logger.warning(f"Could not apply answer highlights to {image_file}: {err}")
+
+
+def _write_countdown_audio(audio_file: str, duration_seconds: int, sound: str) -> None:
+    """Synthesize a short countdown bed with optional tick/beep/ding cues."""
+    sample_rate = 44100
+    duration = max(1, int(duration_seconds or 5))
+    total_samples = duration * sample_rate
+    samples = np.zeros(total_samples, dtype=np.float32)
+    kind = (sound or "none").strip().lower()
+
+    def add_tone(start_s: float, tone_duration: float, frequency: float, volume: float) -> None:
+        start = max(0, int(start_s * sample_rate))
+        count = min(total_samples - start, max(1, int(tone_duration * sample_rate)))
+        if count <= 0:
+            return
+        t = np.arange(count, dtype=np.float32) / sample_rate
+        attack = np.clip(t / 0.012, 0.0, 1.0)
+        release = np.clip((tone_duration - t) / 0.06, 0.0, 1.0)
+        envelope = attack * release
+        samples[start:start + count] += (
+            volume * envelope * np.sin(2.0 * np.pi * frequency * t)
+        ).astype(np.float32)
+
+    if kind in ("tick", "tick_ding", "beep"):
+        tick_seconds = range(duration) if kind != "tick_ding" else range(max(0, duration - 1))
+        for second in tick_seconds:
+            if kind == "beep":
+                add_tone(float(second), 0.16, 660.0, 0.20)
+            else:
+                add_tone(float(second), 0.075, 980.0, 0.22)
+    if kind in ("ding", "tick_ding"):
+        ding_start = max(0.0, duration - 0.78)
+        add_tone(ding_start, 0.68, 1320.0, 0.24)
+        add_tone(ding_start, 0.68, 1980.0, 0.08)
+
+    pcm = np.clip(samples, -1.0, 1.0)
+    pcm = (pcm * 32767.0).astype(np.int16)
+    with wave.open(audio_file, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(sample_rate)
+        wav.writeframes(pcm.tobytes())
+
+
 def _normalize_token(token) -> str:
     """Lowercase, strip non-letters and simple suffixes, for fuzzy word matching."""
     t = re.sub(r"[^a-zA-Z]", "", str(token or "").lower())
@@ -513,6 +673,7 @@ def _scene_voice_signature(
 ) -> str:
     payload = {
         "script": getattr(scene, "script", "") or "",
+        "timing_version": 2,
         "voice_name": voice_name or "",
         "voice_rate": voice_rate,
         "language": language or "",
@@ -1080,19 +1241,29 @@ async def render_final_video(
         try:
             # 获取文件路径
             image_file = os.path.join(task_dir, f"{i}.png")
-            audio_file = os.path.join(task_dir, f"{i}.mp3")
+            is_countdown = (getattr(scene, "render_mode", "normal") or "normal").strip().lower() == "countdown"
+            audio_file = os.path.join(task_dir, f"{i}.wav" if is_countdown else f"{i}.mp3")
             subtitle_file = os.path.join(task_dir, f"{i}.srt")
 
-            if not (os.path.exists(image_file) and os.path.exists(audio_file) and os.path.exists(subtitle_file)):
+            required_files_exist = (
+                os.path.exists(image_file)
+                and os.path.exists(audio_file)
+                and (is_countdown or os.path.exists(subtitle_file))
+            )
+            if not required_files_exist:
                 logger.warning(f"Required files not found for scene {i}, skipping scene video render or expecting error.")
                 # We do not raise error immediately, let it break normally if it fails to load files.
-            # 获取字幕的总时长
-            subs = subtitles.file_to_subtitles(subtitle_file, encoding="utf-8")
-            subtitle_duration = max([tb for ((ta, tb), txt) in subs])
-            # 创建音频剪辑
+            # 创建音频剪辑。Countdown scenes use a synthesized WAV bed and no subtitles.
             audio_clip = AudioFileClip(audio_file)
-            if audio_clip.duration and audio_clip.duration > subtitle_duration:
-                subtitle_duration = audio_clip.duration
+            if is_countdown:
+                subs = []
+                subtitle_duration = float(audio_clip.duration or getattr(scene, "countdown_seconds", 5) or 5)
+            else:
+                # 获取字幕的总时长
+                subs = subtitles.file_to_subtitles(subtitle_file, encoding="utf-8")
+                subtitle_duration = max([tb for ((ta, tb), txt) in subs]) if subs else 0.0
+                if audio_clip.duration and audio_clip.duration > subtitle_duration:
+                    subtitle_duration = audio_clip.duration
             raw_slots = list(getattr(scene, "image_slots", None) or [])
             tasks_root = os.path.dirname(task_dir)
 
@@ -1235,7 +1406,114 @@ async def render_final_video(
             keyword_expl_font_path = noto_light if os.path.exists(noto_light) else keyword_font_path
             logger.info(f"Subtitle font: {subtitle_font_path}")
             # 添加字幕 (PIL render directly onto frames)
-            if os.path.exists(subtitle_file):
+            if is_countdown:
+                countdown_bg, countdown_fg = image_clips[0]
+                countdown_scene_clip = CompositeVideoClip(
+                    [countdown_bg, countdown_fg],
+                    (origin_image_w, origin_image_h),
+                ).with_duration(subtitle_duration).with_fps(24)
+
+                def build_countdown_badge(number_text: str, label_text: str) -> Image.Image | None:
+                    base_size = max(68, int(min(origin_image_w, origin_image_h) * 0.18))
+                    number_img = render_text_rgba(
+                        number_text,
+                        subtitle_font_path,
+                        base_size,
+                        "#0F172A",
+                        max_width=max(120, int(origin_image_w * 0.28)),
+                        bg_rgba=(0, 0, 0, 0),
+                        stroke_width=max(1, int(base_size * 0.025)),
+                        stroke_fill="#FFFFFF",
+                    )
+                    if number_img is None:
+                        return None
+                    padding = max(16, int(base_size * 0.26))
+                    circle_size = max(number_img.width, number_img.height) + padding * 2
+                    badge = Image.new("RGBA", (circle_size, circle_size), (0, 0, 0, 0))
+                    badge_draw = ImageDraw.Draw(badge)
+                    border_width = max(5, int(circle_size * 0.035))
+                    badge_draw.ellipse(
+                        [0, 0, circle_size - 1, circle_size - 1],
+                        fill=(255, 255, 255, 236),
+                        outline=(245, 158, 11, 255),
+                        width=border_width,
+                    )
+                    badge.alpha_composite(
+                        number_img,
+                        (
+                            (circle_size - number_img.width) // 2,
+                            (circle_size - number_img.height) // 2,
+                        ),
+                    )
+                    if not label_text:
+                        return badge
+                    label_font_path = (
+                        chinese_subtitle_font_path
+                        if re.search(r"[\u4e00-\u9fff]", label_text)
+                        else subtitle_font_path
+                    )
+                    label_img = render_text_rgba(
+                        label_text,
+                        label_font_path,
+                        max(28, int(base_size * 0.30)),
+                        "#FFFFFF",
+                        max_width=max(160, int(origin_image_w * 0.72)),
+                        bg_rgba=(15, 23, 42, 225),
+                        stroke_width=max(1, int(base_size * 0.018)),
+                        stroke_fill="#111827",
+                    )
+                    if label_img is None:
+                        return badge
+                    gap = max(8, int(base_size * 0.10))
+                    width = max(badge.width, label_img.width)
+                    height = label_img.height + gap + badge.height
+                    combined = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+                    combined.alpha_composite(label_img, ((width - label_img.width) // 2, 0))
+                    combined.alpha_composite(
+                        badge,
+                        ((width - badge.width) // 2, label_img.height + gap),
+                    )
+                    return combined
+
+                subtitle_items = []
+                countdown_seconds = max(1, min(15, int(getattr(scene, "countdown_seconds", 5) or 5)))
+                countdown_label = str(getattr(scene, "countdown_label", "") or "").strip()
+                countdown_position = str(getattr(scene, "countdown_position", "center") or "center")
+                for step in range(countdown_seconds):
+                    badge_img = build_countdown_badge(str(countdown_seconds - step), countdown_label)
+                    if badge_img is None:
+                        continue
+                    badge_x, badge_y = _countdown_overlay_position(
+                        countdown_position,
+                        origin_image_w,
+                        origin_image_h,
+                        badge_img.width,
+                        badge_img.height,
+                    )
+                    subtitle_items.append(
+                        {
+                            "start": float(step),
+                            "end": float(step + 1),
+                            "sub_img": badge_img,
+                            "sub_pos": (badge_x, badge_y),
+                            "kw_img": None,
+                            "kw_pos": (0, 0),
+                        }
+                    )
+
+                def make_countdown_frame(t, _scene=countdown_scene_clip, _items=subtitle_items):
+                    return overlay_frame_with_subs(_scene.get_frame(t), t, _items)
+
+                video_clip = VideoClip(
+                    frame_function=make_countdown_frame,
+                    duration=subtitle_duration,
+                ).with_fps(24)
+                clips.append(video_clip.with_audio(audio_clip))
+                logger.info(
+                    f"Added countdown scene {i}: {countdown_seconds}s at {countdown_position} "
+                    f"(sound={getattr(scene, 'countdown_sound', 'none')})"
+                )
+            elif os.path.exists(subtitle_file):
                 logger.info(f"Loading subtitle file: {subtitle_file}")
                 try:
                     sub = subtitles.file_to_subtitles(subtitle_file, encoding="utf-8")
@@ -1547,20 +1825,20 @@ async def render_final_video(
                         def make_frame(t, _scene=scene_image_frame):
                             return _scene(t)
 
-                    try:
-                        video_clip = VideoClip(frame_function=make_frame, duration=subtitle_duration).with_fps(fps)
-                    except TypeError:
-                        video_clip = VideoClip(make_frame=make_frame, duration=subtitle_duration).with_fps(fps)
+                    video_clip = VideoClip(
+                        frame_function=make_frame,
+                        duration=subtitle_duration,
+                    ).with_fps(fps)
                     clips.append(video_clip.with_audio(audio_clip))
                     logger.info(f"Added subtitles for scene {i}")
                 except Exception as e:
-                    logger.error(f"Failed to add subtitles for scene {i}: {str(e)}")
+                    logger.exception(f"Failed to add subtitles for scene {i}: {str(e)}")
                     clips.append(_fallback_scene_clip().with_audio(audio_clip))
             else:
                 logger.warning(f"Subtitle file not found: {subtitle_file}")
                 clips.append(_fallback_scene_clip().with_audio(audio_clip))
         except Exception as e:
-            logger.error(f"Failed to process scene {i}: {str(e)}")
+            logger.exception(f"Failed to process scene {i}: {str(e)}")
             raise e
     
     if not clips:
@@ -2097,6 +2375,240 @@ async def assemble_video_impl(request: "StoryboardAssembleRequest") -> str:
     except Exception as e:
         logger.error(f"Failed to assemble video: {e}")
         raise e
+
+
+async def assemble_interactive_impl(request: "InteractiveAssembleRequest") -> str:
+    """Expand interactive rounds into question/countdown/answer scenes and render them."""
+    try:
+        task_id = request.task_id
+        task_dir = utils.task_dir(task_id)
+        if not os.path.exists(task_dir):
+            raise ValueError(f"Task directory not found: {task_dir}.")
+        if not request.rounds:
+            raise ValueError("Add at least one interactive round before generating the video.")
+
+        def localize_image(url: str, stem: str) -> str:
+            if not url:
+                return url
+            url_path = url.split("?")[0]
+            target_img = os.path.join(task_dir, f"{stem}.png")
+            local_url = f"http://127.0.0.1:8889/tasks/{task_id}/{stem}.png"
+            if "/tasks/" in url_path:
+                rel_path = url_path.split("/tasks/")[-1]
+                tasks_root = os.path.dirname(task_dir)
+                source_img = os.path.join(tasks_root, rel_path.replace("/", os.sep))
+                if os.path.exists(source_img):
+                    if os.path.abspath(source_img) != os.path.abspath(target_img):
+                        shutil.copy2(source_img, target_img)
+                    return local_url
+            elif url_path.startswith("http"):
+                try:
+                    response = requests.get(url_path, timeout=10)
+                    if response.status_code == 200:
+                        with open(target_img, "wb") as f:
+                            f.write(response.content)
+                        return local_url
+                    logger.error(f"Failed to download interactive image {url_path}: HTTP {response.status_code}")
+                except Exception as err:
+                    logger.error(f"Failed to download interactive image {url_path}: {err}")
+            elif os.path.exists(url_path):
+                if os.path.abspath(url_path) != os.path.abspath(target_img):
+                    shutil.copy2(url_path, target_img)
+                return local_url
+            return url
+
+        scenes: List[StoryScene] = []
+        next_index = 1
+
+        def append_bookend(bookend, label: str) -> None:
+            nonlocal next_index
+            image_url = (bookend.image_url or "").strip()
+            script = (bookend.script or "").strip()
+            if not image_url:
+                raise ValueError(f"{label}: image is missing.")
+            if not script:
+                raise ValueError(f"{label}: narration is empty.")
+            localized_url = localize_image(image_url, str(next_index))
+            image_file = os.path.join(task_dir, f"{next_index}.png")
+            if not os.path.exists(image_file):
+                raise ValueError(f"{label}: image could not be loaded.")
+            scenes.append(
+                StoryScene(
+                    script=script,
+                    scene_prompt="",
+                    objects=[],
+                    keywords=[],
+                    url=localized_url,
+                    original_index=next_index,
+                    chinese_translation=(bookend.translation or "").strip() or None,
+                    motion_effect="none",
+                    transition="cut",
+                    render_mode="normal",
+                )
+            )
+            next_index += 1
+
+        if request.intro is not None:
+            append_bookend(request.intro, "Intro scene")
+
+        for round_index, round_item in enumerate(request.rounds, 1):
+            question_script = (round_item.question_script or "").strip()
+            answer_script = (round_item.answer_script or "").strip()
+            if not question_script:
+                raise ValueError(f"Round {round_index}: question narration is empty.")
+            if not answer_script:
+                raise ValueError(f"Round {round_index}: answer narration is empty.")
+            if not (round_item.question_image_url or "").strip():
+                raise ValueError(f"Round {round_index}: question image is missing.")
+
+            question_idx = next_index
+            countdown_idx = next_index + 1
+            answer_idx = next_index + 2
+            question_url = localize_image(round_item.question_image_url, str(question_idx))
+            question_file = os.path.join(task_dir, f"{question_idx}.png")
+            if not os.path.exists(question_file):
+                raise ValueError(f"Round {round_index}: question image could not be loaded.")
+
+            countdown_file = os.path.join(task_dir, f"{countdown_idx}.png")
+            shutil.copy2(question_file, countdown_file)
+            countdown_url = f"http://127.0.0.1:8889/tasks/{task_id}/{countdown_idx}.png"
+
+            answer_source_url = round_item.answer_image_url or question_url
+            answer_url = localize_image(answer_source_url, str(answer_idx))
+            answer_file = os.path.join(task_dir, f"{answer_idx}.png")
+            if not os.path.exists(answer_file):
+                raise ValueError(f"Round {round_index}: answer image could not be loaded.")
+            if round_item.highlights:
+                _apply_highlight_regions(answer_file, round_item.highlights)
+
+            scenes.append(
+                StoryScene(
+                    script=question_script,
+                    scene_prompt="",
+                    objects=[],
+                    keywords=[],
+                    url=question_url,
+                    original_index=question_idx,
+                    chinese_translation=(round_item.question_translation or "").strip() or None,
+                    motion_effect="none",
+                    transition="cut",
+                    render_mode="normal",
+                )
+            )
+            scenes.append(
+                StoryScene(
+                    script="",
+                    scene_prompt="",
+                    objects=[],
+                    keywords=[],
+                    url=countdown_url,
+                    original_index=countdown_idx,
+                    chinese_translation=None,
+                    motion_effect="none",
+                    transition="cut",
+                    render_mode="countdown",
+                    countdown_seconds=round_item.countdown_seconds,
+                    countdown_position=round_item.countdown_position,
+                    countdown_sound=round_item.countdown_sound,
+                    countdown_label=(round_item.countdown_label or "").strip(),
+                )
+            )
+            scenes.append(
+                StoryScene(
+                    script=answer_script,
+                    scene_prompt="",
+                    objects=[],
+                    keywords=[],
+                    url=answer_url,
+                    original_index=answer_idx,
+                    chinese_translation=(round_item.answer_translation or "").strip() or None,
+                    motion_effect="none",
+                    transition="cut",
+                    render_mode="answer",
+                    highlight_regions=list(round_item.highlights),
+                )
+            )
+            next_index = answer_idx + 1
+
+        if request.outro is not None:
+            append_bookend(request.outro, "Outro scene")
+
+        story_file = os.path.join(task_dir, "story.json")
+        story_data = {
+            "task_id": task_id,
+            "mode": "interactive",
+            "intro": request.intro.model_dump() if request.intro else None,
+            "outro": request.outro.model_dump() if request.outro else None,
+            "rounds": [round_item.model_dump() for round_item in request.rounds],
+            "scenes": [scene.model_dump() for scene in scenes],
+        }
+        with open(story_file, "w", encoding="utf-8") as f:
+            json.dump(story_data, f, ensure_ascii=False, indent=2)
+        with open(os.path.join(task_dir, "interactive.json"), "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "task_id": task_id,
+                    "resolution": request.resolution,
+                    "intro": request.intro.model_dump() if request.intro else None,
+                    "outro": request.outro.model_dump() if request.outro else None,
+                    "rounds": [round_item.model_dump() for round_item in request.rounds],
+                },
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
+
+        voice_scenes = [scene for scene in scenes if scene.render_mode != "countdown"]
+        logger.info(f"Interactive mode: generating voice assets for {len(voice_scenes)} question/answer scenes")
+        await generate_scene_assets(
+            task_dir=task_dir,
+            scenes=voice_scenes,
+            voice_name=request.voice_name or "default",
+            voice_rate=request.voice_rate,
+            language=request.language or "fixed-en-GB",
+            voice_provider=request.voice_provider or "gtts",
+            karaoke=request.karaoke,
+            reuse_unchanged=True,
+        )
+
+        for scene in scenes:
+            if scene.render_mode != "countdown":
+                continue
+            scene_index = int(scene.original_index or 0)
+            audio_file = os.path.join(task_dir, f"{scene_index}.wav")
+            _write_countdown_audio(
+                audio_file,
+                int(scene.countdown_seconds or 5),
+                str(scene.countdown_sound or "none"),
+            )
+            for stale_extension in ("mp3", "srt", "words.json"):
+                stale_file = os.path.join(task_dir, f"{scene_index}.{stale_extension}")
+                if os.path.exists(stale_file):
+                    try:
+                        os.remove(stale_file)
+                    except OSError:
+                        pass
+
+        return await render_final_video(
+            task_dir=task_dir,
+            scenes=scenes,
+            karaoke=request.karaoke,
+            chinese_subtitle_enabled=request.chinese_subtitle_enabled,
+            resolution=request.resolution,
+            subtitle_font=request.subtitle_font,
+            subtitle_font_size=request.subtitle_font_size,
+            subtitle_color=request.subtitle_color,
+            karaoke_highlight_color=request.karaoke_highlight_color,
+            motion_effect="none",
+            motion_strength=0.0,
+            framing=request.framing,
+            transition="cut",
+            transition_duration=0.0,
+        )
+    except Exception as e:
+        logger.error(f"Failed to assemble interactive video: {e}")
+        raise e
+
 
 async def regenerate_image_impl(request: RegenerateImageRequest) -> str:
     """Regenerate a specific scene image and overwrite it in the task dir."""

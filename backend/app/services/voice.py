@@ -174,10 +174,15 @@ def _write_karaoke_words_file(
         f"| source={timing_source} quality={timing_quality}"
     )
 
-def _karaoke_words_from_subtitle(subtitle_file: str) -> list[dict]:
+def _karaoke_words_from_subtitle(subtitle_file: str, audio: AudioSegment | None = None) -> list[dict]:
     words: list[dict] = []
     try:
         sbs = subtitles.file_to_subtitles(subtitle_file, encoding="utf-8")
+        chunks = (
+            detect_nonsilent(audio, min_silence_len=400, silence_thresh=-40)
+            if audio is not None
+            else []
+        )
         for ((start_s, end_s), line_text) in sbs:
             tokens = karaoke_tokenize(line_text or "")
             if not tokens:
@@ -185,6 +190,51 @@ def _karaoke_words_from_subtitle(subtitle_file: str) -> list[dict]:
             line_start = float(start_s)
             line_end = float(end_s)
             line_dur = max(0.05, line_end - line_start)
+            line_chunks = [
+                (max(line_start, chunk_start / 1000.0), min(line_end, chunk_end / 1000.0))
+                for chunk_start, chunk_end in chunks
+                if chunk_end / 1000.0 > line_start and chunk_start / 1000.0 < line_end
+            ]
+            line_chunks = [(cs, ce) for cs, ce in line_chunks if ce - cs > 0.05]
+            if line_chunks:
+                durations = [ce - cs for cs, ce in line_chunks]
+                total_duration = sum(durations)
+                raw_counts = [len(tokens) * duration / total_duration for duration in durations]
+                counts = [int(value) for value in raw_counts]
+                remainder = len(tokens) - sum(counts)
+                order = sorted(
+                    range(len(raw_counts)),
+                    key=lambda index: raw_counts[index] - counts[index],
+                    reverse=True,
+                )
+                for index in order[:max(0, remainder)]:
+                    counts[index] += 1
+                token_index = 0
+                for (chunk_start, chunk_end), count in zip(line_chunks, counts):
+                    if count <= 0:
+                        continue
+                    step = (chunk_end - chunk_start) / count
+                    for step_index in range(count):
+                        if token_index >= len(tokens):
+                            break
+                        ws = chunk_start + step_index * step
+                        we = chunk_start + (step_index + 1) * step
+                        words.append({
+                            "word": tokens[token_index],
+                            "start": round(ws, 4),
+                            "end": round(max(ws + 0.03, we), 4),
+                        })
+                        token_index += 1
+                if token_index < len(tokens):
+                    step = line_dur / len(tokens)
+                    for index in range(token_index, len(tokens)):
+                        ws = line_start + index * step
+                        words.append({
+                            "word": tokens[index],
+                            "start": round(ws, 4),
+                            "end": round(max(ws + 0.03, line_end), 4),
+                        })
+                continue
             step = line_dur / len(tokens)
             for idx, token in enumerate(tokens):
                 ws = line_start + idx * step
@@ -277,7 +327,111 @@ def _build_google_ssml_with_marks(text: str) -> tuple[str, list[str]]:
         parts.append(xml.sax.saxutils.escape(text[last:]))
     return f"<speak>{''.join(parts)}</speak>", marks
 
-def build_srt_from_audio(audio: AudioSegment, clean_text: str, subtitle_file: str) -> None:
+def _locate_text_segments(text: str, segments: list[str]) -> list[tuple[int, int]] | None:
+    """Map consecutively synthesized segments back to character ranges."""
+    ranges: list[tuple[int, int]] = []
+    cursor = 0
+    for segment in segments:
+        candidate = (segment or "").strip()
+        if not candidate:
+            continue
+        index = text.find(candidate, cursor)
+        if index < 0:
+            shortened = candidate.rstrip(" ,.;:!?")
+            index = text.find(shortened, cursor) if shortened else -1
+            if index < 0:
+                return None
+            candidate = shortened
+        ranges.append((index, index + len(candidate)))
+        cursor = index + len(candidate)
+    return ranges or None
+
+
+def _spans_from_segment_timings(
+    text: str,
+    lines: list[str],
+    segments: list[str],
+    timings: list[tuple[float, float]],
+) -> list[tuple[float, float]] | None:
+    """Align subtitle lines to the real audio spans of synthesized segments."""
+    ranges = _locate_text_segments(text, segments)
+    if not ranges or len(ranges) != len(timings):
+        return None
+
+    def time_at(position: int) -> float:
+        for (range_start, range_end), (start_s, end_s) in zip(ranges, timings):
+            if position < range_start:
+                return float(start_s)
+            if position <= range_end:
+                fraction = (position - range_start) / max(1, range_end - range_start)
+                return float(start_s) + (float(end_s) - float(start_s)) * fraction
+        return float(timings[-1][1])
+
+    spans: list[tuple[float, float]] = []
+    cursor = 0
+    for line in lines:
+        line_text = (line or "").strip()
+        if not line_text:
+            return None
+        start_char = text.find(line_text, cursor)
+        if start_char < 0:
+            return None
+        end_char = start_char + len(line_text)
+        cursor = end_char
+        start_s = time_at(start_char)
+        end_s = max(start_s + 0.25, time_at(end_char))
+        spans.append((start_s, end_s))
+    return spans
+
+
+def _spans_from_speech_chunks(
+    chunks: list[tuple[int, int]],
+    lines: list[str],
+    total_duration_s: float,
+) -> list[tuple[float, float]] | None:
+    """Spread subtitle lines across the voiced span, snapping to pauses."""
+    if not chunks:
+        return None
+    speech_start = max(0.0, chunks[0][0] / 1000.0)
+    speech_end = min(float(total_duration_s), chunks[-1][1] / 1000.0)
+    if speech_end <= speech_start:
+        return None
+
+    weights = [max(1, len(re.findall(r"[A-Za-z0-9']+", line))) for line in lines]
+    total_weight = sum(weights)
+    span_length = speech_end - speech_start
+    boundaries = [speech_start]
+    cursor = speech_start
+    for weight in weights[:-1]:
+        cursor += span_length * (weight / total_weight)
+        boundaries.append(cursor)
+    boundaries.append(speech_end)
+
+    edges: list[float] = []
+    for start_ms, end_ms in chunks:
+        edges.append(start_ms / 1000.0)
+        edges.append(end_ms / 1000.0)
+    tolerance = max(0.12, span_length * 0.03)
+    snapped = [boundaries[0]]
+    for boundary in boundaries[1:-1]:
+        nearest = min(edges, key=lambda edge: abs(edge - boundary))
+        snapped.append(nearest if abs(nearest - boundary) <= tolerance else boundary)
+    snapped.append(boundaries[-1])
+
+    spans: list[tuple[float, float]] = []
+    for index in range(len(lines)):
+        start_s = max(0.0, snapped[index])
+        end_s = min(float(total_duration_s), snapped[index + 1])
+        spans.append((start_s, max(start_s + 0.25, end_s)))
+    return spans
+
+
+def build_srt_from_audio(
+    audio: AudioSegment,
+    clean_text: str,
+    subtitle_file: str,
+    segment_timings: list[tuple[str, float, float]] | None = None,
+) -> None:
     total_duration_ms = len(audio)
     total_duration_s = total_duration_ms / 1000.0
     nonsilent_chunks = detect_nonsilent(audio, min_silence_len=400, silence_thresh=-40)
@@ -319,41 +473,38 @@ def build_srt_from_audio(audio: AudioSegment, clean_text: str, subtitle_file: st
             f.write("")
         return
 
-    if len(nonsilent_chunks) >= num_lines:
-        with open(subtitle_file, "w", encoding="utf-8") as f:
-            raw_pairs = []
-            for i in range(num_lines):
-                start_ms, end_ms = nonsilent_chunks[i]
-                raw_pairs.append((start_ms / 1000.0, end_ms / 1000.0))
-            norm_pairs = normalize_srt_times(raw_pairs, total_duration_s)
-            for i, line in enumerate(lines, 1):
-                start_s, end_s = norm_pairs[i - 1]
-                start_hms = f"{int(start_s // 3600):02d}:{int((start_s % 3600) // 60):02d}:{int(start_s % 60):02d},{int((start_s % 1)*1000):03d}"
-                end_hms   = f"{int(end_s // 3600):02d}:{int((end_s % 3600) // 60):02d}:{int(end_s % 60):02d},{int((end_s % 1)*1000):03d}"
-                f.write(f"{i}\n")
-                f.write(f"{start_hms} --> {end_hms}\n")
-                f.write(f"{line.strip()}\n\n")
-        logger.info("SRT aligned with real speech chunks")
-        return
-
-    time_per_line = (total_duration_s - 1.0) / num_lines if num_lines > 0 else 5.0
-    with open(subtitle_file, "w", encoding="utf-8") as f:
-        current_time = 0.5
-        raw_pairs = []
+    spans = None
+    if segment_timings:
+        spans = _spans_from_segment_timings(
+            clean_text,
+            lines,
+            [item[0] for item in segment_timings],
+            [(item[1], item[2]) for item in segment_timings],
+        )
+        if spans:
+            logger.info("SRT aligned with synthesized segment timings")
+    if spans is None:
+        spans = _spans_from_speech_chunks(nonsilent_chunks, lines, total_duration_s)
+        if spans:
+            logger.info("SRT aligned with detected speech chunks")
+    if spans is None:
+        per_line = max(0.25, (total_duration_s - 1.0) / num_lines)
+        spans = []
+        current_time = min(0.5, max(0.0, total_duration_s - per_line))
         for _ in range(num_lines):
             start_s = current_time
-            end_s = min(start_s + time_per_line, total_duration_s - 0.5)
-            raw_pairs.append((start_s, end_s))
+            end_s = min(start_s + per_line, max(0.05, total_duration_s - 0.05))
+            spans.append((start_s, end_s))
             current_time = end_s
-        norm_pairs = normalize_srt_times(raw_pairs, total_duration_s)
+        logger.info("SRT fallback with silence trim")
+
+    norm_pairs = normalize_srt_times(spans, total_duration_s)
+    with open(subtitle_file, "w", encoding="utf-8") as f:
         for i, line in enumerate(lines, 1):
             start_s, end_s = norm_pairs[i - 1]
-            start_hms = f"{int(start_s // 3600):02d}:{int((start_s % 3600) // 60):02d}:{int(start_s % 60):02d},{int((start_s % 1)*1000):03d}"
-            end_hms   = f"{int(end_s // 3600):02d}:{int((end_s % 3600) // 60):02d}:{int(end_s % 60):02d},{int((end_s % 1)*1000):03d}"
             f.write(f"{i}\n")
-            f.write(f"{start_hms} --> {end_hms}\n")
+            f.write(f"{_format_srt_ts(start_s)} --> {_format_srt_ts(end_s)}\n")
             f.write(f"{line.strip()}\n\n")
-    logger.info("SRT fallback with silence trim")
 
 def _format_srt_ts(seconds: float) -> str:
     s = max(0.0, float(seconds))
@@ -1658,6 +1809,7 @@ async def gtts_voice(
         # Approximate rate: slow=True for slower speech
         slow = voice_rate < 0.8
         segment_word_timings: list[dict] = []
+        segment_timings: list[tuple[str, float, float]] = []
         if sequence_mode:
             tokens = [m.group(0) for m in KARAOKE_WORD_PATTERN.finditer(clean_text or "")]
             if not tokens:
@@ -1705,8 +1857,12 @@ async def gtts_voice(
                     tts.write_to_fp(buffer)
                     buffer.seek(0)
                     seg_audio = AudioSegment.from_file(buffer, format="mp3")
+                    seg_start_ms = cursor_ms
                     combined += seg_audio
                     cursor_ms += len(seg_audio)
+                    segment_timings.append(
+                        (segment, seg_start_ms / 1000.0, cursor_ms / 1000.0)
+                    )
                     if idx < len(segments) - 1:
                         combined += AudioSegment.silent(duration=pause_ms)
                         cursor_ms += pause_ms
@@ -1747,9 +1903,18 @@ async def gtts_voice(
                 )
             return
 
-        build_srt_from_audio(audio, clean_text, subtitle_file)
+        shifted_segment_timings = [
+            (item[0], item[1] + lead_shift_s, item[2] + lead_shift_s)
+            for item in segment_timings
+        ]
+        build_srt_from_audio(
+            audio,
+            clean_text,
+            subtitle_file,
+            segment_timings=shifted_segment_timings or None,
+        )
         if karaoke:
-            words = _karaoke_words_from_subtitle(subtitle_file)
+            words = _karaoke_words_from_subtitle(subtitle_file, audio=audio)
             _write_karaoke_words_file(
                 subtitle_file,
                 "gtts",

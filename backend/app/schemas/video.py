@@ -295,6 +295,16 @@ class ImageSlot(BaseModel):
     sub_end: Optional[int] = Field(default=None, description="0-indexed SRT line index end (inclusive)")
 
 
+class HighlightRegion(BaseModel):
+    """Normalized highlight region used by Interactive Mode answer scenes."""
+    x: float = Field(ge=0.0, le=1.0, description="Left edge, normalized to image width")
+    y: float = Field(ge=0.0, le=1.0, description="Top edge, normalized to image height")
+    width: float = Field(gt=0.0, le=1.0, description="Region width, normalized to image width")
+    height: float = Field(gt=0.0, le=1.0, description="Region height, normalized to image height")
+    shape: str = Field(default="rect", description="rect | ellipse")
+    color: Optional[str] = Field(default="#FFD54F", description="Highlight outline color")
+
+
 class StoryScene(BaseModel):
     """故事场景"""
     script: str = Field(description="场景讲解脚本")
@@ -311,6 +321,12 @@ class StoryScene(BaseModel):
     chinese_translation: Optional[str] = Field(default=None, description="Pre-translated Chinese text for the scene script")
     motion_effect: Optional[str] = Field(default=None, description="Per-scene override: none|pan|zoom_in|zoom_out|auto")
     transition: Optional[str] = Field(default=None, description="Per-scene override: cut|fade|dissolve|iris|wipe")
+    render_mode: Optional[str] = Field(default="normal", description="normal | countdown | answer")
+    countdown_seconds: Optional[int] = Field(default=None, ge=1, le=15)
+    countdown_position: Optional[str] = Field(default="center")
+    countdown_sound: Optional[str] = Field(default="tick_ding")
+    countdown_label: Optional[str] = Field(default="")
+    highlight_regions: List[HighlightRegion] = Field(default_factory=list)
 
 class VideoGenerateRequest(BaseModel):
     """视频生成请求"""
@@ -360,6 +376,21 @@ class TranslateScenesRequest(BaseModel):
     scripts: List[str] = Field(default_factory=list, description="Scene transcripts in timeline order")
 
 
+class InteractiveRound(BaseModel):
+    """One question -> countdown -> answer learning loop."""
+    question_image_url: str = Field(description="Image shown for the question")
+    question_script: str = Field(description="Question narration")
+    question_translation: str = Field(default="", description="Line-aligned Chinese translation")
+    answer_script: str = Field(description="Answer narration")
+    answer_translation: str = Field(default="", description="Line-aligned Chinese translation")
+    answer_image_url: Optional[str] = Field(default=None, description="Optional separate answer image; defaults to question image")
+    countdown_seconds: int = Field(default=5, ge=1, le=15, description="Countdown duration in seconds")
+    countdown_position: str = Field(default="center", description="center|top_left|top_center|top_right|center_left|center_right|bottom_left|bottom|bottom_right")
+    countdown_sound: str = Field(default="tick_ding", description="none|tick|beep|ding|tick_ding")
+    countdown_label: str = Field(default="", description="Optional label shown with the countdown")
+    highlights: List[HighlightRegion] = Field(default_factory=list, description="Answer image highlights")
+
+
 class StoryboardAssembleRequest(BaseModel):
     """第二阶段：视频拼装请求"""
     task_id: str = Field(description="任务ID（Step 1 返回的）")
@@ -381,6 +412,33 @@ class StoryboardAssembleRequest(BaseModel):
     voice_name: Optional[str] = Field(default="default", description="自由模式语音名称")
     voice_rate: float = Field(default=1.0, description="自由模式语音速率")
     language: Optional[str] = Field(default="fixed-en-GB", description="自由模式语音语言")
+
+
+class InteractiveBookend(BaseModel):
+    """Optional intro/outro scene for an interactive video."""
+    image_url: str = Field(description="Image shown for the intro/outro scene")
+    script: str = Field(default="", description="English narration")
+    translation: str = Field(default="", description="Line-aligned Chinese translation")
+
+
+class InteractiveAssembleRequest(BaseModel):
+    """Interactive education video: grouped question/countdown/answer rounds."""
+    task_id: str = Field(description="Task ID returned by create_task")
+    rounds: List[InteractiveRound] = Field(description="Ordered learning rounds")
+    intro: Optional[InteractiveBookend] = Field(default=None, description="Optional intro scene")
+    outro: Optional[InteractiveBookend] = Field(default=None, description="Optional outro scene")
+    resolution: Optional[str] = Field(default="1024*1024", description="Output resolution")
+    chinese_subtitle_enabled: bool = Field(default=True)
+    karaoke: bool = Field(default=True)
+    subtitle_font: Optional[str] = Field(default=None)
+    subtitle_font_size: Optional[int] = Field(default=None)
+    subtitle_color: Optional[str] = Field(default=None)
+    karaoke_highlight_color: Optional[str] = Field(default=None)
+    framing: Optional[str] = Field(default="fit")
+    voice_provider: Optional[str] = Field(default="gtts")
+    voice_name: Optional[str] = Field(default="default")
+    voice_rate: float = Field(default=1.0)
+    language: Optional[str] = Field(default="fixed-en-GB")
 
 
 class VideoGenerateResponse(BaseModel):
