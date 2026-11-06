@@ -100,9 +100,11 @@ def split_string_by_punctuations(s, split_minor_punct: bool = True):
 
 
 def split_text_for_subtitles(s: str) -> list[str]:
+    """Split subtitles at sentence punctuation and at explicit line breaks."""
     return split_string_by_punctuations(s, split_minor_punct=False)
 
-def sanitize_text_for_tts(raw_text: str) -> str:
+def sanitize_text_for_subtitles(raw_text: str) -> str:
+    """Sanitize text while preserving line breaks as forced subtitle breaks."""
     if not raw_text:
         return raw_text
     cleaned = (
@@ -120,8 +122,19 @@ def sanitize_text_for_tts(raw_text: str) -> str:
     )
     cleaned = cleaned.replace("“", '"').replace("”", '"').replace("‘", "'").replace("’", "'")
     cleaned = re.sub(r"(?<!\w)['\"](?!\w)", "", cleaned)
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    return cleaned
+    cleaned = cleaned.replace("\r\n", "\n").replace("\r", "\n")
+    lines = []
+    for raw_line in cleaned.split("\n"):
+        line = re.sub(r"[^\S\n]+", " ", raw_line).strip()
+        if line:
+            lines.append(line)
+    return "\n".join(lines)
+
+
+def sanitize_text_for_tts(raw_text: str) -> str:
+    if not raw_text:
+        return raw_text
+    return re.sub(r"\s+", " ", sanitize_text_for_subtitles(raw_text)).strip()
 
 def expand_contractions(raw_text: str) -> str:
     if not raw_text:
@@ -1718,6 +1731,7 @@ async def generate_voice(
         sentence_pause_ms: int | None = None,
         karaoke: bool = False,
         sequence_mode: bool = False,
+        preserve_line_breaks: bool = False,
         ) -> Tuple[str, str]:
     """生成语音和字幕
 
@@ -1742,7 +1756,15 @@ async def generate_voice(
             logger.info("Using default voice")
     if provider == "edge-tts":
         voice_name = parse_voice_name(voice_name or "")
-        await edge_tts_voice_notwork(text, voice_name, audio_file, subtitle_file, voice_rate, karaoke=karaoke)
+        await edge_tts_voice_notwork(
+            text,
+            voice_name,
+            audio_file,
+            subtitle_file,
+            voice_rate,
+            karaoke=karaoke,
+            preserve_line_breaks=preserve_line_breaks,
+        )
     elif provider in ("google-tts", "google", "google-cloud-tts"):
         await google_cloud_tts_voice(
             text,
@@ -1754,6 +1776,7 @@ async def generate_voice(
             karaoke=karaoke,
             sentence_pause_ms=sentence_pause_ms,
             sequence_mode=sequence_mode,
+            preserve_line_breaks=preserve_line_breaks,
         )
     else:
         await gtts_voice(
@@ -1767,6 +1790,7 @@ async def generate_voice(
             sentence_pause_ms=sentence_pause_ms,
             karaoke=karaoke,
             sequence_mode=sequence_mode,
+            preserve_line_breaks=preserve_line_breaks,
         )
     
     return audio_file, subtitle_file
@@ -1788,6 +1812,7 @@ async def gtts_voice(
     sentence_pause_ms: int | None = None,
     karaoke: bool = False,
     sequence_mode: bool = False,
+    preserve_line_breaks: bool = False,
 ):
     """
     Fallback to gTTS (Google TTS) — stable, no 403 issues.
@@ -1805,6 +1830,7 @@ async def gtts_voice(
 
     try:
         clean_text = sanitize_text_for_tts(text)
+        subtitle_text = sanitize_text_for_subtitles(text) if preserve_line_breaks else clean_text
         tts_text = expand_contractions(clean_text)
         # Approximate rate: slow=True for slower speech
         slow = voice_rate < 0.8
@@ -1842,7 +1868,7 @@ async def gtts_voice(
                     cursor_ms += pause_ms
             combined.export(voice_file, format="mp3")
         else:
-            segments = split_string_by_punctuations(clean_text)
+            segments = split_string_by_punctuations(subtitle_text)
             if len(segments) <= 1:
                 tts = gTTS(text=tts_text, lang="en", tld=tld, slow=slow)
                 tts.save(voice_file)
@@ -1909,7 +1935,7 @@ async def gtts_voice(
         ]
         build_srt_from_audio(
             audio,
-            clean_text,
+            subtitle_text,
             subtitle_file,
             segment_timings=shifted_segment_timings or None,
         )
@@ -1936,8 +1962,10 @@ async def google_cloud_tts_voice(
     karaoke: bool = False,
     sentence_pause_ms: int | None = None,
     sequence_mode: bool = False,
+    preserve_line_breaks: bool = False,
 ):
     clean_text = sanitize_text_for_tts(text)
+    subtitle_text = sanitize_text_for_subtitles(text) if preserve_line_breaks else clean_text
     lang = normalize_language_code(language) or "en-GB"
     if not voice_name:
         candidates = list_google_tts_voices(lang)
@@ -1986,7 +2014,7 @@ async def google_cloud_tts_voice(
                 combined += AudioSegment.silent(duration=pause_ms)
                 cursor_ms += pause_ms
         combined.export(voice_file, format="mp3")
-        build_srt_from_lines_and_words(clean_text, words, subtitle_file)
+        build_srt_from_lines_and_words(subtitle_text, words, subtitle_file)
         if karaoke or sequence_mode:
             _write_karaoke_words_file(
                 subtitle_file,
@@ -2010,7 +2038,7 @@ async def google_cloud_tts_voice(
     # --- Non-karaoke: build SRT from audio silence detection and return ---
     if not karaoke:
         audio = AudioSegment.from_mp3(voice_file)
-        build_srt_from_audio(audio, clean_text, subtitle_file)
+        build_srt_from_audio(audio, subtitle_text, subtitle_file)
         return
 
     # --- Karaoke: try Whisper forced alignment first (best quality) ---
@@ -2019,7 +2047,7 @@ async def google_cloud_tts_voice(
 
     if whisper_words:
         # Whisper success — build precise SRT and karaoke file
-        build_srt_from_lines_and_words(clean_text, whisper_words, subtitle_file)
+        build_srt_from_lines_and_words(subtitle_text, whisper_words, subtitle_file)
         _write_karaoke_words_file(
             subtitle_file,
             "google-tts",
@@ -2032,9 +2060,9 @@ async def google_cloud_tts_voice(
 
     # --- Fallback: per-word synthesis (slower but always precise) ---
     logger.warning("Whisper unavailable, falling back to per-word synthesis for karaoke timing")
-    word_tokens = [m.group(0) for m in KARAOKE_WORD_PATTERN.finditer(clean_text or "")]
+    word_tokens = [m.group(0) for m in KARAOKE_WORD_PATTERN.finditer(subtitle_text or "")]
     if not word_tokens:
-        word_tokens = split_string_by_punctuations(clean_text)
+        word_tokens = split_string_by_punctuations(subtitle_text)
     inter_word_pause_ms = 80
     combined = AudioSegment.empty()
     cursor_ms = 0
@@ -2066,7 +2094,7 @@ async def google_cloud_tts_voice(
             combined += AudioSegment.silent(duration=inter_word_pause_ms)
             cursor_ms += inter_word_pause_ms
     combined.export(voice_file, format="mp3")
-    build_srt_from_lines_and_words(clean_text, words_fallback, subtitle_file)
+    build_srt_from_lines_and_words(subtitle_text, words_fallback, subtitle_file)
     _write_karaoke_words_file(
         subtitle_file,
         "google-tts",
@@ -2085,6 +2113,7 @@ async def edge_tts_voice_notwork(
     subtitle_file: str,
     voice_rate: float = 0,
     karaoke: bool = False,
+    preserve_line_breaks: bool = False,
 ):
     """使用 Edge TTS 生成语音"""
     rate_str = convert_rate_to_percent(voice_rate)
@@ -2103,7 +2132,9 @@ async def edge_tts_voice_notwork(
         # Temporarily patch
         websockets.connect = patched_connect
 
-        communicate = edge_tts.Communicate(text, voice_name, rate=rate_str)
+        tts_text = sanitize_text_for_tts(text) if preserve_line_breaks else text
+        subtitle_text = sanitize_text_for_subtitles(text) if preserve_line_breaks else text
+        communicate = edge_tts.Communicate(tts_text, voice_name, rate=rate_str)
         sub_maker = edge_tts.SubMaker()
         
         karaoke_words: list[dict] = []
@@ -2137,7 +2168,7 @@ async def edge_tts_voice_notwork(
 
         # 生成字幕
         if sub_maker:
-            await generate_subtitle(sub_maker, text, subtitle_file)
+            await generate_subtitle(sub_maker, subtitle_text, subtitle_file)
             if karaoke:
                 timing_source = "word_boundary"
                 timing_quality = "precise"

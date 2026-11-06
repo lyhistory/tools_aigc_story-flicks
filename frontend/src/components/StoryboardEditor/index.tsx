@@ -268,28 +268,32 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
         }));
     };
 
-    // Helper to count lines in script (by sentence delimiters)
-    // Matches backend's split_string_by_punctuations(s, split_minor_punct=False)
+    // Helper to preview subtitle lines. Line breaks in the transcript are hard
+    // breaks; sentence punctuation still splits within each line.
     const getScriptLines = (script: string) => {
         if (!script) return [];
+        const normalized = script.replace(/\r\n?/g, '\n');
         const activePunctuations = ["?", ".", "!", "…", "？", "。", "！", "..."];
         let result: string[] = [];
         let txt = "";
         
-        for (let i = 0; i < script.length; i++) {
-            const char = script[i];
-            
-            // Mirror the backend (sanitize_text_for_tts collapses all whitespace,
-            // newlines included) so these numbered lines match the subtitle lines
-            // the renderer actually indexes. A "\n" is just a space here.
+        for (let i = 0; i < normalized.length; i++) {
+            const char = normalized[i];
+
+            if (char === '\n') {
+                if (txt.trim()) result.push(txt.trim());
+                txt = "";
+                continue;
+            }
+
             if (/\s/.test(char)) {
                 txt += " ";
                 continue;
             }
             
             // Handle numeric decimals like in backend (1.5 should not split)
-            const prev = i > 0 ? script[i-1] : "";
-            const next = i < script.length - 1 ? script[i+1] : "";
+            const prev = i > 0 ? normalized[i-1] : "";
+            const next = i < normalized.length - 1 ? normalized[i+1] : "";
             if (char === "." && /\d/.test(prev) && /\d/.test(next)) {
                 txt += char;
                 continue;
@@ -297,8 +301,8 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
 
             txt += char;
             if (activePunctuations.includes(char)) {
-                while (i + 1 < script.length && ['\'', '"', '”', '’', ')', ']'].includes(script[i+1])) {
-                    txt += script[i+1];
+                while (i + 1 < normalized.length && ['\'', '"', '”', '’', ')', ']'].includes(normalized[i+1])) {
+                    txt += normalized[i+1];
                     i++;
                 }
                 if (txt.trim()) result.push(txt.trim());
@@ -1086,7 +1090,7 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
                                             style={{ fontSize: 13 }}
                                         />
                                         <Text type="secondary" style={{ fontSize: 11 }}>
-                                            {getScriptLines(scene.script).length} subtitle line(s). Voice and subtitles regenerate when you click Generate Video.
+                                            {getScriptLines(scene.script).length} subtitle line(s). Press Enter in the transcript to force a line break. Voice and subtitles regenerate when you click Generate Video.
                                         </Text>
                                     </div>
                                 ) : (
@@ -1125,7 +1129,7 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
                                                 </Button>
                                             </div>
                                             <Text type="secondary" style={{ display: 'block', fontSize: 11, marginBottom: 8 }}>
-                                                One Chinese line per English subtitle line, in the same order. Translate All to Chinese overwrites these lines.
+                                                One Chinese line per English subtitle line, in the same order. Translate All to Chinese overwrites these lines; re-run it after changing line breaks.
                                             </Text>
                                             {englishLines.length === 0 ? (
                                                 <Text type="secondary" style={{ fontSize: 12 }}>

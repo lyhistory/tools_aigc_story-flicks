@@ -17,7 +17,12 @@ from app.schemas.video import (
     RegenerateImageRequest,
 )
 from app.services.llm import llm_service
-from app.services.voice import generate_voice, sanitize_text_for_tts, split_text_for_subtitles
+from app.services.voice import (
+    generate_voice,
+    sanitize_text_for_subtitles,
+    sanitize_text_for_tts,
+    split_text_for_subtitles,
+)
 from app.utils import utils
 from moviepy import (
     VideoFileClip,
@@ -724,15 +729,17 @@ def _scene_voice_signature(
     language: str,
     voice_provider: str,
     karaoke: bool,
+    preserve_line_breaks: bool = False,
 ) -> str:
     payload = {
         "script": getattr(scene, "script", "") or "",
-        "timing_version": 2,
+        "timing_version": 3,
         "voice_name": voice_name or "",
         "voice_rate": voice_rate,
         "language": language or "",
         "voice_provider": (voice_provider or "gtts").lower(),
         "karaoke": bool(karaoke),
+        "preserve_line_breaks": bool(preserve_line_breaks),
         "is_cover": bool(getattr(scene, "is_cover", False)),
         "subject": getattr(scene, "subject", None) or "",
         "topic_type": str(getattr(scene, "topic_type", None) or ""),
@@ -750,6 +757,7 @@ async def generate_scene_assets(
     voice_provider: str,
     karaoke: bool,
     reuse_unchanged: bool = False,
+    preserve_line_breaks: bool = False,
 ):
     """生成每个场景所需的音频和字幕资产 (Step 1)
     """
@@ -762,7 +770,13 @@ async def generate_scene_assets(
             words_file = os.path.join(task_dir, f"{i}.words.json")
             signature_file = os.path.join(task_dir, f"{i}.voice.json")
             signature = _scene_voice_signature(
-                scene, voice_name, voice_rate, language, voice_provider, karaoke
+                scene,
+                voice_name,
+                voice_rate,
+                language,
+                voice_provider,
+                karaoke,
+                preserve_line_breaks,
             )
 
             if reuse_unchanged and os.path.exists(audio_file) and os.path.exists(subtitle_file) and os.path.exists(signature_file):
@@ -805,6 +819,7 @@ async def generate_scene_assets(
                 sentence_pause_ms=sentence_pause_ms,
                 karaoke=(karaoke or is_sequence_scene),
                 sequence_mode=is_sequence_scene,
+                preserve_line_breaks=preserve_line_breaks,
             )
             with open(signature_file, "w", encoding="utf-8") as f:
                 json.dump({"signature": signature}, f, ensure_ascii=False)
@@ -2339,13 +2354,13 @@ Original Machine-Translated Chinese Script:
 def translate_scenes_to_chinese(scripts: List[str]) -> List[str]:
     """Translate each scene into one Chinese line per subtitle line.
 
-    The split mirrors the subtitle pipeline (sanitize whitespace, then split on
-    sentence punctuation) so every line lines up with the SRT renderer.
+    The split mirrors the subtitle pipeline (preserve forced line breaks, then
+    split on sentence punctuation) so every line lines up with the SRT renderer.
     """
     cache: dict[str, str] = {}
     translations: List[str] = []
     for script in scripts:
-        clean_text = sanitize_text_for_tts(script or "")
+        clean_text = sanitize_text_for_subtitles(script or "")
         lines = split_text_for_subtitles(clean_text)
         translated_lines: List[str] = []
         for line in lines:
@@ -2447,6 +2462,7 @@ async def assemble_video_impl(request: "StoryboardAssembleRequest") -> str:
                 voice_provider=request.voice_provider or "gtts",
                 karaoke=request.karaoke,
                 reuse_unchanged=True,
+                preserve_line_breaks=True,
             )
 
 
@@ -2665,6 +2681,7 @@ async def assemble_interactive_impl(request: "InteractiveAssembleRequest") -> st
             voice_provider=request.voice_provider or "gtts",
             karaoke=request.karaoke,
             reuse_unchanged=True,
+            preserve_line_breaks=True,
         )
 
         for scene in scenes:

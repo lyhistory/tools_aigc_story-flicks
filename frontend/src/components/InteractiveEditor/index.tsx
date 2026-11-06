@@ -208,30 +208,36 @@ const ImageSourceControls: React.FC<ImageSourceControlsProps> = ({
     );
 };
 
-// Mirrors the backend's split_string_by_punctuations(s, split_minor_punct=False)
-// so the preview matches the subtitle lines that will actually be rendered.
+// Mirrors the backend subtitle splitter. Newlines are hard breaks; sentence
+// punctuation still splits within each typed line.
 const splitSubtitleLines = (script: string): string[] => {
     if (!script) return [];
+    const normalized = script.replace(/\r\n?/g, '\n');
     const activePunctuations = ['?', '.', '!', '…', '？', '。', '！', '...'];
     const result: string[] = [];
     let current = '';
 
-    for (let i = 0; i < script.length; i += 1) {
-        const char = script[i];
+    for (let i = 0; i < normalized.length; i += 1) {
+        const char = normalized[i];
+        if (char === '\n') {
+            if (current.trim()) result.push(current.trim());
+            current = '';
+            continue;
+        }
         if (/\s/.test(char)) {
             current += ' ';
             continue;
         }
-        const previous = i > 0 ? script[i - 1] : '';
-        const next = i < script.length - 1 ? script[i + 1] : '';
+        const previous = i > 0 ? normalized[i - 1] : '';
+        const next = i < normalized.length - 1 ? normalized[i + 1] : '';
         if (char === '.' && /\d/.test(previous) && /\d/.test(next)) {
             current += char;
             continue;
         }
         current += char;
         if (activePunctuations.includes(char)) {
-            while (i + 1 < script.length && ['\'', '"', '”', '’', ')', ']'].includes(script[i + 1])) {
-                current += script[i + 1];
+            while (i + 1 < normalized.length && ['\'', '"', '”', '’', ')', ']'].includes(normalized[i + 1])) {
+                current += normalized[i + 1];
                 i += 1;
             }
             if (current.trim()) result.push(current.trim());
@@ -258,6 +264,9 @@ const SubtitleLinePreview: React.FC<{ script: string }> = ({ script }) => {
                     </div>
                 ))}
             </div>
+            <Text type="secondary" style={{ fontSize: 11, display: 'block', marginTop: 4 }}>
+                Press Enter in the narration to force a subtitle line break.
+            </Text>
         </div>
     );
 };
@@ -885,7 +894,7 @@ const InteractiveEditor: React.FC<InteractiveEditorProps> = ({
                 <div style={{ marginTop: 8 }}>
                     <Text type="secondary">
                         Chinese translations are aligned one line per English subtitle line. Use “Translate All” after
-                        writing the English narration, then edit any line manually if needed.
+                        writing the English narration, then edit any line manually if needed. Re-run it after changing line breaks.
                     </Text>
                 </div>
             </Card>
