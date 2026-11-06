@@ -327,6 +327,8 @@ class StoryScene(BaseModel):
     countdown_sound: Optional[str] = Field(default="tick_ding")
     countdown_label: Optional[str] = Field(default="")
     highlight_regions: List[HighlightRegion] = Field(default_factory=list)
+    subtitle_font_size: Optional[int] = Field(default=None, ge=16, le=200, description="Per-scene subtitle font size override (px)")
+    subtitle_position: Optional[str] = Field(default=None, description="Per-scene subtitle position: bottom|center|top|bottom_left|bottom_right|top_left|top_right|center_left|center_right")
 
 class VideoGenerateRequest(BaseModel):
     """视频生成请求"""
@@ -389,6 +391,8 @@ class InteractiveRound(BaseModel):
     countdown_sound: str = Field(default="tick_ding", description="none|tick|beep|ding|tick_ding")
     countdown_label: str = Field(default="", description="Optional label shown with the countdown")
     highlights: List[HighlightRegion] = Field(default_factory=list, description="Answer image highlights")
+    answer_subtitle_font_size: Optional[int] = Field(default=None, ge=16, le=200, description="Answer subtitle font size override (px)")
+    answer_subtitle_position: Optional[str] = Field(default=None, description="Answer subtitle position")
 
 
 class StoryboardAssembleRequest(BaseModel):

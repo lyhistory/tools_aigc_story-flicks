@@ -89,6 +89,18 @@ const COUNTDOWN_SOUND_OPTIONS = [
     { value: 'none', label: 'Silent' },
 ];
 
+const ANSWER_SUBTITLE_POSITION_OPTIONS = [
+    { value: 'bottom', label: 'Bottom (default)' },
+    { value: 'center', label: 'Middle' },
+    { value: 'top', label: 'Top' },
+    { value: 'bottom_left', label: 'Bottom left' },
+    { value: 'bottom_right', label: 'Bottom right' },
+    { value: 'top_left', label: 'Top left' },
+    { value: 'top_right', label: 'Top right' },
+    { value: 'center_left', label: 'Middle left' },
+    { value: 'center_right', label: 'Middle right' },
+];
+
 const HIGHLIGHT_COLORS = ['#FFD54F', '#FF7043', '#4DD0E1', '#81C784', '#F06292', '#FFFFFF'];
 
 const makeRound = (): InteractiveRound => ({
@@ -103,6 +115,8 @@ const makeRound = (): InteractiveRound => ({
     countdown_sound: 'tick_ding',
     countdown_label: '',
     highlights: [],
+    answer_subtitle_font_size: null,
+    answer_subtitle_position: 'bottom',
 });
 
 const getRequestError = (error: unknown): string => {
@@ -933,6 +947,43 @@ const InteractiveEditor: React.FC<InteractiveEditorProps> = ({
                                         placeholder="Use Translate All, or type one line per English subtitle line"
                                         autoSize={{ minRows: 2, maxRows: 7 }}
                                     />
+                                    <Divider orientation="left" style={{ margin: '16px 0 10px' }}>Answer subtitle</Divider>
+                                    <Row gutter={16}>
+                                        <Col xs={24} md={12}>
+                                            <div style={{ marginBottom: 6 }}>
+                                                Font size
+                                                {round.answer_subtitle_font_size
+                                                    ? ' (this answer only)'
+                                                    : ` (global ${subtitleFontSize}px)`}
+                                            </div>
+                                            <Space.Compact style={{ width: '100%' }}>
+                                                <InputNumber
+                                                    min={16}
+                                                    max={160}
+                                                    value={round.answer_subtitle_font_size ?? subtitleFontSize}
+                                                    onChange={(value) => updateRound(roundIndex, {
+                                                        answer_subtitle_font_size: typeof value === 'number' ? value : null,
+                                                    })}
+                                                    style={{ width: '100%' }}
+                                                />
+                                                <Button
+                                                    disabled={!round.answer_subtitle_font_size}
+                                                    onClick={() => updateRound(roundIndex, { answer_subtitle_font_size: null })}
+                                                >
+                                                    Global
+                                                </Button>
+                                            </Space.Compact>
+                                        </Col>
+                                        <Col xs={24} md={12}>
+                                            <div style={{ marginBottom: 6 }}>Position</div>
+                                            <Select
+                                                value={round.answer_subtitle_position || 'bottom'}
+                                                onChange={(value) => updateRound(roundIndex, { answer_subtitle_position: value })}
+                                                style={{ width: '100%' }}
+                                                options={ANSWER_SUBTITLE_POSITION_OPTIONS}
+                                            />
+                                        </Col>
+                                    </Row>
                                     {answerImage && !round.answer_image_url && (
                                         <Text type="secondary" style={{ display: 'block', marginTop: 8 }}>
                                             The answer will use the question image until you upload a separate one.

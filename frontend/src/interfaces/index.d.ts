@@ -114,6 +114,8 @@ interface InteractiveRound {
     countdown_sound: string;
     countdown_label: string;
     highlights: InteractiveHighlight[];
+    answer_subtitle_font_size?: number | null;
+    answer_subtitle_position?: string | null;
 }
 
 interface InteractiveBookend {

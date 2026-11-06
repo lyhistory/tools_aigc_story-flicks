@@ -492,6 +492,60 @@ def _countdown_overlay_position(
     )
 
 
+SUBTITLE_POSITION_ANCHORS = {
+    "top_left": (0.07, 0.10, "left", "top"),
+    "top_center": (0.50, 0.10, "center", "top"),
+    "top_right": (0.93, 0.10, "right", "top"),
+    "center_left": (0.07, 0.50, "left", "center"),
+    "center": (0.50, 0.50, "center", "center"),
+    "center_right": (0.93, 0.50, "right", "center"),
+    "bottom_left": (0.07, 0.90, "left", "bottom"),
+    "bottom": (0.50, 0.90, "center", "bottom"),
+    "bottom_right": (0.93, 0.90, "right", "bottom"),
+}
+
+
+def _subtitle_overlay_position(
+    position: str | None,
+    image_width: int,
+    image_height: int,
+    overlay_width: int,
+    overlay_height: int,
+) -> tuple[int, int]:
+    """Return the top-left pixel position for a subtitle block.
+
+    The default bottom placement keeps the historical layout; explicit
+    positions use a 3x3 anchor grid so short answers can be moved.
+    """
+    key = (position or "bottom").strip().lower()
+    if key in ("", "bottom"):
+        return (
+            max(0, (image_width - overlay_width) // 2),
+            max(0, int(image_height * 0.95 - overlay_height - 50)),
+        )
+    ax, _, align_x, align_y = SUBTITLE_POSITION_ANCHORS.get(
+        key,
+        SUBTITLE_POSITION_ANCHORS["bottom"],
+    )
+    anchor_x = int(image_width * ax)
+    if align_x == "left":
+        x = anchor_x
+    elif align_x == "right":
+        x = anchor_x - overlay_width
+    else:
+        x = anchor_x - overlay_width // 2
+    if align_y == "top":
+        y = int(image_height * 0.10)
+    elif align_y == "bottom":
+        y = int(image_height * 0.95) - overlay_height - 50
+    else:
+        y = int(image_height * 0.50) - overlay_height // 2
+    return (
+        max(0, min(image_width - overlay_width, x)),
+        max(0, min(image_height - overlay_height, y)),
+    )
+
+
 def _apply_highlight_regions(image_file: str, regions) -> None:
     """Dim outside and outline answer highlights directly in the scene image."""
     if not regions or not os.path.exists(image_file):
@@ -1237,6 +1291,8 @@ async def render_final_video(
         i = getattr(scene, "original_index", None) or __i
         scene_motion = (getattr(scene, "motion_effect", None) or motion_effect).strip().lower()
         scene_transition = (getattr(scene, "transition", None) or transition).strip().lower()
+        scene_subtitle_font_size = getattr(scene, "subtitle_font_size", None)
+        scene_subtitle_position = getattr(scene, "subtitle_position", None)
         scene_transitions.append(scene_transition)
         try:
             # 获取文件路径
@@ -1627,7 +1683,10 @@ async def render_final_video(
                                 sub_stroke_w = max(3, int(origin_image_h * 0.008))
                                 sub_stroke_fill = "#FFFFFF"
                             else:
-                                sub_font_size = subtitle_font_size or 58
+                                sub_font_size = int(
+                                    scene_subtitle_font_size or subtitle_font_size or 58
+                                )
+                                sub_font_size = max(16, min(200, sub_font_size))
                                 sub_color = subtitle_color or "#F472B6"
                                 # A matching outline keeps any chosen colour crisp
                                 # on busy art instead of looking washed out.
@@ -1653,10 +1712,15 @@ async def render_final_video(
                             ):
                                 zh_phrase = zh_translations[item_idx - 1] if (item_idx - 1) < len(zh_translations) and zh_translations[item_idx - 1] else translate_to_zh(phrase)
                                 if zh_phrase:
+                                    zh_font_size = (
+                                        max(18, int(sub_font_size * 0.42))
+                                        if scene_subtitle_font_size
+                                        else max(20, int(origin_image_h * 0.024))
+                                    )
                                     zh_sub_img = render_text_rgba(
                                         zh_phrase,
                                         chinese_subtitle_font_path,
-                                        max(20, int(origin_image_h * 0.024)),
+                                        zh_font_size,
                                         "#F8FAFC",
                                         max_width=int(origin_image_w * 0.85),
                                         bg_rgba=(0, 0, 0, 0),
@@ -1705,6 +1769,28 @@ async def render_final_video(
                                     )
                                     if kara_img is not None:
                                         sub_karaoke_imgs[token_idx] = kara_img
+                            # A very large per-scene size can make a single long
+                            # word wider than the frame. Scale the rendered block
+                            # down proportionally instead of clipping its edge.
+                            if sub_img is not None and sub_img.width > origin_image_w:
+                                scale = origin_image_w / float(sub_img.width)
+                                sub_img = sub_img.resize(
+                                    (
+                                        origin_image_w,
+                                        max(1, int(sub_img.height * scale)),
+                                    ),
+                                    Image.LANCZOS,
+                                )
+                                for token_idx, kara_img in list(sub_karaoke_imgs.items()):
+                                    if kara_img is None:
+                                        continue
+                                    sub_karaoke_imgs[token_idx] = kara_img.resize(
+                                        (
+                                            max(1, int(kara_img.width * scale)),
+                                            max(1, int(kara_img.height * scale)),
+                                        ),
+                                        Image.LANCZOS,
+                                    )
                             kw_img = None
                             if kw:
                                 word = (kw.get("word") or "").strip()
@@ -1727,11 +1813,19 @@ async def render_final_video(
                                     shown_keyword_words.add(word_key)
                             if sub_img is None and kw_img is None:
                                 continue
-                            sub_x = (origin_image_w - sub_img.width) // 2 if sub_img else 0
+                            sub_w = sub_img.width if sub_img else 0
+                            sub_h = sub_img.height if sub_img else 0
                             if is_sequence_scene:
-                                sub_y = (origin_image_h - (sub_img.height if sub_img else 0)) // 2
+                                sub_x = (origin_image_w - sub_w) // 2
+                                sub_y = (origin_image_h - sub_h) // 2
                             else:
-                                sub_y = int(origin_image_h * 0.95 - (sub_img.height if sub_img else 0) - 50)
+                                sub_x, sub_y = _subtitle_overlay_position(
+                                    scene_subtitle_position,
+                                    origin_image_w,
+                                    origin_image_h,
+                                    sub_w,
+                                    sub_h,
+                                )
                             kw_x = (origin_image_w - kw_img.width) // 2 if kw_img else 0
                             kw_y = 20
                             subtitle_items.append(
@@ -2526,6 +2620,8 @@ async def assemble_interactive_impl(request: "InteractiveAssembleRequest") -> st
                     transition="cut",
                     render_mode="answer",
                     highlight_regions=list(round_item.highlights),
+                    subtitle_font_size=round_item.answer_subtitle_font_size,
+                    subtitle_position=round_item.answer_subtitle_position,
                 )
             )
             next_index = answer_idx + 1
