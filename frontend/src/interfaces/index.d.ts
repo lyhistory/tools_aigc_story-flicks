@@ -145,8 +145,8 @@ interface GrammarCheckResult {
 interface InteractiveAssembleReq {
     task_id: string;
     rounds: InteractiveRound[];
-    intro?: InteractiveBookend | null;
-    outro?: InteractiveBookend | null;
+    intros?: InteractiveBookend[];
+    outros?: InteractiveBookend[];
     resolution?: string;
     chinese_subtitle_enabled?: boolean;
     karaoke?: boolean;

@@ -273,35 +273,28 @@ const SubtitleLinePreview: React.FC<{ script: string }> = ({ script }) => {
 
 interface BookendSceneCardProps {
     title: string;
-    addLabel: string;
-    hint: string;
     taskId: string;
-    value: InteractiveBookend | null;
-    onChange: (value: InteractiveBookend | null) => void;
+    value: InteractiveBookend;
+    onChange: (value: InteractiveBookend) => void;
+    onRemove: () => void;
+    onMoveUp: () => void;
+    onMoveDown: () => void;
+    canMoveUp: boolean;
+    canMoveDown: boolean;
 }
 
 const BookendSceneCard: React.FC<BookendSceneCardProps> = ({
     title,
-    addLabel,
-    hint,
     taskId,
     value,
     onChange,
+    onRemove,
+    onMoveUp,
+    onMoveDown,
+    canMoveUp,
+    canMoveDown,
 }) => {
     const [translating, setTranslating] = useState(false);
-
-    if (!value) {
-        return (
-            <Card size="small" style={{ marginBottom: 18 }}>
-                <Space wrap>
-                    <Button type="dashed" onClick={() => onChange({ image_url: '', script: '', translation: '' })}>
-                        {addLabel}
-                    </Button>
-                    <Text type="secondary">{hint}</Text>
-                </Space>
-            </Card>
-        );
-    }
 
     const translate = async () => {
         if (!value.script.trim()) {
@@ -330,10 +323,12 @@ const BookendSceneCard: React.FC<BookendSceneCardProps> = ({
             style={{ marginBottom: 18 }}
             extra={(
                 <Space>
+                    <Button size="small" icon={<ArrowUpOutlined />} disabled={!canMoveUp} onClick={onMoveUp} />
+                    <Button size="small" icon={<ArrowDownOutlined />} disabled={!canMoveDown} onClick={onMoveDown} />
                     <Button size="small" icon={<TranslationOutlined />} loading={translating} onClick={translate}>
                         Translate
                     </Button>
-                    <Button size="small" danger icon={<DeleteOutlined />} onClick={() => onChange(null)}>
+                    <Button size="small" danger icon={<DeleteOutlined />} onClick={onRemove}>
                         Remove
                     </Button>
                 </Space>
@@ -368,7 +363,7 @@ const BookendSceneCard: React.FC<BookendSceneCardProps> = ({
                     <Input.TextArea
                         value={value.script}
                         onChange={(event) => onChange({ ...value, script: event.target.value })}
-                        placeholder={title === 'Intro scene'
+                        placeholder={title.startsWith('Intro')
                             ? 'Welcome! Today we will play a guessing game.'
                             : 'Great job! See you next time.'}
                         autoSize={{ minRows: 3, maxRows: 7 }}
@@ -384,6 +379,75 @@ const BookendSceneCard: React.FC<BookendSceneCardProps> = ({
                 </Col>
             </Row>
         </Card>
+    );
+};
+
+interface BookendListProps {
+    label: string;
+    addLabel: string;
+    hint: string;
+    taskId: string;
+    items: InteractiveBookend[];
+    onChange: (items: InteractiveBookend[]) => void;
+}
+
+const BookendList: React.FC<BookendListProps> = ({
+    label,
+    addLabel,
+    hint,
+    taskId,
+    items,
+    onChange,
+}) => {
+    const add = () => onChange([...items, { image_url: '', script: '', translation: '' }]);
+    const update = (index: number, value: InteractiveBookend) => {
+        onChange(items.map((item, itemIndex) => (itemIndex === index ? value : item)));
+    };
+    const remove = (index: number) => {
+        onChange(items.filter((_, itemIndex) => itemIndex !== index));
+    };
+    const move = (index: number, direction: -1 | 1) => {
+        const target = index + direction;
+        if (target < 0 || target >= items.length) return;
+        const next = [...items];
+        [next[index], next[target]] = [next[target], next[index]];
+        onChange(next);
+    };
+
+    if (items.length === 0) {
+        return (
+            <Card size="small" style={{ marginBottom: 18 }}>
+                <Space wrap>
+                    <Button type="dashed" onClick={add}>{addLabel}</Button>
+                    <Text type="secondary">{hint}</Text>
+                </Space>
+            </Card>
+        );
+    }
+
+    return (
+        <>
+            {items.map((item, index) => (
+                <BookendSceneCard
+                    key={`${label}-${index}`}
+                    title={`${label} ${index + 1}`}
+                    taskId={taskId}
+                    value={item}
+                    onChange={(value) => update(index, value)}
+                    onRemove={() => remove(index)}
+                    onMoveUp={() => move(index, -1)}
+                    onMoveDown={() => move(index, 1)}
+                    canMoveUp={index > 0}
+                    canMoveDown={index < items.length - 1}
+                />
+            ))}
+            <Card size="small" style={{ marginBottom: 18 }}>
+                <Space wrap>
+                    <Button type="dashed" icon={<PlusOutlined />} onClick={add}>{addLabel}</Button>
+                    <Text type="secondary">{hint}</Text>
+                </Space>
+            </Card>
+        </>
     );
 };
 
@@ -409,8 +473,8 @@ const InteractiveEditor: React.FC<InteractiveEditorProps> = ({
     const [draftRect, setDraftRect] = useState<DraftRect | null>(null);
     const [translatingAll, setTranslatingAll] = useState(false);
     const [translatingRound, setTranslatingRound] = useState<number | null>(null);
-    const [intro, setIntro] = useState<InteractiveBookend | null>(null);
-    const [outro, setOutro] = useState<InteractiveBookend | null>(null);
+    const [intros, setIntros] = useState<InteractiveBookend[]>([]);
+    const [outros, setOutros] = useState<InteractiveBookend[]>([]);
     const [narrationRate, setNarrationRate] = useState(voiceRate ?? 0.9);
     const [grammarIssues, setGrammarIssues] = useState<GrammarIssue[]>([]);
     const [grammarLabels, setGrammarLabels] = useState<string[]>([]);
@@ -476,9 +540,9 @@ const InteractiveEditor: React.FC<InteractiveEditorProps> = ({
 
     const translateAll = async () => {
         const scripts: string[] = [];
-        if (intro) scripts.push(intro.script);
+        intros.forEach((item) => scripts.push(item.script));
         rounds.forEach((round) => scripts.push(round.question_script, round.answer_script));
-        if (outro) scripts.push(outro.script);
+        outros.forEach((item) => scripts.push(item.script));
         if (!scripts.some((script) => script.trim())) {
             message.warning('Write some English narration first.');
             return;
@@ -491,18 +555,24 @@ const InteractiveEditor: React.FC<InteractiveEditorProps> = ({
             }
             const translations = res.data.translations;
             let offset = 0;
-            if (intro) {
-                setIntro((previous) => (previous ? { ...previous, translation: translations[0] || '' } : previous));
-                offset = 1;
+            if (intros.length > 0) {
+                setIntros((previous) => previous.map((item, index) => ({
+                    ...item,
+                    translation: translations[index] || '',
+                })));
+                offset = intros.length;
             }
             setRounds((previous) => previous.map((round, index) => ({
                 ...round,
                 question_translation: translations[offset + index * 2] || '',
                 answer_translation: translations[offset + index * 2 + 1] || '',
             })));
-            if (outro) {
-                const outroIndex = scripts.length - 1;
-                setOutro((previous) => (previous ? { ...previous, translation: translations[outroIndex] || '' } : previous));
+            if (outros.length > 0) {
+                const outroOffset = offset + rounds.length * 2;
+                setOutros((previous) => previous.map((item, index) => ({
+                    ...item,
+                    translation: translations[outroOffset + index] || '',
+                })));
             }
             message.success('All English narration translated line by line');
         } catch (error: unknown) {
@@ -577,20 +647,20 @@ const InteractiveEditor: React.FC<InteractiveEditorProps> = ({
     const collectTranscripts = () => {
         const texts: string[] = [];
         const labels: string[] = [];
-        if (intro) {
-            texts.push(intro.script);
-            labels.push('Intro');
-        }
+        intros.forEach((item, index) => {
+            texts.push(item.script);
+            labels.push(`Intro ${index + 1}`);
+        });
         rounds.forEach((round, index) => {
             texts.push(round.question_script);
             labels.push(`Round ${index + 1} question`);
             texts.push(round.answer_script);
             labels.push(`Round ${index + 1} answer`);
         });
-        if (outro) {
-            texts.push(outro.script);
-            labels.push('Outro');
-        }
+        outros.forEach((item, index) => {
+            texts.push(item.script);
+            labels.push(`Outro ${index + 1}`);
+        });
         return { texts, labels };
     };
 
@@ -630,30 +700,31 @@ const InteractiveEditor: React.FC<InteractiveEditorProps> = ({
 
     const handleApplyGrammarFixes = (choices: Record<string, string>) => {
         const grouped = groupGrammarIssues(grammarIssues);
+        const introOffset = intros.length;
         const roundIssues = rounds.map((_, index) => {
-            const offset = (intro ? 1 : 0) + index * 2;
+            const offset = introOffset + index * 2;
             return {
                 question: grouped.get(offset) || [],
                 answer: grouped.get(offset + 1) || [],
             };
         });
-        if (intro) {
-            const introIssues = grouped.get(0) || [];
-            setIntro((previous) => (previous
-                ? { ...previous, script: applyGrammarFixesToText(previous.script, introIssues, choices) }
-                : previous));
+        if (intros.length > 0) {
+            setIntros((previous) => previous.map((item, index) => ({
+                ...item,
+                script: applyGrammarFixesToText(item.script, grouped.get(index) || [], choices),
+            })));
         }
         setRounds((previous) => previous.map((round, index) => ({
             ...round,
             question_script: applyGrammarFixesToText(round.question_script, roundIssues[index]?.question || [], choices),
             answer_script: applyGrammarFixesToText(round.answer_script, roundIssues[index]?.answer || [], choices),
         })));
-        if (outro) {
-            const outroIndex = (intro ? 1 : 0) + rounds.length * 2;
-            const outroIssues = grouped.get(outroIndex) || [];
-            setOutro((previous) => (previous
-                ? { ...previous, script: applyGrammarFixesToText(previous.script, outroIssues, choices) }
-                : previous));
+        if (outros.length > 0) {
+            const outroOffset = introOffset + rounds.length * 2;
+            setOutros((previous) => previous.map((item, index) => ({
+                ...item,
+                script: applyGrammarFixesToText(item.script, grouped.get(outroOffset + index) || [], choices),
+            })));
         }
         const fixedCount = grammarIssues.filter((issue) => (
             issue.replacements.length === 1 || Boolean(choices[grammarIssueKey(issue)])
@@ -676,12 +747,22 @@ const InteractiveEditor: React.FC<InteractiveEditorProps> = ({
             message.warning(`Round ${missingRound + 1} is missing its ${missing}.`);
             return;
         }
-        const invalidBookend = [
-            { label: 'Intro', value: intro },
-            { label: 'Outro', value: outro },
-        ].find(({ value }) => value && (!value.image_url.trim() || !value.script.trim()));
-        if (invalidBookend) {
-            message.warning(`${invalidBookend.label} scene needs both an image and English narration.`);
+        const invalidIntro = intros.findIndex(
+            (item) => !item.image_url.trim() || !item.script.trim()
+        );
+        if (invalidIntro >= 0) {
+            message.warning(
+                `Intro scene ${invalidIntro + 1} needs both an image and English narration.`
+            );
+            return;
+        }
+        const invalidOutro = outros.findIndex(
+            (item) => !item.image_url.trim() || !item.script.trim()
+        );
+        if (invalidOutro >= 0) {
+            message.warning(
+                `Outro scene ${invalidOutro + 1} needs both an image and English narration.`
+            );
             return;
         }
         const { texts, labels } = collectTranscripts();
@@ -693,8 +774,8 @@ const InteractiveEditor: React.FC<InteractiveEditorProps> = ({
             const res = await assembleInteractive({
                 task_id: taskId,
                 rounds,
-                intro,
-                outro,
+                intros,
+                outros,
                 resolution,
                 chinese_subtitle_enabled: chineseSubtitleEnabled,
                 karaoke,
@@ -899,13 +980,13 @@ const InteractiveEditor: React.FC<InteractiveEditorProps> = ({
                 </div>
             </Card>
 
-            <BookendSceneCard
-                title="Intro scene"
+            <BookendList
+                label="Intro"
                 addLabel="Add intro scene"
-                hint="Optional: shown before the first round."
+                hint="Optional: shown before the first round. Add as many as you need."
                 taskId={taskId}
-                value={intro}
-                onChange={setIntro}
+                items={intros}
+                onChange={setIntros}
             />
 
             {rounds.map((round, roundIndex) => {
@@ -1150,13 +1231,13 @@ const InteractiveEditor: React.FC<InteractiveEditorProps> = ({
                 );
             })}
 
-            <BookendSceneCard
-                title="Outro scene"
+            <BookendList
+                label="Outro"
                 addLabel="Add outro scene"
-                hint="Optional: shown after the last round."
+                hint="Optional: shown after the last round. Add as many as you need."
                 taskId={taskId}
-                value={outro}
-                onChange={setOutro}
+                items={outros}
+                onChange={setOutros}
             />
 
             <Card style={{ marginBottom: 24 }}>

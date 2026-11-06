@@ -434,8 +434,10 @@ class InteractiveAssembleRequest(BaseModel):
     """Interactive education video: grouped question/countdown/answer rounds."""
     task_id: str = Field(description="Task ID returned by create_task")
     rounds: List[InteractiveRound] = Field(description="Ordered learning rounds")
-    intro: Optional[InteractiveBookend] = Field(default=None, description="Optional intro scene")
-    outro: Optional[InteractiveBookend] = Field(default=None, description="Optional outro scene")
+    intros: List[InteractiveBookend] = Field(default_factory=list, description="Optional intro scenes, shown in order")
+    outros: List[InteractiveBookend] = Field(default_factory=list, description="Optional outro scenes, shown in order")
+    intro: Optional[InteractiveBookend] = Field(default=None, description="Deprecated: single intro scene")
+    outro: Optional[InteractiveBookend] = Field(default=None, description="Deprecated: single outro scene")
     resolution: Optional[str] = Field(default="1024*1024", description="Output resolution")
     chinese_subtitle_enabled: bool = Field(default=True)
     karaoke: bool = Field(default=True)

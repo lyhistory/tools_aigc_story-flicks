@@ -2558,8 +2558,11 @@ async def assemble_interactive_impl(request: "InteractiveAssembleRequest") -> st
             )
             next_index += 1
 
+        intro_items = list(request.intros)
         if request.intro is not None:
-            append_bookend(request.intro, "Intro scene")
+            intro_items.insert(0, request.intro)
+        for intro_index, bookend in enumerate(intro_items, 1):
+            append_bookend(bookend, f"Intro scene {intro_index}")
 
         for round_index, round_item in enumerate(request.rounds, 1):
             question_script = (round_item.question_script or "").strip()
@@ -2642,15 +2645,18 @@ async def assemble_interactive_impl(request: "InteractiveAssembleRequest") -> st
             )
             next_index = answer_idx + 1
 
+        outro_items = list(request.outros)
         if request.outro is not None:
-            append_bookend(request.outro, "Outro scene")
+            outro_items.append(request.outro)
+        for outro_index, bookend in enumerate(outro_items, 1):
+            append_bookend(bookend, f"Outro scene {outro_index}")
 
         story_file = os.path.join(task_dir, "story.json")
         story_data = {
             "task_id": task_id,
             "mode": "interactive",
-            "intro": request.intro.model_dump() if request.intro else None,
-            "outro": request.outro.model_dump() if request.outro else None,
+            "intros": [bookend.model_dump() for bookend in intro_items],
+            "outros": [bookend.model_dump() for bookend in outro_items],
             "rounds": [round_item.model_dump() for round_item in request.rounds],
             "scenes": [scene.model_dump() for scene in scenes],
         }
@@ -2661,8 +2667,8 @@ async def assemble_interactive_impl(request: "InteractiveAssembleRequest") -> st
                 {
                     "task_id": task_id,
                     "resolution": request.resolution,
-                    "intro": request.intro.model_dump() if request.intro else None,
-                    "outro": request.outro.model_dump() if request.outro else None,
+                    "intros": [bookend.model_dump() for bookend in intro_items],
+                    "outros": [bookend.model_dump() for bookend in outro_items],
                     "rounds": [round_item.model_dump() for round_item in request.rounds],
                 },
                 f,
