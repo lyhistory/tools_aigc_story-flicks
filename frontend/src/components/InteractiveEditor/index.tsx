@@ -26,8 +26,10 @@ import {
     TranslationOutlined,
     UploadOutlined,
 } from '@ant-design/icons';
-import { assembleInteractive, getSubtitleFonts, translateScenes, uploadImage } from '../../services/index';
+import { assembleInteractive, checkTranscripts, getSubtitleFonts, translateScenes, uploadImage } from '../../services/index';
 import { useVideoStore } from '../../stores';
+import GrammarCheckModal from '../GrammarCheckModal';
+import { applyGrammarFixesToText, grammarIssueKey, groupGrammarIssues } from '../../utils/grammar';
 
 const { Text } = Typography;
 
@@ -59,7 +61,7 @@ interface DraftRect {
     currentY: number;
 }
 
-const DEFAULT_FONT = 'NotoSans-Bold';
+const DEFAULT_FONT = 'UbuntuCondensed';
 const DEFAULT_HIGHLIGHT_COLOR = '#FFD54F';
 
 const VOICE_RATE_OPTIONS = [
@@ -390,7 +392,7 @@ const InteractiveEditor: React.FC<InteractiveEditorProps> = ({
     const [rounds, setRounds] = useState<InteractiveRound[]>(() => [makeRound()]);
     const [fontOptions, setFontOptions] = useState<FontOption[]>([]);
     const [subtitleFont, setSubtitleFont] = useState(DEFAULT_FONT);
-    const [subtitleFontSize, setSubtitleFontSize] = useState(58);
+    const [subtitleFontSize, setSubtitleFontSize] = useState(32);
     const [subtitleColor, setSubtitleColor] = useState('#F472B6');
     const [framing, setFraming] = useState<'fit' | 'fill'>('fit');
     const [highlightShape, setHighlightShape] = useState<HighlightShape>('rect');
@@ -401,6 +403,8 @@ const InteractiveEditor: React.FC<InteractiveEditorProps> = ({
     const [intro, setIntro] = useState<InteractiveBookend | null>(null);
     const [outro, setOutro] = useState<InteractiveBookend | null>(null);
     const [narrationRate, setNarrationRate] = useState(voiceRate ?? 0.9);
+    const [grammarIssues, setGrammarIssues] = useState<GrammarIssue[]>([]);
+    const [grammarLabels, setGrammarLabels] = useState<string[]>([]);
     const { setVideoUrl, assembling, setAssembling } = useVideoStore();
 
     useEffect(() => {
@@ -410,7 +414,7 @@ const InteractiveEditor: React.FC<InteractiveEditorProps> = ({
                 setSubtitleFont(res.data.default || DEFAULT_FONT);
             }
         }).catch(() => {
-            setFontOptions([{ id: DEFAULT_FONT, label: 'Noto Sans Bold', default: true }]);
+            setFontOptions([{ id: DEFAULT_FONT, label: 'Ubuntu Condensed', default: true }]);
         });
     }, []);
 
@@ -561,6 +565,94 @@ const InteractiveEditor: React.FC<InteractiveEditorProps> = ({
         )));
     };
 
+    const collectTranscripts = () => {
+        const texts: string[] = [];
+        const labels: string[] = [];
+        if (intro) {
+            texts.push(intro.script);
+            labels.push('Intro');
+        }
+        rounds.forEach((round, index) => {
+            texts.push(round.question_script);
+            labels.push(`Round ${index + 1} question`);
+            texts.push(round.answer_script);
+            labels.push(`Round ${index + 1} answer`);
+        });
+        if (outro) {
+            texts.push(outro.script);
+            labels.push('Outro');
+        }
+        return { texts, labels };
+    };
+
+    const runGrammarCheck = async (texts: string[], labels: string[]): Promise<boolean> => {
+        message.loading({ content: 'Checking grammar and spelling...', key: 'grammar-check' });
+        try {
+            const res = await checkTranscripts(texts);
+            if (!res.success || !res.data) {
+                throw new Error(res.message || 'Grammar check failed');
+            }
+            if (!res.data.checked) {
+                message.warning({
+                    content: 'Grammar check is unavailable right now, so it was skipped.',
+                    key: 'grammar-check',
+                });
+                return true;
+            }
+            if (res.data.issues.length > 0) {
+                setGrammarIssues(res.data.issues);
+                setGrammarLabels(labels);
+                message.warning({
+                    content: `Found ${res.data.issues.length} grammar/spelling issue(s). Fix them before generating.`,
+                    key: 'grammar-check',
+                });
+                return false;
+            }
+            message.success({ content: 'Transcript check passed.', key: 'grammar-check' });
+            return true;
+        } catch (error: unknown) {
+            message.warning({
+                content: `Grammar check skipped: ${getRequestError(error)}`,
+                key: 'grammar-check',
+            });
+            return true;
+        }
+    };
+
+    const handleApplyGrammarFixes = (choices: Record<string, string>) => {
+        const grouped = groupGrammarIssues(grammarIssues);
+        const roundIssues = rounds.map((_, index) => {
+            const offset = (intro ? 1 : 0) + index * 2;
+            return {
+                question: grouped.get(offset) || [],
+                answer: grouped.get(offset + 1) || [],
+            };
+        });
+        if (intro) {
+            const introIssues = grouped.get(0) || [];
+            setIntro((previous) => (previous
+                ? { ...previous, script: applyGrammarFixesToText(previous.script, introIssues, choices) }
+                : previous));
+        }
+        setRounds((previous) => previous.map((round, index) => ({
+            ...round,
+            question_script: applyGrammarFixesToText(round.question_script, roundIssues[index]?.question || [], choices),
+            answer_script: applyGrammarFixesToText(round.answer_script, roundIssues[index]?.answer || [], choices),
+        })));
+        if (outro) {
+            const outroIndex = (intro ? 1 : 0) + rounds.length * 2;
+            const outroIssues = grouped.get(outroIndex) || [];
+            setOutro((previous) => (previous
+                ? { ...previous, script: applyGrammarFixesToText(previous.script, outroIssues, choices) }
+                : previous));
+        }
+        const fixedCount = grammarIssues.filter((issue) => (
+            issue.replacements.length === 1 || Boolean(choices[grammarIssueKey(issue)])
+        )).length;
+        setGrammarIssues([]);
+        message.success(`Applied ${fixedCount} suggestion(s). Review the text, then generate again.`);
+    };
+
     const handleGenerate = async () => {
         const missingRound = rounds.findIndex((round) => (
             !round.question_image_url.trim()
@@ -583,6 +675,9 @@ const InteractiveEditor: React.FC<InteractiveEditorProps> = ({
             message.warning(`${invalidBookend.label} scene needs both an image and English narration.`);
             return;
         }
+        const { texts, labels } = collectTranscripts();
+        const passed = await runGrammarCheck(texts, labels);
+        if (!passed) return;
         setAssembling(true);
         message.loading({ content: 'Rendering interactive video...', key: 'interactive-assemble' });
         try {
@@ -1070,6 +1165,14 @@ const InteractiveEditor: React.FC<InteractiveEditorProps> = ({
                     </Button>
                 </Space>
             </Card>
+
+            <GrammarCheckModal
+                open={grammarIssues.length > 0}
+                issues={grammarIssues}
+                labels={grammarLabels}
+                onClose={() => setGrammarIssues([])}
+                onApplySuggestions={handleApplyGrammarFixes}
+            />
         </div>
     );
 };

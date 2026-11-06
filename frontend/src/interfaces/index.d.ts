@@ -124,6 +124,24 @@ interface InteractiveBookend {
     translation: string;
 }
 
+interface GrammarIssue {
+    text_index: number;
+    offset: number;
+    length: number;
+    original: string;
+    message: string;
+    short_message: string;
+    category: string;
+    rule_id: string;
+    replacements: string[];
+}
+
+interface GrammarCheckResult {
+    checked: boolean;
+    issues: GrammarIssue[];
+    reason: string | null;
+}
+
 interface InteractiveAssembleReq {
     task_id: string;
     rounds: InteractiveRound[];

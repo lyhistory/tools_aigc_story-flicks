@@ -378,6 +378,11 @@ class TranslateScenesRequest(BaseModel):
     scripts: List[str] = Field(default_factory=list, description="Scene transcripts in timeline order")
 
 
+class GrammarCheckRequest(BaseModel):
+    """Check manually entered English transcripts for spelling/grammar issues."""
+    texts: List[str] = Field(default_factory=list, description="Transcripts in editor order")
+
+
 class InteractiveRound(BaseModel):
     """One question -> countdown -> answer learning loop."""
     question_image_url: str = Field(description="Image shown for the question")

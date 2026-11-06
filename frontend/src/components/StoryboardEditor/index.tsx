@@ -1,8 +1,10 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Button, Card, Typography, Space, Popconfirm, message, Modal, Slider, Image, Select, Badge, Spin, Input, Upload, Divider, ColorPicker, Tooltip, Empty } from 'antd';
 import { DeleteOutlined, ReloadOutlined, SwapOutlined, CheckCircleFilled, UploadOutlined, LinkOutlined, PlusOutlined, ArrowUpOutlined, ArrowDownOutlined, TranslationOutlined } from '@ant-design/icons';
-import { assembleVideo, regenerateImage, getSubtitleFonts, retranslateScript, uploadImage, translateScenes } from '../../services/index';
+import { assembleVideo, checkTranscripts, regenerateImage, getSubtitleFonts, retranslateScript, uploadImage, translateScenes } from '../../services/index';
 import { useVideoStore } from '../../stores/index';
+import GrammarCheckModal from '../GrammarCheckModal';
+import { applyGrammarFixesToText, grammarIssueKey, groupGrammarIssues } from '../../utils/grammar';
 
 const { Text } = Typography;
 
@@ -47,8 +49,8 @@ const FONT_STYLE_MAP: Record<string, React.CSSProperties> = {
     'UbuntuCondensed': { fontWeight: 400, letterSpacing: '-0.02em' },
 };
 
-const DEFAULT_FONT = 'NotoSans-Bold';
-const DEFAULT_FONT_SIZE = 58;
+const DEFAULT_FONT = 'UbuntuCondensed';
+const DEFAULT_FONT_SIZE = 32;
 
 const getRequestError = (error: unknown): string => {
     const maybe = error as { response?: { data?: { message?: string } }; message?: string };
@@ -137,6 +139,8 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
     const [fontOptions, setFontOptions] = useState<FontOption[]>([]);
     const [selectedFont, setSelectedFont] = useState<string>(DEFAULT_FONT);
     const [fontSize, setFontSize] = useState<number>(DEFAULT_FONT_SIZE);
+    const [grammarIssues, setGrammarIssues] = useState<GrammarIssue[]>([]);
+    const [grammarLabels, setGrammarLabels] = useState<string[]>([]);
     const [subtitleColor, setSubtitleColor] = useState<string>('#F472B6');
     const [karaokeHighlightColor, setKaraokeHighlightColor] = useState<string>('#FFFF00');
     const [motionEffect, setMotionEffect] = useState<MotionEffect>('auto');
@@ -473,6 +477,53 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
         }
     };
 
+    const runGrammarCheck = async (texts: string[], labels: string[]): Promise<boolean> => {
+        message.loading({ content: 'Checking grammar and spelling...', key: 'grammar-check' });
+        try {
+            const res = await checkTranscripts(texts);
+            if (!res.success || !res.data) {
+                throw new Error(res.message || 'Grammar check failed');
+            }
+            if (!res.data.checked) {
+                message.warning({
+                    content: 'Grammar check is unavailable right now, so it was skipped.',
+                    key: 'grammar-check',
+                });
+                return true;
+            }
+            if (res.data.issues.length > 0) {
+                setGrammarIssues(res.data.issues);
+                setGrammarLabels(labels);
+                message.warning({
+                    content: `Found ${res.data.issues.length} grammar/spelling issue(s). Fix them before generating.`,
+                    key: 'grammar-check',
+                });
+                return false;
+            }
+            message.success({ content: 'Transcript check passed.', key: 'grammar-check' });
+            return true;
+        } catch (error: unknown) {
+            message.warning({
+                content: `Grammar check skipped: ${getRequestError(error)}`,
+                key: 'grammar-check',
+            });
+            return true;
+        }
+    };
+
+    const handleApplyGrammarFixes = (choices: Record<string, string>) => {
+        const grouped = groupGrammarIssues(grammarIssues);
+        setScenes((previous) => previous.map((scene, index) => ({
+            ...scene,
+            script: applyGrammarFixesToText(scene.script || '', grouped.get(index) || [], choices),
+        })));
+        const fixedCount = grammarIssues.filter((issue) => (
+            issue.replacements.length === 1 || Boolean(choices[grammarIssueKey(issue)])
+        )).length;
+        setGrammarIssues([]);
+        message.success(`Applied ${fixedCount} suggestion(s). Review the transcript, then generate again.`);
+    };
+
     const handleAssemble = async () => {
         if (scenes.length === 0) {
             message.warning("Timeline is empty! Cannot assemble empty video.");
@@ -493,6 +544,11 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
                 message.warning(`Scene ${missingImage + 1} has no image. Upload or select an image first.`);
                 return;
             }
+            const passed = await runGrammarCheck(
+                scenes.map((scene) => scene.script || ''),
+                scenes.map((_, index) => `Scene ${index + 1}`),
+            );
+            if (!passed) return;
         }
         setAssembling(true);
         message.loading({
@@ -717,7 +773,7 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
                 <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
                     <Text style={{ whiteSpace: 'nowrap' }}>Font Size: <b>{fontSize}px</b></Text>
                     <Slider
-                        min={36}
+                        min={32}
                         max={100}
                         step={2}
                         value={fontSize}
@@ -1232,6 +1288,14 @@ const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
                     />
                 </div>
             </Modal>
+
+            <GrammarCheckModal
+                open={grammarIssues.length > 0}
+                issues={grammarIssues}
+                labels={grammarLabels}
+                onClose={() => setGrammarIssues([])}
+                onApplySuggestions={handleApplyGrammarFixes}
+            />
         </div>
     );
 };

@@ -834,7 +834,7 @@ SUBTITLE_FONT_MAP = {
     "SuperScribble": ("SuperScribble-pg3qr.ttf",),
     "UbuntuCondensed": ("UbuntuCondensed-Regular.ttf",),
 }
-DEFAULT_SUBTITLE_FONT = "NotoSans-Bold"
+DEFAULT_SUBTITLE_FONT = "UbuntuCondensed"
 
 
 def resolve_subtitle_font(font_name: str | None) -> str:
@@ -1684,7 +1684,7 @@ async def render_final_video(
                                 sub_stroke_fill = "#FFFFFF"
                             else:
                                 sub_font_size = int(
-                                    scene_subtitle_font_size or subtitle_font_size or 58
+                                    scene_subtitle_font_size or subtitle_font_size or 32
                                 )
                                 sub_font_size = max(16, min(200, sub_font_size))
                                 sub_color = subtitle_color or "#F472B6"

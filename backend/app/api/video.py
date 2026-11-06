@@ -135,8 +135,9 @@ async def regenerate_image_endpoint(request: RegenerateImageRequest):
             message=str(e)
         )
 
-from app.schemas.video import RetranslateScriptRequest, TranslateScenesRequest
+from app.schemas.video import GrammarCheckRequest, RetranslateScriptRequest, TranslateScenesRequest
 from app.services.video import retranslate_script_impl, translate_scenes_to_chinese
+from app.services.grammar import check_english_texts
 
 @router.post("/retranslate_script")
 async def retranslate_script_endpoint(request: RetranslateScriptRequest):
@@ -166,6 +167,20 @@ async def translate_scenes_endpoint(request: TranslateScenesRequest):
         )
     except Exception as e:
         logger.error(f"Failed to translate scenes: {str(e)}")
+        return VideoGenerateResponse(
+            success=False,
+            message=str(e)
+        )
+
+
+@router.post("/check_transcripts")
+async def check_transcripts_endpoint(request: GrammarCheckRequest):
+    """Check manually entered English transcripts before video generation."""
+    try:
+        result = await asyncio.to_thread(check_english_texts, request.texts)
+        return VideoGenerateResponse(success=True, data=result)
+    except Exception as e:
+        logger.error(f"Failed to check transcripts: {str(e)}")
         return VideoGenerateResponse(
             success=False,
             message=str(e)
@@ -207,7 +222,11 @@ async def upload_image_endpoint(
 async def get_subtitle_fonts():
     """Return available subtitle font options."""
     fonts = [
-        {"id": key, "label": key.replace("NotoSans-", "Noto Sans ").replace("-", " "), "default": key == DEFAULT_SUBTITLE_FONT}
+        {
+            "id": key,
+            "label": key.replace("NotoSans-", "Noto Sans ").replace("UbuntuCondensed", "Ubuntu Condensed").replace("-", " "),
+            "default": key == DEFAULT_SUBTITLE_FONT,
+        }
         for key in SUBTITLE_FONT_MAP.keys()
     ]
     return {"success": True, "data": {"fonts": fonts, "default": DEFAULT_SUBTITLE_FONT}}

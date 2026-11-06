@@ -107,6 +107,14 @@ export async function translateScenes(scripts: string[]): Promise<{ success: boo
     });
 }
 
+export async function checkTranscripts(texts: string[]): Promise<{ success: boolean; data?: GrammarCheckResult; message?: string | null }> {
+    return request({
+        url: "/api/video/check_transcripts",
+        method: "post",
+        data: { texts },
+    });
+}
+
 // ========================
 // Social Publisher
 // ========================
