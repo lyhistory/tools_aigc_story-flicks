@@ -1049,6 +1049,7 @@ async def _generate_camera_assets(
     voice_rate: float,
     language: str,
     voice_provider: str,
+    karaoke: bool = False,
     preserve_line_breaks: bool = True,
 ):
     """Generate one voice clip + SRT per camera step."""
@@ -1071,7 +1072,7 @@ async def _generate_camera_assets(
             subtitle_file,
             language,
             voice_provider,
-            karaoke=False,
+            karaoke=karaoke,
             preserve_line_breaks=preserve_line_breaks,
         )
 
@@ -1101,6 +1102,7 @@ async def generate_scene_assets(
                     voice_rate=voice_rate,
                     language=language,
                     voice_provider=voice_provider,
+                    karaoke=karaoke,
                     preserve_line_breaks=True,
                 )
                 continue
@@ -1783,6 +1785,17 @@ async def render_final_video(
                     except Exception:
                         continue
                     zh_lines = [line.strip() for line in (getattr(step, "translation", "") or "").split("\n")]
+                    words_path = os.path.join(task_dir, f"{i}_step{step_index}.words.json")
+                    step_karaoke_words, step_karaoke_quality = (
+                        load_karaoke_words(words_path) if karaoke else ([], "unknown")
+                    )
+                    step_karaoke_enabled = bool(karaoke) and step_karaoke_quality == "precise"
+                    if karaoke and not step_karaoke_enabled:
+                        logger.info(
+                            f"Camera scene {i} step {step_index}: karaoke disabled "
+                            f"because timing quality is '{step_karaoke_quality}'"
+                        )
+                    karaoke_word_ptr = 0
                     for line_index, ((start_s, end_s), text) in enumerate(step_subs, 1):
                         phrase = clean_subtitle_text(text)
                         if not phrase:
@@ -1812,16 +1825,57 @@ async def render_final_video(
                         sub_img = stack_subtitle_images(sub_img_en, zh_sub_img, gap=6)
                         if sub_img is None:
                             continue
+                        phrase_tokens = tokenize_karaoke_words(phrase)
+                        karaoke_words_line: list[dict] = []
+                        if step_karaoke_enabled and phrase_tokens:
+                            karaoke_words_line, karaoke_word_ptr = _align_karaoke_words(
+                                phrase_tokens,
+                                step_karaoke_words,
+                                karaoke_word_ptr,
+                                float(start_s),
+                                float(end_s),
+                            )
+                        sub_karaoke_imgs: dict[int, Image.Image] = {}
+                        if step_karaoke_enabled and karaoke_words_line:
+                            for word_info in karaoke_words_line:
+                                token_idx = int(word_info["token_index"])
+                                kara_img_en = render_text_rgba(
+                                    phrase,
+                                    font_path,
+                                    sub_font_size,
+                                    sub_color,
+                                    max_width=int(target_w * 0.9),
+                                    bg_rgba=(0, 0, 0, 0),
+                                    highlight_token_index=token_idx,
+                                    highlight_bg_rgba=parsed_highlight_bg_rgba,
+                                    highlight_text_color=readable_text_on(parsed_highlight_bg_rgba),
+                                    stroke_width=sub_stroke_w,
+                                    stroke_fill=sub_stroke_fill,
+                                )
+                                kara_img = stack_subtitle_images(kara_img_en, zh_sub_img, gap=6)
+                                if kara_img is not None:
+                                    sub_karaoke_imgs[token_idx] = kara_img
                         sub_x, sub_y = _subtitle_overlay_position(
                             "bottom", target_w, target_h, sub_img.width, sub_img.height
                         )
+                        step_offset = hold_starts[step_index - 1]
+                        absolute_words = [
+                            {
+                                **word_info,
+                                "start": float(word_info["start"]) + step_offset,
+                                "end": float(word_info["end"]) + step_offset,
+                            }
+                            for word_info in karaoke_words_line
+                        ]
                         camera_subtitles.append({
-                            "start": hold_starts[step_index - 1] + float(start_s),
-                            "end": hold_starts[step_index - 1] + float(end_s),
+                            "start": step_offset + float(start_s),
+                            "end": step_offset + float(end_s),
                             "sub_img": sub_img,
                             "sub_pos": (sub_x, sub_y),
                             "kw_img": None,
                             "kw_pos": (0, 0),
+                            "karaoke_words": absolute_words,
+                            "sub_karaoke_imgs": sub_karaoke_imgs,
                         })
 
                 def _camera_with_subs(t: float, _frame_fn=_camera_frame, _items=camera_subtitles):

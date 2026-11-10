@@ -9,6 +9,7 @@ import {
     Input,
     InputNumber,
     message,
+    Modal,
     Popconfirm,
     Row,
     Select,
@@ -204,6 +205,7 @@ interface ImageSourceControlsProps {
     onClear?: () => void;
     clearLabel?: string;
     showClear?: boolean;
+    currentUrl?: string;
 }
 
 const ImageSourceControls: React.FC<ImageSourceControlsProps> = ({
@@ -212,6 +214,7 @@ const ImageSourceControls: React.FC<ImageSourceControlsProps> = ({
     onClear,
     clearLabel = 'Clear image',
     showClear = false,
+    currentUrl = '',
 }) => {
     const [externalUrl, setExternalUrl] = useState('');
     const [uploading, setUploading] = useState(false);
@@ -262,6 +265,35 @@ const ImageSourceControls: React.FC<ImageSourceControlsProps> = ({
                 enterButton="Use URL"
                 allowClear
             />
+            {currentUrl && (
+                <div
+                    style={{
+                        display: 'flex',
+                        gap: 10,
+                        alignItems: 'center',
+                        padding: 8,
+                        background: '#F8FAFC',
+                        border: '1px solid #E2E8F0',
+                        borderRadius: 8,
+                    }}
+                >
+                    <img
+                        src={currentUrl}
+                        alt="Selected image"
+                        style={{
+                            width: 112,
+                            height: 84,
+                            objectFit: 'contain',
+                            background: '#0F172A',
+                            borderRadius: 6,
+                            flex: '0 0 auto',
+                        }}
+                    />
+                    <Text type="secondary" style={{ fontSize: 11, wordBreak: 'break-all' }}>
+                        {currentUrl}
+                    </Text>
+                </div>
+            )}
         </Space>
     );
 };
@@ -639,9 +671,371 @@ const SpotlightPreview: React.FC<SpotlightPreviewProps> = ({
     );
 };
 
+interface CameraSequencePreviewProps {
+    open: boolean;
+    sequence: InteractiveCameraSequence;
+    resolution: string;
+    onClose: () => void;
+}
+
+interface CameraPreviewSegment {
+    kind: 'hold' | 'travel';
+    start: number;
+    end: number;
+    index: number;
+}
+
+const easeCameraPreview = (value: number) => (
+    value < 0.5 ? 2 * value * value : 1 - Math.pow(-2 * value + 2, 2) / 2
+);
+
+const estimateCameraHold = (step: InteractiveCameraStep) => {
+    if (typeof step.hold_seconds === 'number' && step.hold_seconds > 0) return step.hold_seconds;
+    const words = step.script.trim() ? step.script.trim().split(/\s+/).length : 0;
+    return Math.max(1.1, Math.min(6, words * 0.36));
+};
+
+const buildCameraPreviewTimeline = (sequence: InteractiveCameraSequence) => {
+    const segments: CameraPreviewSegment[] = [];
+    let cursor = 0;
+    sequence.steps.forEach((step, index) => {
+        const hold = Math.max(0.4, estimateCameraHold(step));
+        const pause = Math.max(0, Number(step.pause_after) || 0);
+        const holdEnd = cursor + hold + pause;
+        segments.push({ kind: 'hold', start: cursor, end: holdEnd, index });
+        cursor = holdEnd;
+        if (index < sequence.steps.length - 1) {
+            const travel = Math.max(0.2, Number(sequence.travel_seconds) || 1.5);
+            segments.push({ kind: 'travel', start: cursor, end: cursor + travel, index });
+            cursor += travel;
+        }
+    });
+    return { segments, duration: Math.max(0.1, cursor) };
+};
+
+const parsePreviewAspect = (resolution: string) => {
+    const match = /^(\d+)\s*[*xX]\s*(\d+)$/.exec((resolution || '').trim());
+    if (!match) return 1;
+    const width = Number(match[1]);
+    const height = Number(match[2]);
+    if (!width || !height) return 1;
+    return Math.max(0.4, Math.min(2.5, width / height));
+};
+
+const CameraSequencePreview: React.FC<CameraSequencePreviewProps> = ({
+    open,
+    sequence,
+    resolution,
+    onClose,
+}) => {
+    const canvasRef = useRef<HTMLCanvasElement>(null);
+    const imagesRef = useRef(new Map<string, HTMLImageElement>());
+    const preparedCacheRef = useRef(new Map<string, HTMLCanvasElement>());
+    const offsetRef = useRef(0);
+    const playingRef = useRef(true);
+    const timelineRef = useRef(buildCameraPreviewTimeline(sequence));
+    timelineRef.current = buildCameraPreviewTimeline(sequence);
+
+    const [imagesReady, setImagesReady] = useState(false);
+    const [playing, setPlaying] = useState(true);
+    const [elapsed, setElapsed] = useState(0);
+
+    const canvasWidth = 720;
+    const canvasHeight = Math.max(320, Math.min(720, Math.round(canvasWidth / parsePreviewAspect(resolution))));
+    const imageSignature = [sequence.base_image_url, ...sequence.steps.map((step) => step.image_url || '')].join('|');
+    const sequenceSignature = JSON.stringify(sequence);
+
+    useEffect(() => {
+        playingRef.current = playing;
+    }, [playing]);
+
+    useEffect(() => {
+        if (!open) return;
+        offsetRef.current = 0;
+        setElapsed(0);
+        setPlaying(true);
+        playingRef.current = true;
+    }, [open]);
+
+    useEffect(() => {
+        if (!open) return;
+        const urls = Array.from(new Set(
+            [sequence.base_image_url, ...sequence.steps.map((step) => step.image_url || '')].filter(Boolean),
+        ));
+        let cancelled = false;
+        setImagesReady(false);
+        preparedCacheRef.current.clear();
+        Promise.all(urls.map((url) => new Promise<void>((resolve) => {
+            const image = new Image();
+            image.onload = () => {
+                imagesRef.current.set(url, image);
+                resolve();
+            };
+            image.onerror = () => resolve();
+            image.src = url;
+        }))).then(() => {
+            if (!cancelled) setImagesReady(true);
+        });
+        return () => {
+            cancelled = true;
+        };
+    }, [open, imageSignature, canvasHeight]);
+
+    const getPrepared = (url: string) => {
+        if (!url) return null;
+        const cacheKey = `${sequence.fit_mode}|${canvasWidth}x${canvasHeight}|${url}`;
+        const cached = preparedCacheRef.current.get(cacheKey);
+        if (cached) return cached;
+        const image = imagesRef.current.get(url);
+        if (!image) return null;
+        const canvas = document.createElement('canvas');
+        canvas.width = canvasWidth;
+        canvas.height = canvasHeight;
+        const context = canvas.getContext('2d');
+        if (!context) return null;
+        const coverScale = Math.max(canvasWidth / image.width, canvasHeight / image.height);
+        if (sequence.fit_mode === 'contain') {
+            context.save();
+            context.filter = 'blur(18px) brightness(0.55)';
+            context.drawImage(
+                image,
+                (canvasWidth - image.width * coverScale) / 2,
+                (canvasHeight - image.height * coverScale) / 2,
+                image.width * coverScale,
+                image.height * coverScale,
+            );
+            context.restore();
+            const containScale = Math.min(canvasWidth / image.width, canvasHeight / image.height);
+            context.drawImage(
+                image,
+                (canvasWidth - image.width * containScale) / 2,
+                (canvasHeight - image.height * containScale) / 2,
+                image.width * containScale,
+                image.height * containScale,
+            );
+        } else {
+            context.drawImage(
+                image,
+                (canvasWidth - image.width * coverScale) / 2,
+                (canvasHeight - image.height * coverScale) / 2,
+                image.width * coverScale,
+                image.height * coverScale,
+            );
+        }
+        preparedCacheRef.current.set(cacheKey, canvas);
+        return canvas;
+    };
+
+    const drawCameraImage = (
+        context: CanvasRenderingContext2D,
+        prepared: HTMLCanvasElement,
+        zoomValue: number,
+        centerX: number,
+        centerY: number,
+    ) => {
+        const zoom = Math.max(1, zoomValue);
+        const viewWidth = canvasWidth / zoom;
+        const viewHeight = canvasHeight / zoom;
+        const left = Math.max(0, Math.min(canvasWidth - viewWidth, centerX * canvasWidth - viewWidth / 2));
+        const top = Math.max(0, Math.min(canvasHeight - viewHeight, centerY * canvasHeight - viewHeight / 2));
+        context.drawImage(prepared, left, top, viewWidth, viewHeight, 0, 0, canvasWidth, canvasHeight);
+    };
+
+    const drawArrows = (
+        context: CanvasRenderingContext2D,
+        index: number,
+        progress: number,
+        zoomValue: number,
+        centerX: number,
+        centerY: number,
+        moving: boolean,
+    ) => {
+        const style = (sequence.arrow_style || 'none').toLowerCase();
+        if (style === 'none' || sequence.steps.length < 2) return;
+        const zoom = Math.max(1, zoomValue);
+        const project = (x: number, y: number): [number, number] => [
+            (x * canvasWidth - centerX * canvasWidth) * zoom + canvasWidth / 2,
+            (y * canvasHeight - centerY * canvasHeight) * zoom + canvasHeight / 2,
+        ];
+        const color = sequence.arrow_color || '#F59E0B';
+        context.save();
+        if (style === 'route' || style === 'both') {
+            context.beginPath();
+            context.setLineDash([10, 7]);
+            context.lineWidth = 3;
+            context.strokeStyle = color;
+            sequence.steps.forEach((step, stepIndex) => {
+                const [px, py] = project(step.x, step.y);
+                if (stepIndex === 0) context.moveTo(px, py);
+                else context.lineTo(px, py);
+            });
+            context.stroke();
+            context.setLineDash([]);
+        }
+        if ((style === 'chevron' || style === 'both') && moving && index < sequence.steps.length - 1) {
+            const from = sequence.steps[index];
+            const to = sequence.steps[index + 1];
+            const [x1, y1] = project(from.x, from.y);
+            const [x2, y2] = project(to.x, to.y);
+            const midX = x1 + (x2 - x1) * progress;
+            const midY = y1 + (y2 - y1) * progress;
+            const angle = Math.atan2(y2 - y1, x2 - x1);
+            context.translate(midX, midY);
+            context.rotate(angle);
+            context.strokeStyle = color;
+            context.lineWidth = 4;
+            context.lineCap = 'round';
+            [-9, 5].forEach((shift) => {
+                context.beginPath();
+                context.moveTo(shift - 7, -10);
+                context.lineTo(shift + 5, 0);
+                context.lineTo(shift - 7, 10);
+                context.stroke();
+            });
+        }
+        context.restore();
+    };
+
+    const drawPreview = (time: number) => {
+        const canvas = canvasRef.current;
+        const context = canvas?.getContext('2d');
+        if (!canvas || !context) return;
+        context.clearRect(0, 0, canvasWidth, canvasHeight);
+        context.fillStyle = '#0F172A';
+        context.fillRect(0, 0, canvasWidth, canvasHeight);
+        const steps = sequence.steps;
+        if (!steps.length) return;
+        const timeline = timelineRef.current;
+        const segment = timeline.segments.find((item, index) => (
+            time < item.end || index === timeline.segments.length - 1
+        )) || timeline.segments[0];
+        if (!segment) return;
+        const current = steps[segment.index];
+        let zoom = Math.max(1, Number(current.zoom) || 1);
+        let centerX = current.x;
+        let centerY = current.y;
+        let progress = 0;
+        if (segment.kind === 'travel') {
+            const next = steps[segment.index + 1];
+            progress = easeCameraPreview(Math.max(0, Math.min(1, (time - segment.start) / Math.max(1e-6, segment.end - segment.start))));
+            zoom = (Number(current.zoom) || 1) + ((Number(next.zoom) || 1) - (Number(current.zoom) || 1)) * progress;
+            centerX = current.x + (next.x - current.x) * progress;
+            centerY = current.y + (next.y - current.y) * progress;
+        }
+        const currentUrl = current.image_url || sequence.base_image_url;
+        const preparedCurrent = getPrepared(currentUrl);
+        if (!preparedCurrent) return;
+        if (segment.kind === 'travel' && steps[segment.index + 1]) {
+            const nextUrl = steps[segment.index + 1].image_url || sequence.base_image_url;
+            const preparedNext = getPrepared(nextUrl);
+            if (preparedNext && nextUrl !== currentUrl) {
+                const swap = (steps[segment.index + 1].swap_style || 'crossfade').toLowerCase();
+                if (swap === 'cut') {
+                    drawCameraImage(context, progress < 0.5 ? preparedCurrent : preparedNext, zoom, centerX, centerY);
+                } else if (swap === 'circle_reveal') {
+                    drawCameraImage(context, preparedCurrent, zoom, centerX, centerY);
+                    context.save();
+                    context.beginPath();
+                    const radius = progress * Math.hypot(canvasWidth, canvasHeight) * 0.75;
+                    context.arc(centerX * canvasWidth, centerY * canvasHeight, radius, 0, Math.PI * 2);
+                    context.clip();
+                    drawCameraImage(context, preparedNext, zoom, centerX, centerY);
+                    context.restore();
+                } else {
+                    drawCameraImage(context, preparedCurrent, zoom, centerX, centerY);
+                    context.save();
+                    context.globalAlpha = progress;
+                    drawCameraImage(context, preparedNext, zoom, centerX, centerY);
+                    context.restore();
+                }
+            } else {
+                drawCameraImage(context, preparedCurrent, zoom, centerX, centerY);
+            }
+        } else {
+            drawCameraImage(context, preparedCurrent, zoom, centerX, centerY);
+        }
+        drawArrows(context, segment.index, progress, zoom, centerX, centerY, segment.kind === 'travel');
+    };
+
+    useEffect(() => {
+        if (!open || !imagesReady) return;
+        let frame = 0;
+        let last = performance.now();
+        const tick = (now: number) => {
+            const delta = Math.min(0.1, Math.max(0, (now - last) / 1000));
+            last = now;
+            if (playingRef.current) {
+                const next = Math.min(timelineRef.current.duration, offsetRef.current + delta);
+                offsetRef.current = next;
+                setElapsed(next);
+                if (next >= timelineRef.current.duration) {
+                    setPlaying(false);
+                }
+            }
+            drawPreview(offsetRef.current);
+            frame = requestAnimationFrame(tick);
+        };
+        frame = requestAnimationFrame(tick);
+        return () => cancelAnimationFrame(frame);
+    }, [open, imagesReady, sequenceSignature]);
+
+    const seek = (value: number) => {
+        offsetRef.current = value;
+        setElapsed(value);
+        drawPreview(value);
+    };
+    const restart = () => {
+        offsetRef.current = 0;
+        setElapsed(0);
+        setPlaying(true);
+    };
+    const activeSegment = timelineRef.current.segments.find((item, index) => (
+        elapsed < item.end || index === timelineRef.current.segments.length - 1
+    ));
+    const activeStep = activeSegment ? activeSegment.index + 1 : 1;
+
+    return (
+        <Modal
+            open={open}
+            onCancel={onClose}
+            footer={null}
+            width={860}
+            title="Camera sequence preview"
+        >
+            <div style={{ background: '#0F172A', borderRadius: 10, padding: 10, display: 'flex', justifyContent: 'center' }}>
+                <canvas
+                    ref={canvasRef}
+                    width={canvasWidth}
+                    height={canvasHeight}
+                    style={{ width: '100%', maxWidth: 720, borderRadius: 8 }}
+                />
+            </div>
+            <div style={{ marginTop: 12, display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+                <Button onClick={() => setPlaying((previous) => !previous)}>{playing ? 'Pause' : 'Play'}</Button>
+                <Button onClick={restart}>Restart</Button>
+                <Text type="secondary">Step {activeStep} / {sequence.steps.length}</Text>
+                <Text type="secondary">{elapsed.toFixed(2)}s / {timelineRef.current.duration.toFixed(2)}s</Text>
+            </div>
+            <Slider
+                min={0}
+                max={timelineRef.current.duration}
+                step={0.01}
+                value={elapsed}
+                onChange={seek}
+                tooltip={{ formatter: (value) => `${Number(value).toFixed(2)}s` }}
+            />
+            <Text type="secondary" style={{ fontSize: 12 }}>
+                Preview timing is estimated from each step&apos;s hold time and narration length.
+                The final video uses the generated voice duration.
+            </Text>
+        </Modal>
+    );
+};
+
 interface CameraSequenceCardProps {
     title: string;
     taskId: string;
+    resolution: string;
     value: InteractiveCameraSequence;
     onChange: (value: InteractiveCameraSequence) => void;
     onRemove: () => void;
@@ -656,6 +1050,7 @@ interface CameraSequenceCardProps {
 const CameraSequenceCard: React.FC<CameraSequenceCardProps> = ({
     title,
     taskId,
+    resolution,
     value,
     onChange,
     onRemove,
@@ -666,6 +1061,7 @@ const CameraSequenceCard: React.FC<CameraSequenceCardProps> = ({
     onTranslate,
     translating,
 }) => {
+    const [previewOpen, setPreviewOpen] = useState(false);
     const imageRef = useRef<HTMLDivElement>(null);
     const draggingIndexRef = useRef<number | null>(null);
     const [selectedStep, setSelectedStep] = useState<number | null>(null);
@@ -783,6 +1179,9 @@ const CameraSequenceCard: React.FC<CameraSequenceCardProps> = ({
                     onMoveDown={onMoveDown}
                     onRemove={onRemove}
                 >
+                    <Button size="small" onClick={() => setPreviewOpen(true)} disabled={!value.base_image_url || !value.steps.length}>
+                        Preview
+                    </Button>
                     <Button size="small" icon={<TranslationOutlined />} loading={translating} onClick={onTranslate}>
                         Translate
                     </Button>
@@ -1117,6 +1516,7 @@ const CameraSequenceCard: React.FC<CameraSequenceCardProps> = ({
                                             showClear={!!step.image_url}
                                             clearLabel="Clear detail image"
                                             onClear={() => updateStep(index, { image_url: '' })}
+                                            currentUrl={step.image_url || ''}
                                         />
                                         {!step.image_url && (
                                             <Text type="danger" style={{ fontSize: 12 }}>
@@ -1147,6 +1547,12 @@ const CameraSequenceCard: React.FC<CameraSequenceCardProps> = ({
                     </Card>
                 );
             })}
+            <CameraSequencePreview
+                open={previewOpen}
+                sequence={value}
+                resolution={resolution}
+                onClose={() => setPreviewOpen(false)}
+            />
         </Card>
     );
 };
@@ -2128,6 +2534,7 @@ const InteractiveTimelineEditor: React.FC<InteractiveEditorProps> = ({
                     key={block.id}
                     title={blockLabel(block, index)}
                     taskId={taskId}
+                    resolution={resolution}
                     value={block.camera}
                     onChange={(camera) => updateCamera(block.id, camera)}
                     onRemove={() => removeBlock(block.id)}
