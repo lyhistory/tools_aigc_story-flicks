@@ -102,6 +102,18 @@ interface InteractiveHighlight {
     color: string;
 }
 
+interface InteractiveQuestionSpotlight {
+    enabled: boolean;
+    regions: InteractiveHighlight[];
+    mask_style: 'dim' | 'blur' | 'solid';
+    mask_opacity: number;
+    blur_radius: number;
+    feather: number;
+    outline: boolean;
+    answer_reveal: 'cut' | 'expand';
+    reveal_seconds: number;
+}
+
 interface InteractiveRound {
     question_image_url: string;
     question_script: string;
@@ -116,13 +128,47 @@ interface InteractiveRound {
     highlights: InteractiveHighlight[];
     answer_subtitle_font_size?: number | null;
     answer_subtitle_position?: string | null;
+    question_spotlight?: InteractiveQuestionSpotlight | null;
 }
 
 interface InteractiveBookend {
     image_url: string;
     script: string;
     translation: string;
+    hold_after?: number;
 }
+
+interface InteractiveCameraStep {
+    id?: string;
+    label: string;
+    x: number;
+    y: number;
+    zoom: number;
+    script: string;
+    translation: string;
+    image_url?: string | null;
+    swap_style: 'crossfade' | 'circle_reveal' | 'cut';
+    hold_seconds?: number | null;
+    pause_after: number;
+}
+
+interface InteractiveCameraSequence {
+    preset: 'journey' | 'zoom' | 'custom';
+    base_image_url: string;
+    steps: InteractiveCameraStep[];
+    travel_seconds: number;
+    arrow_style: 'chevron' | 'route' | 'both' | 'none';
+    arrow_color: string;
+    travel_sound: 'none' | 'whoosh' | 'footsteps';
+    fit_mode: 'cover' | 'contain';
+    camera_mode: 'follow' | 'wide';
+}
+
+type InteractiveBlock =
+    | { id: string; kind: 'intro'; intro: InteractiveBookend }
+    | { id: string; kind: 'round'; round: InteractiveRound }
+    | { id: string; kind: 'camera'; camera: InteractiveCameraSequence }
+    | { id: string; kind: 'outro'; outro: InteractiveBookend };
 
 interface GrammarIssue {
     text_index: number;
@@ -144,9 +190,10 @@ interface GrammarCheckResult {
 
 interface InteractiveAssembleReq {
     task_id: string;
-    rounds: InteractiveRound[];
+    rounds?: InteractiveRound[];
     intros?: InteractiveBookend[];
     outros?: InteractiveBookend[];
+    blocks?: InteractiveBlock[];
     resolution?: string;
     chinese_subtitle_enabled?: boolean;
     karaoke?: boolean;

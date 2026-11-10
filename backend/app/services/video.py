@@ -14,6 +14,9 @@ from app.schemas.video import (
     StoryScene,
     StoryboardAssembleRequest,
     InteractiveAssembleRequest,
+    InteractiveBlock,
+    InteractiveBookend,
+    AnswerReveal,
     RegenerateImageRequest,
 )
 from app.services.llm import llm_service
@@ -29,6 +32,7 @@ from moviepy import (
     VideoClip,
     ImageClip,
     AudioFileClip,
+    CompositeAudioClip,
     TextClip,
     CompositeVideoClip,
     concatenate_videoclips,
@@ -617,6 +621,296 @@ def _apply_highlight_regions(image_file: str, regions) -> None:
         logger.warning(f"Could not apply answer highlights to {image_file}: {err}")
 
 
+def _region_mask(width: int, height: int, regions, feather: int = 0) -> Image.Image:
+    """Build an L mask where selected regions are white and everything else is black."""
+    mask = Image.new("L", (width, height), 0)
+    draw = ImageDraw.Draw(mask)
+    for region in regions or []:
+        try:
+            rx = max(0.0, min(1.0, float(getattr(region, "x", 0.0) or 0.0)))
+            ry = max(0.0, min(1.0, float(getattr(region, "y", 0.0) or 0.0)))
+            rw = max(0.005, min(1.0 - rx, float(getattr(region, "width", 0.0) or 0.0)))
+            rh = max(0.005, min(1.0 - ry, float(getattr(region, "height", 0.0) or 0.0)))
+        except (TypeError, ValueError):
+            continue
+        x1, y1 = int(rx * width), int(ry * height)
+        x2, y2 = int((rx + rw) * width), int((ry + rh) * height)
+        if x2 <= x1 or y2 <= y1:
+            continue
+        shape = (getattr(region, "shape", "rect") or "rect").strip().lower()
+        if shape == "ellipse":
+            draw.ellipse([x1, y1, x2, y2], fill=255)
+        else:
+            draw.rounded_rectangle(
+                [x1, y1, x2, y2],
+                radius=max(4, int(min(x2 - x1, y2 - y1) * 0.08)),
+                fill=255,
+            )
+    if feather and feather > 0:
+        mask = mask.filter(ImageFilter.GaussianBlur(radius=float(feather)))
+    return mask
+
+
+def _apply_question_spotlight(image_file: str, spotlight) -> None:
+    """Hide everything on the question image except the selected spotlight regions."""
+    if not spotlight or not getattr(spotlight, "enabled", False) or not os.path.exists(image_file):
+        return
+    regions = list(getattr(spotlight, "regions", None) or [])
+    if not regions:
+        return
+    try:
+        base = Image.open(image_file).convert("RGBA")
+        width, height = base.size
+        if width <= 0 or height <= 0:
+            return
+        feather = max(0, int(getattr(spotlight, "feather", 12) or 0))
+        mask = _region_mask(width, height, regions, feather)
+        style = str(getattr(spotlight, "mask_style", "dim") or "dim").strip().lower()
+        opacity = max(0.0, min(1.0, float(getattr(spotlight, "mask_opacity", 0.92) or 0.0)))
+        if style == "blur":
+            radius = max(0, int(getattr(spotlight, "blur_radius", 18) or 18))
+            blurred = base.filter(ImageFilter.GaussianBlur(radius=radius))
+            outside = Image.eval(mask, lambda value: 255 - value)
+            base = Image.composite(blurred, base, outside)
+        else:
+            color = (0, 0, 0) if style == "solid" else (8, 15, 23)
+            alpha = int(round(255 * opacity))
+            outside = Image.eval(mask, lambda value: int(round(alpha * (1.0 - value / 255.0))))
+            overlay = Image.new("RGBA", (width, height), (*color, 0))
+            overlay.putalpha(outside)
+            base = Image.alpha_composite(base, overlay)
+        if bool(getattr(spotlight, "outline", True)):
+            draw = ImageDraw.Draw(base)
+            outline_width = max(4, int(min(width, height) * 0.006))
+            for region in regions:
+                try:
+                    rx = max(0.0, min(1.0, float(getattr(region, "x", 0.0) or 0.0)))
+                    ry = max(0.0, min(1.0, float(getattr(region, "y", 0.0) or 0.0)))
+                    rw = max(0.005, min(1.0 - rx, float(getattr(region, "width", 0.0) or 0.0)))
+                    rh = max(0.005, min(1.0 - ry, float(getattr(region, "height", 0.0) or 0.0)))
+                except (TypeError, ValueError):
+                    continue
+                x1, y1 = int(rx * width), int(ry * height)
+                x2, y2 = int((rx + rw) * width), int((ry + rh) * height)
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                shape = (getattr(region, "shape", "rect") or "rect").strip().lower()
+                if shape == "ellipse":
+                    draw.ellipse([x1, y1, x2, y2], outline=(255, 255, 255, 255), width=outline_width)
+                else:
+                    draw.rounded_rectangle(
+                        [x1, y1, x2, y2],
+                        radius=max(4, int(min(x2 - x1, y2 - y1) * 0.08)),
+                        outline=(255, 255, 255, 255),
+                        width=outline_width,
+                    )
+        base.convert("RGB").save(image_file, format="PNG")
+        logger.info(f"Applied question spotlight with {len(regions)} region(s) to {image_file}")
+    except Exception as err:
+        logger.warning(f"Could not apply question spotlight to {image_file}: {err}")
+
+
+def _reveal_union(regions) -> tuple[float, float, float, float]:
+    xs1, ys1, xs2, ys2 = [], [], [], []
+    for region in regions or []:
+        try:
+            rx = max(0.0, min(1.0, float(getattr(region, "x", 0.0) or 0.0)))
+            ry = max(0.0, min(1.0, float(getattr(region, "y", 0.0) or 0.0)))
+            rw = max(0.005, min(1.0 - rx, float(getattr(region, "width", 0.0) or 0.0)))
+            rh = max(0.005, min(1.0 - ry, float(getattr(region, "height", 0.0) or 0.0)))
+        except (TypeError, ValueError):
+            continue
+        xs1.append(rx); ys1.append(ry); xs2.append(rx + rw); ys2.append(ry + rh)
+    if not xs1:
+        return 0.0, 0.0, 1.0, 1.0
+    return min(xs1), min(ys1), max(xs2), max(ys2)
+
+
+def _apply_answer_reveal(frame: np.ndarray, t: float, reveal) -> np.ndarray:
+    """Expand a question spotlight mask until the full answer picture is visible."""
+    if not reveal:
+        return frame
+    seconds = float(getattr(reveal, "seconds", 0.0) or 0.0)
+    if seconds <= 0 or t >= seconds:
+        return frame
+    regions = list(getattr(reveal, "regions", None) or [])
+    if not regions:
+        return frame
+    progress = _ease(max(0.0, min(1.0, t / max(1e-6, seconds))))
+    x1, y1, x2, y2 = _reveal_union(regions)
+    ex1 = x1 * (1.0 - progress)
+    ey1 = y1 * (1.0 - progress)
+    ex2 = x2 + (1.0 - x2) * progress
+    ey2 = y2 + (1.0 - y2) * progress
+    class _RevealRegion:
+        pass
+    region = _RevealRegion()
+    region.x, region.y = ex1, ey1
+    region.width, region.height = max(0.005, ex2 - ex1), max(0.005, ey2 - ey1)
+    region.shape = "rect"
+    height, width = frame.shape[0], frame.shape[1]
+    mask = _region_mask(width, height, [region], int(getattr(reveal, "feather", 12) or 0))
+    style = str(getattr(reveal, "mask_style", "dim") or "dim").strip().lower()
+    base = Image.fromarray(frame.astype(np.uint8)).convert("RGBA")
+    if style == "blur":
+        radius = max(1, int(min(width, height) * 0.02))
+        blurred = base.filter(ImageFilter.GaussianBlur(radius=radius))
+        outside = Image.eval(mask, lambda value: 255 - value)
+        base = Image.composite(blurred, base, outside)
+    else:
+        opacity = max(0.0, min(1.0, float(getattr(reveal, "mask_opacity", 0.92) or 0.0)))
+        alpha = int(round(255 * opacity))
+        outside = Image.eval(mask, lambda value: int(round(alpha * (1.0 - value / 255.0))))
+        overlay = Image.new("RGBA", (width, height), (8, 15, 23, 0))
+        overlay.putalpha(outside)
+        base = Image.alpha_composite(base, overlay)
+    return np.array(base.convert("RGB"))
+
+
+def _hex_rgb(color: str, fallback=(245, 158, 11)) -> tuple[int, int, int]:
+    try:
+        value = (color or "").strip().lstrip("#")
+        if len(value) == 3:
+            value = "".join(ch * 2 for ch in value)
+        if len(value) != 6:
+            return fallback
+        return int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16)
+    except Exception:
+        return fallback
+
+
+def _prepare_camera_canvas(img: Image.Image, out_w: int, out_h: int, fit_mode: str) -> Image.Image:
+    """Prepare one camera image so zoom=1 always fills the output frame."""
+    mode = (fit_mode or "cover").strip().lower()
+    if mode == "contain":
+        ratio = min(out_w / img.width, out_h / img.height)
+        new_w = max(1, int(round(img.width * ratio)))
+        new_h = max(1, int(round(img.height * ratio)))
+        contained = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+        backdrop = img.resize((out_w, out_h), Image.Resampling.LANCZOS).filter(
+            ImageFilter.GaussianBlur(radius=max(18, min(out_w, out_h) // 16))
+        ).convert("RGBA")
+        backdrop.alpha_composite(
+            contained.convert("RGBA"),
+            ((out_w - new_w) // 2, (out_h - new_h) // 2),
+        )
+        return backdrop.convert("RGB")
+    return _cover_resize(img, out_w, out_h, 1.0)
+
+
+def _render_camera_view(canvas: Image.Image, out_w: int, out_h: int,
+                        zoom: float, x: float, y: float) -> Image.Image:
+    """Render a camera crop using a normalized focus point and a zoom factor."""
+    zoom = max(1.0, float(zoom or 1.0))
+    if zoom <= 1.0001:
+        return canvas
+    crop_w = max(1.0, out_w / zoom)
+    crop_h = max(1.0, out_h / zoom)
+    cx = max(0.0, min(1.0, float(x or 0.5))) * out_w
+    cy = max(0.0, min(1.0, float(y or 0.5))) * out_h
+    left = max(0.0, min(out_w - crop_w, cx - crop_w / 2.0))
+    top = max(0.0, min(out_h - crop_h, cy - crop_h / 2.0))
+    matrix = (crop_w / out_w, 0.0, left, 0.0, crop_h / out_h, top)
+    return canvas.transform(
+        (out_w, out_h), Image.AFFINE, matrix, resample=Image.Resampling.BILINEAR
+    )
+
+
+def _camera_screen_point(x: float, y: float, out_w: int, out_h: int,
+                         zoom: float, cx: float, cy: float) -> tuple[float, float]:
+    z = max(1.0, float(zoom or 1.0))
+    px = float(x) * out_w
+    py = float(y) * out_h
+    return ((px - float(cx) * out_w) * z + out_w / 2.0,
+            (py - float(cy) * out_h) * z + out_h / 2.0)
+
+
+def _overlay_camera_arrows(frame: np.ndarray, steps, progress_step: int, progress: float,
+                           zoom: float, cx: float, cy: float, style: str, color: str) -> np.ndarray:
+    """Draw a route and/or moving double chevrons over a camera frame."""
+    style = (style or "none").strip().lower()
+    if style == "none" or len(steps) < 2:
+        return frame
+    height, width = frame.shape[0], frame.shape[1]
+    base = Image.fromarray(frame.astype(np.uint8)).convert("RGBA")
+    overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    rgb = _hex_rgb(color)
+    line_width = max(3, int(min(width, height) * 0.006))
+    arrow_size = max(10, int(min(width, height) * 0.028))
+    points = [
+        _camera_screen_point(float(getattr(step, "x", 0.5) or 0.5),
+                             float(getattr(step, "y", 0.5) or 0.5),
+                             width, height, zoom, cx, cy)
+        for step in steps
+    ]
+    if style in ("route", "both"):
+        for idx in range(len(points) - 1):
+            x1, y1 = points[idx]
+            x2, y2 = points[idx + 1]
+            active = idx == max(0, min(progress_step, len(points) - 2))
+            alpha = 235 if active else 90
+            draw.line([(x1, y1), (x2, y2)], fill=(*rgb, alpha), width=line_width)
+            if active:
+                for ax, ay, bx, by in ((x1, y1, x2, y2), (x2, y2, x1, y1)):
+                    angle = math.atan2(by - ay, bx - ax)
+                    for side in (-0.55, 0.55):
+                        ex = ax + arrow_size * math.cos(angle + side)
+                        ey = ay + arrow_size * math.sin(angle + side)
+                        draw.line([(ax, ay), (ex, ey)], fill=(*rgb, 245), width=line_width)
+    if style in ("chevron", "both"):
+        seg = max(0, min(progress_step, len(points) - 2))
+        x1, y1 = points[seg]
+        x2, y2 = points[seg + 1]
+        px = x1 + (x2 - x1) * progress
+        py = y1 + (y2 - y1) * progress
+        angle = math.atan2(y2 - y1, x2 - x1)
+        for offset in (-0.42, 0.42):
+            cx0 = px + arrow_size * 0.55 * math.cos(angle) * offset
+            cy0 = py + arrow_size * 0.55 * math.sin(angle) * offset
+            wing = arrow_size * 0.72
+            left = (cx0 - wing * math.cos(angle - 0.62), cy0 - wing * math.sin(angle - 0.62))
+            right = (cx0 - wing * math.cos(angle + 0.62), cy0 - wing * math.sin(angle + 0.62))
+            draw.line([left, (cx0, cy0), right], fill=(*rgb, 255), width=max(3, line_width + 1), joint="curve")
+    return np.array(Image.alpha_composite(base, overlay).convert("RGB"))
+
+
+def _write_travel_audio(audio_file: str, duration_seconds: float, sound: str) -> None:
+    """Synthesize a short whoosh/footsteps bed for a camera travel segment."""
+    kind = (sound or "none").strip().lower()
+    if kind == "none" or duration_seconds <= 0:
+        return
+    sample_rate = 44100
+    total = max(1, int(duration_seconds * sample_rate))
+    t = np.arange(total, dtype=np.float32) / sample_rate
+    if kind == "footsteps":
+        samples = np.zeros(total, dtype=np.float32)
+        step_gap = 0.34
+        step_time = 0.0
+        rng = random.Random(7)
+        while step_time < duration_seconds:
+            start = int(step_time * sample_rate)
+            count = min(total - start, int(0.11 * sample_rate))
+            if count <= 0:
+                break
+            tt = np.arange(count, dtype=np.float32) / sample_rate
+            envelope = np.exp(-tt * 34.0)
+            tone = np.sin(2.0 * np.pi * (95.0 + rng.uniform(-12, 12)) * tt)
+            samples[start:start + count] += (0.26 * envelope * tone).astype(np.float32)
+            step_time += step_gap
+    else:
+        envelope = np.sin(np.pi * np.clip(t / max(1e-6, duration_seconds), 0.0, 1.0)) ** 1.4
+        noise = np.random.default_rng(11).normal(0, 1, total).astype(np.float32)
+        sweep = np.sin(2.0 * np.pi * (180.0 + 900.0 * t / max(1e-6, duration_seconds)) * t)
+        samples = (0.10 * noise + 0.14 * sweep) * envelope
+    pcm = (np.clip(samples, -1.0, 1.0) * 32767.0).astype(np.int16)
+    with wave.open(audio_file, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(sample_rate)
+        wav.writeframes(pcm.tobytes())
+
+
 def _write_countdown_audio(audio_file: str, duration_seconds: int, sound: str) -> None:
     """Synthesize a short countdown bed with optional tick/beep/ding cues."""
     sample_rate = 44100
@@ -748,6 +1042,40 @@ def _scene_voice_signature(
     return hashlib.sha1(encoded).hexdigest()
 
 
+async def _generate_camera_assets(
+    task_dir: str,
+    scene: StoryScene,
+    voice_name: str,
+    voice_rate: float,
+    language: str,
+    voice_provider: str,
+    preserve_line_breaks: bool = True,
+):
+    """Generate one voice clip + SRT per camera step."""
+    sequence = getattr(scene, "camera_sequence", None)
+    if not sequence:
+        return
+    index = getattr(scene, "original_index", None) or 1
+    for step_index, step in enumerate(sequence.steps or [], 1):
+        script = (getattr(step, "script", "") or "").strip()
+        if not script:
+            continue
+        audio_file = os.path.join(task_dir, f"{index}_step{step_index}.mp3")
+        subtitle_file = os.path.join(task_dir, f"{index}_step{step_index}.srt")
+        logger.info(f"Generating camera step voice for scene {index} step {step_index}")
+        await generate_voice(
+            script,
+            voice_name,
+            voice_rate,
+            audio_file,
+            subtitle_file,
+            language,
+            voice_provider,
+            karaoke=False,
+            preserve_line_breaks=preserve_line_breaks,
+        )
+
+
 async def generate_scene_assets(
     task_dir: str,
     scenes: List[StoryScene],
@@ -764,6 +1092,18 @@ async def generate_scene_assets(
     for __i, scene in enumerate(scenes, 1):
         i = getattr(scene, "original_index", None) or __i
         try:
+            render_mode = (getattr(scene, "render_mode", "normal") or "normal").strip().lower()
+            if render_mode == "camera":
+                await _generate_camera_assets(
+                    task_dir=task_dir,
+                    scene=scene,
+                    voice_name=voice_name,
+                    voice_rate=voice_rate,
+                    language=language,
+                    voice_provider=voice_provider,
+                    preserve_line_breaks=True,
+                )
+                continue
             image_file = os.path.join(task_dir, f"{i}.png")
             audio_file = os.path.join(task_dir, f"{i}.mp3")
             subtitle_file = os.path.join(task_dir, f"{i}.srt")
@@ -1310,6 +1650,210 @@ async def render_final_video(
         scene_subtitle_position = getattr(scene, "subtitle_position", None)
         scene_transitions.append(scene_transition)
         try:
+            render_mode = (getattr(scene, "render_mode", "normal") or "normal").strip().lower()
+            if render_mode == "camera":
+                sequence = getattr(scene, "camera_sequence", None)
+                if not sequence or len(getattr(sequence, "steps", None) or []) < 2:
+                    raise ValueError(f"Scene {i}: camera sequence needs at least two steps.")
+                steps = list(sequence.steps)
+                tasks_root = os.path.dirname(task_dir)
+
+                def _resolve_camera_file(url: str) -> str:
+                    clean = (url or "").split("?")[0]
+                    if clean and os.path.exists(clean):
+                        return clean
+                    if "/tasks/" in clean:
+                        rel = clean.split("/tasks/", 1)[-1]
+                        candidate = os.path.join(tasks_root, rel.replace("/", os.sep))
+                        if os.path.exists(candidate):
+                            return candidate
+                    raise FileNotFoundError(f"Camera image not found: {url}")
+
+                base_file = _resolve_camera_file(sequence.base_image_url)
+                step_files = [
+                    _resolve_camera_file(step.image_url) if (step.image_url or "").strip() else base_file
+                    for step in steps
+                ]
+                canvas_cache: dict[str, Image.Image] = {}
+
+                def _camera_canvas(path: str, _fit_mode=sequence.fit_mode, _cache=canvas_cache) -> Image.Image:
+                    if path not in _cache:
+                        with Image.open(path) as source:
+                            _cache[path] = _prepare_camera_canvas(
+                                source.convert("RGB"), target_w, target_h, _fit_mode
+                            )
+                    return _cache[path]
+
+                step_audio: list[AudioFileClip | None] = []
+                step_durations: list[float] = []
+                for step_index, step in enumerate(steps, 1):
+                    audio_path = os.path.join(task_dir, f"{i}_step{step_index}.mp3")
+                    audio_clip = AudioFileClip(audio_path) if os.path.exists(audio_path) else None
+                    fallback = float(getattr(step, "hold_seconds", None) or 1.5)
+                    duration = float(audio_clip.duration or 0.0) if audio_clip is not None else 0.0
+                    step_audio.append(audio_clip)
+                    step_durations.append(max(0.25, duration or fallback))
+
+                hold_starts: list[float] = []
+                travel_ranges: list[tuple[float, float]] = []
+                cursor = 0.0
+                for step_index, step in enumerate(steps):
+                    hold_starts.append(cursor)
+                    cursor += step_durations[step_index]
+                    cursor += max(0.0, float(getattr(step, "pause_after", 0.2) or 0.0))
+                    if step_index < len(steps) - 1:
+                        travel_ranges.append((cursor, cursor + float(sequence.travel_seconds or 1.5)))
+                        cursor += float(sequence.travel_seconds or 1.5)
+                total_camera_duration = max(0.5, cursor)
+
+                def _camera_state(t: float, _steps=steps, _sequence=sequence,
+                                  _hold_starts=hold_starts, _step_durations=step_durations,
+                                  _travel_ranges=travel_ranges):
+                    for idx, step in enumerate(_steps):
+                        hold_end = _hold_starts[idx] + _step_durations[idx]
+                        if t < hold_end:
+                            return idx, 0.0, float(step.zoom or 1.0), float(step.x), float(step.y)
+                        if idx < len(_steps) - 1:
+                            travel_start, travel_end = _travel_ranges[idx]
+                            if t < travel_end:
+                                progress = _ease((t - travel_start) / max(1e-6, travel_end - travel_start))
+                                nxt = _steps[idx + 1]
+                                zoom_a, zoom_b = float(step.zoom or 1.0), float(nxt.zoom or 1.0)
+                                zoom = zoom_a + (zoom_b - zoom_a) * progress
+                                if (_sequence.camera_mode or "follow").strip().lower() == "wide":
+                                    zoom = 1.0 + max(0.0, zoom - 1.0) * abs(2.0 * progress - 1.0)
+                                return (
+                                    idx,
+                                    progress,
+                                    zoom,
+                                    float(step.x) + (float(nxt.x) - float(step.x)) * progress,
+                                    float(step.y) + (float(nxt.y) - float(step.y)) * progress,
+                                )
+                    last = _steps[-1]
+                    return len(_steps) - 1, 1.0, float(last.zoom or 1.0), float(last.x), float(last.y)
+
+                def _camera_frame(t: float, _steps=steps, _step_files=step_files,
+                                  _state_fn=_camera_state, _canvas_fn=_camera_canvas,
+                                  _arrow_style=sequence.arrow_style,
+                                  _arrow_color=sequence.arrow_color):
+                    idx, progress, zoom, cx, cy = _state_fn(t)
+                    travel = idx < len(_steps) - 1 and progress > 0.0
+                    image_a = _render_camera_view(_canvas_fn(_step_files[idx]), target_w, target_h, zoom, cx, cy)
+                    if travel and _step_files[idx] != _step_files[idx + 1]:
+                        image_b = _render_camera_view(
+                            _canvas_fn(_step_files[idx + 1]), target_w, target_h, zoom,
+                            float(_steps[idx].x) + (float(_steps[idx + 1].x) - float(_steps[idx].x)) * progress,
+                            float(_steps[idx].y) + (float(_steps[idx + 1].y) - float(_steps[idx].y)) * progress,
+                        )
+                        swap = (getattr(_steps[idx + 1], "swap_style", "crossfade") or "crossfade").strip().lower()
+                        if swap == "cut":
+                            image_a = image_b if progress >= 0.5 else image_a
+                        elif swap == "circle_reveal":
+                            mask = Image.new("L", (target_w, target_h), 0)
+                            radius = int(progress * math.hypot(target_w, target_h) * 0.75)
+                            ImageDraw.Draw(mask).ellipse(
+                                [int(cx * target_w) - radius, int(cy * target_h) - radius,
+                                 int(cx * target_w) + radius, int(cy * target_h) + radius],
+                                fill=255,
+                            )
+                            image_a = Image.composite(image_b, image_a, mask)
+                        else:
+                            image_a = Image.blend(image_a, image_b, progress)
+                    frame = np.array(image_a.convert("RGB"))
+                    frame = _overlay_camera_arrows(
+                        frame, _steps, idx, progress, zoom, cx, cy,
+                        _arrow_style, _arrow_color,
+                    )
+                    return frame
+
+                font_path = resolve_subtitle_font(subtitle_font)
+                zh_font_path = os.path.join(utils.resource_dir(), "fonts", "MicrosoftYaHeiNormal.ttc")
+                if not os.path.exists(zh_font_path):
+                    zh_font_path = font_path
+                sub_font_size = max(16, min(200, int(subtitle_font_size or 32)))
+                sub_color = subtitle_color or "#F472B6"
+                sub_stroke_fill, sub_stroke_w = subtitle_stroke(sub_color, sub_font_size)
+                camera_subtitles: list[dict] = []
+                for step_index, step in enumerate(steps, 1):
+                    srt_path = os.path.join(task_dir, f"{i}_step{step_index}.srt")
+                    if not os.path.exists(srt_path):
+                        continue
+                    try:
+                        step_subs = subtitles.file_to_subtitles(srt_path, encoding="utf-8")
+                    except Exception:
+                        continue
+                    zh_lines = [line.strip() for line in (getattr(step, "translation", "") or "").split("\n")]
+                    for line_index, ((start_s, end_s), text) in enumerate(step_subs, 1):
+                        phrase = clean_subtitle_text(text)
+                        if not phrase:
+                            continue
+                        sub_img_en = render_text_rgba(
+                            phrase, font_path, sub_font_size, sub_color,
+                            max_width=int(target_w * 0.9),
+                            bg_rgba=(0, 0, 0, 0),
+                            stroke_width=sub_stroke_w,
+                            stroke_fill=sub_stroke_fill,
+                        )
+                        zh_sub_img = None
+                        if chinese_subtitle_enabled:
+                            zh_phrase = (
+                                zh_lines[line_index - 1]
+                                if line_index - 1 < len(zh_lines) and zh_lines[line_index - 1]
+                                else (translate_to_zh(phrase) if should_translate_to_zh(phrase) else "")
+                            )
+                            if zh_phrase:
+                                zh_sub_img = render_text_rgba(
+                                    zh_phrase, zh_font_path, max(18, int(sub_font_size * 0.72)),
+                                    "#F8FAFC", max_width=int(target_w * 0.85),
+                                    bg_rgba=(0, 0, 0, 0),
+                                    stroke_width=max(1, int(sub_font_size * 0.05)),
+                                    stroke_fill="#111827",
+                                )
+                        sub_img = stack_subtitle_images(sub_img_en, zh_sub_img, gap=6)
+                        if sub_img is None:
+                            continue
+                        sub_x, sub_y = _subtitle_overlay_position(
+                            "bottom", target_w, target_h, sub_img.width, sub_img.height
+                        )
+                        camera_subtitles.append({
+                            "start": hold_starts[step_index - 1] + float(start_s),
+                            "end": hold_starts[step_index - 1] + float(end_s),
+                            "sub_img": sub_img,
+                            "sub_pos": (sub_x, sub_y),
+                            "kw_img": None,
+                            "kw_pos": (0, 0),
+                        })
+
+                def _camera_with_subs(t: float, _frame_fn=_camera_frame, _items=camera_subtitles):
+                    frame = _frame_fn(t)
+                    return overlay_frame_with_subs(frame, t, _items) if _items else frame
+
+                camera_video = VideoClip(
+                    frame_function=_camera_with_subs,
+                    duration=total_camera_duration,
+                ).with_fps(24)
+                audio_parts = []
+                for step_index, audio_clip in enumerate(step_audio):
+                    if audio_clip is not None:
+                        audio_parts.append(audio_clip.with_start(hold_starts[step_index]))
+                if (sequence.travel_sound or "none").strip().lower() != "none":
+                    for travel_index, (travel_start, travel_end) in enumerate(travel_ranges, 1):
+                        travel_audio_path = os.path.join(task_dir, f"{i}_travel{travel_index}.wav")
+                        _write_travel_audio(
+                            travel_audio_path,
+                            travel_end - travel_start,
+                            sequence.travel_sound,
+                        )
+                        if os.path.exists(travel_audio_path):
+                            audio_parts.append(AudioFileClip(travel_audio_path).with_start(travel_start))
+                if audio_parts:
+                    camera_video = camera_video.with_audio(CompositeAudioClip(audio_parts))
+                clips.append(camera_video)
+                logger.info(
+                    f"Added camera sequence scene {i}: {len(steps)} steps, "
+                    f"{total_camera_duration:.2f}s, preset={sequence.preset}"
+                )
+                continue
             # 获取文件路径
             image_file = os.path.join(task_dir, f"{i}.png")
             is_countdown = (getattr(scene, "render_mode", "normal") or "normal").strip().lower() == "countdown"
@@ -1335,6 +1879,9 @@ async def render_final_video(
                 subtitle_duration = max([tb for ((ta, tb), txt) in subs]) if subs else 0.0
                 if audio_clip.duration and audio_clip.duration > subtitle_duration:
                     subtitle_duration = audio_clip.duration
+            hold_after = max(0.0, float(getattr(scene, "hold_after", 0.0) or 0.0))
+            if hold_after > 0:
+                subtitle_duration += hold_after
             raw_slots = list(getattr(scene, "image_slots", None) or [])
             tasks_root = os.path.dirname(task_dir)
 
@@ -1920,18 +2467,27 @@ async def render_final_video(
                                     )
                         return _slot_local(idx, t)
 
+                    answer_reveal = getattr(scene, "answer_reveal", None)
+                    if answer_reveal:
+                        scene_frame_with_reveal = (
+                            lambda t, _source=scene_image_frame, _reveal=answer_reveal:
+                            _apply_answer_reveal(_source(t), t, _reveal)
+                        )
+                    else:
+                        scene_frame_with_reveal = scene_image_frame
+
                     if subtitle_items:
                         logger.info(
                             f"Subtitle items rendered for scene {i}: {len(subtitle_items)} "
                             f"| images: {n_images} | slot_transition={slot_kind}({slot_td:.2f}s)"
                         )
 
-                        def make_frame(t, _scene=scene_image_frame, _items=subtitle_items):
+                        def make_frame(t, _scene=scene_frame_with_reveal, _items=subtitle_items):
                             return overlay_frame_with_subs(_scene(t), t, _items)
                     else:
                         logger.warning(f"No subtitle items rendered for scene {i}")
 
-                        def make_frame(t, _scene=scene_image_frame):
+                        def make_frame(t, _scene=scene_frame_with_reveal):
                             return _scene(t)
 
                     video_clip = VideoClip(
@@ -2494,8 +3050,22 @@ async def assemble_interactive_impl(request: "InteractiveAssembleRequest") -> st
         task_dir = utils.task_dir(task_id)
         if not os.path.exists(task_dir):
             raise ValueError(f"Task directory not found: {task_dir}.")
-        if not request.rounds:
-            raise ValueError("Add at least one interactive round before generating the video.")
+        if request.blocks:
+            blocks = list(request.blocks)
+        else:
+            intro_items = list(request.intros)
+            if request.intro is not None:
+                intro_items.insert(0, request.intro)
+            outro_items = list(request.outros)
+            if request.outro is not None:
+                outro_items.append(request.outro)
+            blocks = (
+                [InteractiveBlock(kind="intro", intro=item) for item in intro_items]
+                + [InteractiveBlock(kind="round", round=item) for item in request.rounds]
+                + [InteractiveBlock(kind="outro", outro=item) for item in outro_items]
+            )
+        if not blocks:
+            raise ValueError("Add at least one interactive block before generating the video.")
 
         def localize_image(url: str, stem: str) -> str:
             if not url:
@@ -2530,7 +3100,7 @@ async def assemble_interactive_impl(request: "InteractiveAssembleRequest") -> st
         scenes: List[StoryScene] = []
         next_index = 1
 
-        def append_bookend(bookend, label: str) -> None:
+        def append_bookend(bookend, label: str, transition: str = "cut") -> None:
             nonlocal next_index
             image_url = (bookend.image_url or "").strip()
             script = (bookend.script or "").strip()
@@ -2552,27 +3122,90 @@ async def assemble_interactive_impl(request: "InteractiveAssembleRequest") -> st
                     original_index=next_index,
                     chinese_translation=(bookend.translation or "").strip() or None,
                     motion_effect="none",
-                    transition="cut",
+                    transition=transition,
                     render_mode="normal",
+                    hold_after=max(0.0, float(getattr(bookend, "hold_after", 0.0) or 0.0)),
                 )
             )
             next_index += 1
 
-        intro_items = list(request.intros)
-        if request.intro is not None:
-            intro_items.insert(0, request.intro)
-        for intro_index, bookend in enumerate(intro_items, 1):
-            append_bookend(bookend, f"Intro scene {intro_index}")
+        intro_count = 0
+        round_count = 0
+        camera_count = 0
+        outro_count = 0
 
-        for round_index, round_item in enumerate(request.rounds, 1):
+        for block in blocks:
+            kind = (block.kind or "").strip().lower()
+            # Soft-dissolve only at block boundaries. Scenes inside a round stay
+            # hard-cut so the question/countdown/answer beat remains crisp.
+            entry_transition = "dissolve" if scenes else "cut"
+            if kind == "intro":
+                intro_count += 1
+                if not block.intro:
+                    raise ValueError(f"Intro scene {intro_count}: data is missing.")
+                append_bookend(block.intro, f"Intro scene {intro_count}", entry_transition)
+                continue
+            if kind == "outro":
+                outro_count += 1
+                if not block.outro:
+                    raise ValueError(f"Outro scene {outro_count}: data is missing.")
+                append_bookend(block.outro, f"Outro scene {outro_count}", entry_transition)
+                continue
+            if kind == "camera":
+                camera_count += 1
+                sequence = block.camera
+                if not sequence or len(sequence.steps or []) < 2:
+                    raise ValueError(f"Camera sequence {camera_count}: add at least two steps.")
+                if not (sequence.base_image_url or "").strip():
+                    raise ValueError(f"Camera sequence {camera_count}: base image is missing.")
+                camera_idx = next_index
+                base_url = localize_image(sequence.base_image_url, str(camera_idx))
+                base_file = os.path.join(task_dir, f"{camera_idx}.png")
+                if not os.path.exists(base_file):
+                    raise ValueError(f"Camera sequence {camera_count}: base image could not be loaded.")
+                localized_steps = []
+                for step_index, step in enumerate(sequence.steps, 1):
+                    step_url = (step.image_url or "").strip()
+                    localized_step_url = None
+                    if step_url and step_url != (sequence.base_image_url or "").strip():
+                        localized_step_url = localize_image(step_url, f"{camera_idx}_step{step_index}")
+                    localized_steps.append(step.model_copy(update={"image_url": localized_step_url}))
+                localized_sequence = sequence.model_copy(update={
+                    "base_image_url": base_url,
+                    "steps": localized_steps,
+                })
+                scenes.append(
+                    StoryScene(
+                        script="",
+                        scene_prompt="",
+                        objects=[],
+                        keywords=[],
+                        url=base_url,
+                        original_index=camera_idx,
+                        chinese_translation=None,
+                        motion_effect="none",
+                        transition=entry_transition,
+                        render_mode="camera",
+                        camera_sequence=localized_sequence,
+                    )
+                )
+                next_index = camera_idx + 1
+                continue
+            if kind != "round":
+                raise ValueError(f"Unknown interactive block type: {block.kind}")
+
+            round_count += 1
+            round_item = block.round
+            if not round_item:
+                raise ValueError(f"Round {round_count}: data is missing.")
             question_script = (round_item.question_script or "").strip()
             answer_script = (round_item.answer_script or "").strip()
             if not question_script:
-                raise ValueError(f"Round {round_index}: question narration is empty.")
+                raise ValueError(f"Round {round_count}: question narration is empty.")
             if not answer_script:
-                raise ValueError(f"Round {round_index}: answer narration is empty.")
+                raise ValueError(f"Round {round_count}: answer narration is empty.")
             if not (round_item.question_image_url or "").strip():
-                raise ValueError(f"Round {round_index}: question image is missing.")
+                raise ValueError(f"Round {round_count}: question image is missing.")
 
             question_idx = next_index
             countdown_idx = next_index + 1
@@ -2580,17 +3213,23 @@ async def assemble_interactive_impl(request: "InteractiveAssembleRequest") -> st
             question_url = localize_image(round_item.question_image_url, str(question_idx))
             question_file = os.path.join(task_dir, f"{question_idx}.png")
             if not os.path.exists(question_file):
-                raise ValueError(f"Round {round_index}: question image could not be loaded.")
+                raise ValueError(f"Round {round_count}: question image could not be loaded.")
+
+            # Localize the full answer picture before the question is masked.
+            answer_source_url = round_item.answer_image_url or round_item.question_image_url
+            answer_url = localize_image(answer_source_url, str(answer_idx))
+            answer_file = os.path.join(task_dir, f"{answer_idx}.png")
+            if not os.path.exists(answer_file):
+                raise ValueError(f"Round {round_count}: answer image could not be loaded.")
 
             countdown_file = os.path.join(task_dir, f"{countdown_idx}.png")
             shutil.copy2(question_file, countdown_file)
             countdown_url = f"http://127.0.0.1:8889/tasks/{task_id}/{countdown_idx}.png"
 
-            answer_source_url = round_item.answer_image_url or question_url
-            answer_url = localize_image(answer_source_url, str(answer_idx))
-            answer_file = os.path.join(task_dir, f"{answer_idx}.png")
-            if not os.path.exists(answer_file):
-                raise ValueError(f"Round {round_index}: answer image could not be loaded.")
+            spotlight = round_item.question_spotlight
+            if spotlight and spotlight.enabled and spotlight.regions:
+                _apply_question_spotlight(question_file, spotlight)
+                _apply_question_spotlight(countdown_file, spotlight)
             if round_item.highlights:
                 _apply_highlight_regions(answer_file, round_item.highlights)
 
@@ -2604,7 +3243,7 @@ async def assemble_interactive_impl(request: "InteractiveAssembleRequest") -> st
                     original_index=question_idx,
                     chinese_translation=(round_item.question_translation or "").strip() or None,
                     motion_effect="none",
-                    transition="cut",
+                    transition=entry_transition,
                     render_mode="normal",
                 )
             )
@@ -2626,6 +3265,20 @@ async def assemble_interactive_impl(request: "InteractiveAssembleRequest") -> st
                     countdown_label=(round_item.countdown_label or "").strip(),
                 )
             )
+            reveal = None
+            if (
+                spotlight
+                and spotlight.enabled
+                and spotlight.regions
+                and (spotlight.answer_reveal or "expand").strip().lower() == "expand"
+            ):
+                reveal = AnswerReveal(
+                    regions=list(spotlight.regions),
+                    mask_style=spotlight.mask_style,
+                    mask_opacity=spotlight.mask_opacity,
+                    feather=spotlight.feather,
+                    seconds=spotlight.reveal_seconds,
+                )
             scenes.append(
                 StoryScene(
                     script=answer_script,
@@ -2641,23 +3294,26 @@ async def assemble_interactive_impl(request: "InteractiveAssembleRequest") -> st
                     highlight_regions=list(round_item.highlights),
                     subtitle_font_size=round_item.answer_subtitle_font_size,
                     subtitle_position=round_item.answer_subtitle_position,
+                    answer_reveal=reveal,
                 )
             )
             next_index = answer_idx + 1
 
-        outro_items = list(request.outros)
-        if request.outro is not None:
-            outro_items.append(request.outro)
-        for outro_index, bookend in enumerate(outro_items, 1):
-            append_bookend(bookend, f"Outro scene {outro_index}")
+        intros_for_json = [block.intro.model_dump() for block in blocks if block.kind == "intro" and block.intro]
+        outros_for_json = [block.outro.model_dump() for block in blocks if block.kind == "outro" and block.outro]
+        rounds_for_json = [block.round.model_dump() for block in blocks if block.kind == "round" and block.round]
+        cameras_for_json = [block.camera.model_dump() for block in blocks if block.kind == "camera" and block.camera]
+        blocks_for_json = [block.model_dump() for block in blocks]
 
         story_file = os.path.join(task_dir, "story.json")
         story_data = {
             "task_id": task_id,
             "mode": "interactive",
-            "intros": [bookend.model_dump() for bookend in intro_items],
-            "outros": [bookend.model_dump() for bookend in outro_items],
-            "rounds": [round_item.model_dump() for round_item in request.rounds],
+            "intros": intros_for_json,
+            "outros": outros_for_json,
+            "rounds": rounds_for_json,
+            "cameras": cameras_for_json,
+            "blocks": blocks_for_json,
             "scenes": [scene.model_dump() for scene in scenes],
         }
         with open(story_file, "w", encoding="utf-8") as f:
@@ -2667,9 +3323,11 @@ async def assemble_interactive_impl(request: "InteractiveAssembleRequest") -> st
                 {
                     "task_id": task_id,
                     "resolution": request.resolution,
-                    "intros": [bookend.model_dump() for bookend in intro_items],
-                    "outros": [bookend.model_dump() for bookend in outro_items],
-                    "rounds": [round_item.model_dump() for round_item in request.rounds],
+                    "intros": intros_for_json,
+                    "outros": outros_for_json,
+                    "rounds": rounds_for_json,
+                    "cameras": cameras_for_json,
+                    "blocks": blocks_for_json,
                 },
                 f,
                 ensure_ascii=False,
@@ -2722,7 +3380,7 @@ async def assemble_interactive_impl(request: "InteractiveAssembleRequest") -> st
             motion_strength=0.0,
             framing=request.framing,
             transition="cut",
-            transition_duration=0.0,
+            transition_duration=0.5,
         )
     except Exception as e:
         logger.error(f"Failed to assemble interactive video: {e}")

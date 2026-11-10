@@ -305,6 +305,56 @@ class HighlightRegion(BaseModel):
     color: Optional[str] = Field(default="#FFD54F", description="Highlight outline color")
 
 
+class QuestionSpotlight(BaseModel):
+    """Question-side inverse of answer highlights: only selected regions stay visible."""
+    enabled: bool = Field(default=False)
+    regions: List[HighlightRegion] = Field(default_factory=list)
+    mask_style: str = Field(default="dim", description="dim | blur | solid")
+    mask_opacity: float = Field(default=0.92, ge=0.0, le=1.0)
+    blur_radius: int = Field(default=18, ge=0, le=80)
+    feather: int = Field(default=12, ge=0, le=80)
+    outline: bool = Field(default=True)
+    answer_reveal: str = Field(default="expand", description="cut | expand")
+    reveal_seconds: float = Field(default=0.5, ge=0.0, le=2.0)
+
+
+class CameraStep(BaseModel):
+    """One camera keyframe inside a Journey/Zoom sequence."""
+    id: Optional[str] = Field(default=None)
+    label: str = Field(default="")
+    x: float = Field(default=0.5, ge=0.0, le=1.0)
+    y: float = Field(default=0.5, ge=0.0, le=1.0)
+    zoom: float = Field(default=1.0, ge=1.0, le=8.0)
+    script: str = Field(default="")
+    translation: str = Field(default="")
+    image_url: Optional[str] = Field(default=None, description="Optional image swap from this step onward")
+    swap_style: str = Field(default="crossfade", description="crossfade | circle_reveal | cut")
+    hold_seconds: Optional[float] = Field(default=None, ge=0.0, le=60.0)
+    pause_after: float = Field(default=0.2, ge=0.0, le=10.0)
+
+
+class InteractiveCameraSequence(BaseModel):
+    """Continuous camera sequence over one base image, with optional detail-image swaps."""
+    preset: str = Field(default="journey", description="journey | zoom | custom")
+    base_image_url: str = Field(default="")
+    steps: List[CameraStep] = Field(default_factory=list)
+    travel_seconds: float = Field(default=1.5, ge=0.2, le=10.0)
+    arrow_style: str = Field(default="both", description="chevron | route | both | none")
+    arrow_color: str = Field(default="#F59E0B")
+    travel_sound: str = Field(default="none", description="none | whoosh | footsteps")
+    fit_mode: str = Field(default="cover", description="cover | contain")
+    camera_mode: str = Field(default="follow", description="follow | wide")
+
+
+class AnswerReveal(BaseModel):
+    """Expanding mask used at the start of an answer scene."""
+    regions: List[HighlightRegion] = Field(default_factory=list)
+    mask_style: str = Field(default="dim")
+    mask_opacity: float = Field(default=0.92, ge=0.0, le=1.0)
+    feather: int = Field(default=12, ge=0, le=80)
+    seconds: float = Field(default=0.5, ge=0.0, le=2.0)
+
+
 class StoryScene(BaseModel):
     """故事场景"""
     script: str = Field(description="场景讲解脚本")
@@ -329,6 +379,9 @@ class StoryScene(BaseModel):
     highlight_regions: List[HighlightRegion] = Field(default_factory=list)
     subtitle_font_size: Optional[int] = Field(default=None, ge=16, le=200, description="Per-scene subtitle font size override (px)")
     subtitle_position: Optional[str] = Field(default=None, description="Per-scene subtitle position: bottom|center|top|bottom_left|bottom_right|top_left|top_right|center_left|center_right")
+    camera_sequence: Optional[InteractiveCameraSequence] = Field(default=None, description="Continuous camera sequence for Journey/Zoom blocks")
+    answer_reveal: Optional[AnswerReveal] = Field(default=None, description="Expand a question spotlight into the full answer image")
+    hold_after: Optional[float] = Field(default=0.0, ge=0.0, le=10.0, description="Silent hold after this scene's narration")
 
 class VideoGenerateRequest(BaseModel):
     """视频生成请求"""
@@ -398,6 +451,7 @@ class InteractiveRound(BaseModel):
     highlights: List[HighlightRegion] = Field(default_factory=list, description="Answer image highlights")
     answer_subtitle_font_size: Optional[int] = Field(default=None, ge=16, le=200, description="Answer subtitle font size override (px)")
     answer_subtitle_position: Optional[str] = Field(default=None, description="Answer subtitle position")
+    question_spotlight: Optional[QuestionSpotlight] = Field(default=None, description="Show only selected regions on the question image")
 
 
 class StoryboardAssembleRequest(BaseModel):
@@ -428,16 +482,28 @@ class InteractiveBookend(BaseModel):
     image_url: str = Field(description="Image shown for the intro/outro scene")
     script: str = Field(default="", description="English narration")
     translation: str = Field(default="", description="Line-aligned Chinese translation")
+    hold_after: float = Field(default=0.0, ge=0.0, le=10.0, description="Silent hold after narration before the next block")
+
+
+class InteractiveBlock(BaseModel):
+    """One item in the ordered Interactive timeline."""
+    id: str = Field(default="")
+    kind: str = Field(description="intro | round | camera | outro")
+    intro: Optional[InteractiveBookend] = None
+    round: Optional[InteractiveRound] = None
+    camera: Optional[InteractiveCameraSequence] = None
+    outro: Optional[InteractiveBookend] = None
 
 
 class InteractiveAssembleRequest(BaseModel):
     """Interactive education video: grouped question/countdown/answer rounds."""
     task_id: str = Field(description="Task ID returned by create_task")
-    rounds: List[InteractiveRound] = Field(description="Ordered learning rounds")
+    rounds: List[InteractiveRound] = Field(default_factory=list, description="Ordered learning rounds (legacy)")
     intros: List[InteractiveBookend] = Field(default_factory=list, description="Optional intro scenes, shown in order")
     outros: List[InteractiveBookend] = Field(default_factory=list, description="Optional outro scenes, shown in order")
     intro: Optional[InteractiveBookend] = Field(default=None, description="Deprecated: single intro scene")
     outro: Optional[InteractiveBookend] = Field(default=None, description="Deprecated: single outro scene")
+    blocks: List[InteractiveBlock] = Field(default_factory=list, description="Ordered timeline of intros, rounds, camera sequences and outros")
     resolution: Optional[str] = Field(default="1024*1024", description="Output resolution")
     chinese_subtitle_enabled: bool = Field(default=True)
     karaoke: bool = Field(default=True)
